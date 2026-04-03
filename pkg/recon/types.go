@@ -71,6 +71,26 @@ type FileDetail struct {
 	ContentHash string `json:"content_hash,omitempty"`
 }
 
+type FileContext struct {
+	Path          string            `json:"path"`
+	Preview       string            `json:"preview,omitempty"`
+	ContentHash   string            `json:"content_hash,omitempty"`
+	Owners        []string          `json:"owners,omitempty"`
+	FanIn         int               `json:"fan_in"`
+	FanOut        int               `json:"fan_out"`
+	Churn         int               `json:"churn"`
+	HotspotScore  float64           `json:"hotspot_score"`
+	NearbyConfigs map[string]string `json:"nearby_configs,omitempty"` // type → path
+}
+
+type HotspotInfo struct {
+	Path         string  `json:"path"`
+	FanIn        int     `json:"fan_in"`
+	FanOut       int     `json:"fan_out"`
+	Churn        int     `json:"churn"`
+	HotspotScore float64 `json:"hotspot_score"`
+}
+
 type RelatedOption func(*relatedConfig)
 
 type relatedConfig struct {

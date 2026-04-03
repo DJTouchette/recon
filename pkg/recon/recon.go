@@ -17,15 +17,18 @@ import (
 
 // Recon is the main entry point for repo intelligence.
 type Recon struct {
-	root     string
-	store    *cache.Store
-	idx      *index.FileIndex
-	deps     *index.DepGraph
-	tests    *index.TestMap
-	symbols  *index.SymbolIndex
-	extras   map[string]*index.FileExtra // relPath → extra
-	cochange *gitpkg.CoChange
-	isGit    bool
+	root      string
+	store     *cache.Store
+	idx       *index.FileIndex
+	deps      *index.DepGraph
+	tests     *index.TestMap
+	symbols   *index.SymbolIndex
+	extras    map[string]*index.FileExtra
+	metrics   *index.MetricsIndex
+	nearby    *index.NearbyIndex
+	ownership *index.Ownership
+	cochange  *gitpkg.CoChange
+	isGit     bool
 }
 
 // New creates a Recon instance rooted at the given directory.
@@ -152,6 +155,52 @@ func (r *Recon) Related(path string, opts ...RelatedOption) ([]RelatedFile, erro
 	return out, nil
 }
 
+// Context returns the full operational context for a file: preview, hash, owners, metrics, nearby configs.
+func (r *Recon) Context(path string) (*FileContext, error) {
+	path = filepath.Clean(path)
+	ctx := &FileContext{Path: path}
+
+	if e, ok := r.extras[path]; ok {
+		ctx.Preview = e.Preview
+		ctx.ContentHash = e.ContentHash
+	}
+
+	if m := r.metrics.Get(path); m != nil {
+		ctx.FanIn = m.FanIn
+		ctx.FanOut = m.FanOut
+		ctx.Churn = m.Churn
+		ctx.HotspotScore = m.HotspotScore
+	}
+
+	ctx.Owners = r.ownership.OwnersOf(path)
+
+	configs := r.nearby.ForFile(path)
+	if len(configs) > 0 {
+		ctx.NearbyConfigs = make(map[string]string, len(configs))
+		for _, c := range configs {
+			ctx.NearbyConfigs[c.ConfigType] = c.ConfigPath
+		}
+	}
+
+	return ctx, nil
+}
+
+// Hotspots returns the top N files ranked by hotspot score (fan-in * churn).
+func (r *Recon) Hotspots(n int) ([]HotspotInfo, error) {
+	spots := r.metrics.Hotspots(n)
+	var out []HotspotInfo
+	for _, m := range spots {
+		out = append(out, HotspotInfo{
+			Path:         m.RelPath,
+			FanIn:        m.FanIn,
+			FanOut:       m.FanOut,
+			Churn:        m.Churn,
+			HotspotScore: m.HotspotScore,
+		})
+	}
+	return out, nil
+}
+
 // Symbols returns symbols matching the query. If query is empty, returns all symbols.
 // If query starts with "file:", returns symbols for that specific file.
 func (r *Recon) Symbols(query string) ([]SymbolInfo, error) {
@@ -262,6 +311,8 @@ func (r *Recon) Rebuild() error {
 	r.deps = index.NewDepGraph(r.root, r.idx)
 	r.symbols = index.NewSymbolIndex(r.root, r.idx)
 	r.buildExtrasMap(index.ExtractFileExtras(r.root, r.idx))
+	r.nearby = index.NewNearbyIndex(index.FindNearbyConfigs(r.root, r.idx))
+	r.ownership = index.ParseCodeowners(r.root)
 
 	if r.isGit {
 		commits, err := gitpkg.ParseLog(r.root, 500)
@@ -269,6 +320,8 @@ func (r *Recon) Rebuild() error {
 			r.cochange = gitpkg.NewCoChange(commits)
 		}
 	}
+
+	r.metrics = index.NewMetricsIndex(index.ComputeMetrics(r.deps, r.cochange))
 
 	// Persist to SQLite
 	if r.store != nil {
@@ -390,6 +443,9 @@ func (r *Recon) Refresh() error {
 	r.deps = index.NewDepGraphFromData(snap.Imports)
 	r.symbols = index.NewSymbolIndexFromData(snap.Symbols)
 	r.buildExtrasMap(snap.FileExtras)
+	r.metrics = index.NewMetricsIndex(snap.Metrics)
+	r.nearby = index.NewNearbyIndex(snap.NearbyConfigs)
+	r.ownership = index.NewOwnershipFromData(snap.OwnerRules)
 	if r.cochange == nil {
 		r.cochange = gitpkg.NewCoChangeFromData(snap.CoChangePairs, snap.Churn)
 	}
@@ -415,6 +471,9 @@ func (r *Recon) loadFromCache() error {
 	r.cochange = gitpkg.NewCoChangeFromData(snap.CoChangePairs, snap.Churn)
 	r.symbols = index.NewSymbolIndexFromData(snap.Symbols)
 	r.buildExtrasMap(snap.FileExtras)
+	r.metrics = index.NewMetricsIndex(snap.Metrics)
+	r.nearby = index.NewNearbyIndex(snap.NearbyConfigs)
+	r.ownership = index.NewOwnershipFromData(snap.OwnerRules)
 
 	return nil
 }
@@ -431,6 +490,8 @@ func (r *Recon) rebuildNoPersist() error {
 	r.deps = index.NewDepGraph(r.root, r.idx)
 	r.symbols = index.NewSymbolIndex(r.root, r.idx)
 	r.buildExtrasMap(index.ExtractFileExtras(r.root, r.idx))
+	r.nearby = index.NewNearbyIndex(index.FindNearbyConfigs(r.root, r.idx))
+	r.ownership = index.ParseCodeowners(r.root)
 
 	if r.isGit {
 		commits, err := gitpkg.ParseLog(r.root, 500)
@@ -438,6 +499,7 @@ func (r *Recon) rebuildNoPersist() error {
 			r.cochange = gitpkg.NewCoChange(commits)
 		}
 	}
+	r.metrics = index.NewMetricsIndex(index.ComputeMetrics(r.deps, r.cochange))
 	return nil
 }
 
@@ -452,6 +514,9 @@ func (r *Recon) toSnapshot(files []scan.FileEntry) *cache.Snapshot {
 		CoChangePairs: nil,
 		Churn:         nil,
 		Symbols:       r.symbols.All(),
+		Metrics:       r.metrics.All(),
+		NearbyConfigs: r.nearby.All(),
+		OwnerRules:    r.ownership.Rules(),
 	}
 
 	// Build file extras list from map

@@ -43,6 +43,8 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(relatedCmd())
 	root.AddCommand(testsCmd())
 	root.AddCommand(symbolsCmd())
+	root.AddCommand(contextCmd())
+	root.AddCommand(hotspotsCmd())
 	root.AddCommand(changesCmd())
 	root.AddCommand(refreshCmd())
 	root.AddCommand(rebuildCmd())
@@ -167,6 +169,60 @@ func symbolsCmd() *cobra.Command {
 			return outputJSON(cmd, symbols)
 		},
 	}
+}
+
+func contextCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "context <path>",
+		Short: "File context: preview, owners, metrics, nearby configs",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			r, err := recon.New(flagRoot)
+			if err != nil {
+				return err
+			}
+			defer r.Close()
+
+			ctx, err := r.Context(args[0])
+			if err != nil {
+				return err
+			}
+
+			if flagHuman {
+				printContextHuman(cmd, ctx)
+				return nil
+			}
+			return outputJSON(cmd, ctx)
+		},
+	}
+}
+
+func hotspotsCmd() *cobra.Command {
+	var n int
+	cmd := &cobra.Command{
+		Use:   "hotspots",
+		Short: "Top files by hotspot score (fan-in * churn) — risky to change",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			r, err := recon.New(flagRoot)
+			if err != nil {
+				return err
+			}
+			defer r.Close()
+
+			spots, err := r.Hotspots(n)
+			if err != nil {
+				return err
+			}
+
+			if flagHuman {
+				printHotspotsHuman(cmd, spots)
+				return nil
+			}
+			return outputJSON(cmd, spots)
+		},
+	}
+	cmd.Flags().IntVarP(&n, "max", "n", 20, "max results")
+	return cmd
 }
 
 func changesCmd() *cobra.Command {
@@ -318,6 +374,52 @@ func printSymbolsHuman(cmd *cobra.Command, symbols []recon.SymbolInfo) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, s := range symbols {
 		fmt.Fprintf(tw, "  %s\t%s\t%s:%d\t%s\n", s.Kind, s.Name, s.File, s.Line, s.Signature)
+	}
+	tw.Flush()
+}
+
+func printContextHuman(cmd *cobra.Command, ctx *recon.FileContext) {
+	w := cmd.OutOrStdout()
+	fmt.Fprintf(w, "File: %s\n", ctx.Path)
+	if ctx.ContentHash != "" {
+		fmt.Fprintf(w, "Hash: %s\n", ctx.ContentHash)
+	}
+	fmt.Fprintln(w)
+
+	if ctx.Preview != "" {
+		fmt.Fprintln(w, "Preview:")
+		for _, line := range strings.Split(ctx.Preview, "\n") {
+			fmt.Fprintf(w, "  %s\n", line)
+		}
+		fmt.Fprintln(w)
+	}
+
+	if len(ctx.Owners) > 0 {
+		fmt.Fprintf(w, "Owners: %s\n", strings.Join(ctx.Owners, ", "))
+	}
+
+	fmt.Fprintf(w, "Fan-in: %d  Fan-out: %d  Churn: %d  Hotspot: %.2f\n",
+		ctx.FanIn, ctx.FanOut, ctx.Churn, ctx.HotspotScore)
+
+	if len(ctx.NearbyConfigs) > 0 {
+		fmt.Fprintln(w, "\nNearby configs:")
+		for typ, path := range ctx.NearbyConfigs {
+			fmt.Fprintf(w, "  %-20s %s\n", typ, path)
+		}
+	}
+}
+
+func printHotspotsHuman(cmd *cobra.Command, spots []recon.HotspotInfo) {
+	w := cmd.OutOrStdout()
+	if len(spots) == 0 {
+		fmt.Fprintln(w, "No hotspots found.")
+		return
+	}
+	fmt.Fprintf(w, "Hotspots (%d):\n", len(spots))
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\n", "SCORE", "FAN-IN", "CHURN", "FAN-OUT", "FILE")
+	for _, s := range spots {
+		fmt.Fprintf(tw, "  %.2f\t%d\t%d\t%d\t%s\n", s.HotspotScore, s.FanIn, s.Churn, s.FanOut, s.Path)
 	}
 	tw.Flush()
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/djtouchette/recon/internal/index"
 	"github.com/djtouchette/recon/internal/scan"
@@ -15,7 +16,7 @@ import (
 const (
 	cacheDir   = ".recon"
 	dbFile     = "recon.db"
-	schemaVer  = 2
+	schemaVer  = 3
 )
 
 // Snapshot holds all indexed data for save/load.
@@ -29,6 +30,9 @@ type Snapshot struct {
 	Churn         map[string]int
 	Symbols       []index.Symbol
 	FileExtras    []index.FileExtra
+	Metrics       []index.FileMetrics
+	NearbyConfigs []index.NearbyConfig
+	OwnerRules    []index.OwnerRule
 }
 
 // Store manages the SQLite cache database.
@@ -90,7 +94,7 @@ func (s *Store) ensureSchema() error {
 	}
 
 	// Drop and recreate all tables
-	for _, table := range []string{"meta", "files", "imports", "tests", "cochange", "churn", "symbols", "file_extras"} {
+	for _, table := range []string{"meta", "files", "imports", "tests", "cochange", "churn", "symbols", "file_extras", "file_metrics", "nearby_configs", "codeowners"} {
 		s.db.Exec("DROP TABLE IF EXISTS " + table)
 	}
 
@@ -154,9 +158,29 @@ CREATE INDEX idx_files_class ON files(class);
 CREATE INDEX idx_imports_target ON imports(target_path);
 CREATE INDEX idx_tests_source ON tests(source_path);
 CREATE INDEX idx_cochange_b ON cochange(file_b);
+CREATE TABLE file_metrics (
+	rel_path TEXT PRIMARY KEY,
+	fan_in INTEGER NOT NULL DEFAULT 0,
+	fan_out INTEGER NOT NULL DEFAULT 0,
+	churn INTEGER NOT NULL DEFAULT 0,
+	hotspot_score REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE nearby_configs (
+	dir TEXT NOT NULL,
+	config_type TEXT NOT NULL,
+	config_path TEXT NOT NULL,
+	PRIMARY KEY (dir, config_type)
+);
+CREATE TABLE codeowners (
+	priority INTEGER NOT NULL,
+	pattern TEXT NOT NULL,
+	owners TEXT NOT NULL
+);
 CREATE INDEX idx_symbols_file ON symbols(file_path);
 CREATE INDEX idx_symbols_name ON symbols(name);
 CREATE INDEX idx_symbols_kind ON symbols(kind);
+CREATE INDEX idx_metrics_hotspot ON file_metrics(hotspot_score);
+CREATE INDEX idx_nearby_dir ON nearby_configs(dir);
 `
 
 // --- Meta operations ---
@@ -195,7 +219,7 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 	defer tx.Rollback()
 
 	// Clear data tables (not meta)
-	for _, table := range []string{"files", "imports", "tests", "cochange", "churn", "symbols", "file_extras"} {
+	for _, table := range []string{"files", "imports", "tests", "cochange", "churn", "symbols", "file_extras", "file_metrics", "nearby_configs", "codeowners"} {
 		if _, err := tx.Exec("DELETE FROM " + table); err != nil {
 			return fmt.Errorf("clear %s: %w", table, err)
 		}
@@ -304,6 +328,45 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 		for i := range snap.FileExtras {
 			e := &snap.FileExtras[i]
 			extraStmt.Exec(e.RelPath, e.Preview, e.ContentHash)
+		}
+	}
+
+	// --- File Metrics ---
+	if len(snap.Metrics) > 0 {
+		metStmt, err := tx.Prepare("INSERT INTO file_metrics (rel_path, fan_in, fan_out, churn, hotspot_score) VALUES (?, ?, ?, ?, ?)")
+		if err != nil {
+			return fmt.Errorf("prepare file_metrics: %w", err)
+		}
+		defer metStmt.Close()
+		for i := range snap.Metrics {
+			m := &snap.Metrics[i]
+			metStmt.Exec(m.RelPath, m.FanIn, m.FanOut, m.Churn, m.HotspotScore)
+		}
+	}
+
+	// --- Nearby Configs ---
+	if len(snap.NearbyConfigs) > 0 {
+		ncStmt, err := tx.Prepare("INSERT INTO nearby_configs (dir, config_type, config_path) VALUES (?, ?, ?)")
+		if err != nil {
+			return fmt.Errorf("prepare nearby_configs: %w", err)
+		}
+		defer ncStmt.Close()
+		for i := range snap.NearbyConfigs {
+			nc := &snap.NearbyConfigs[i]
+			ncStmt.Exec(nc.Dir, nc.ConfigType, nc.ConfigPath)
+		}
+	}
+
+	// --- CODEOWNERS ---
+	if len(snap.OwnerRules) > 0 {
+		coStmt, err := tx.Prepare("INSERT INTO codeowners (priority, pattern, owners) VALUES (?, ?, ?)")
+		if err != nil {
+			return fmt.Errorf("prepare codeowners: %w", err)
+		}
+		defer coStmt.Close()
+		for i := range snap.OwnerRules {
+			r := &snap.OwnerRules[i]
+			coStmt.Exec(r.Priority, r.Pattern, strings.Join(r.Owners, " "))
 		}
 	}
 
@@ -456,6 +519,62 @@ func (s *Store) LoadSnapshot() (*Snapshot, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("file_extra rows: %w", err)
+	}
+
+	// --- File Metrics ---
+	rows, err = s.db.Query("SELECT rel_path, fan_in, fan_out, churn, hotspot_score FROM file_metrics")
+	if err != nil {
+		return nil, fmt.Errorf("query file_metrics: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var m index.FileMetrics
+		if err := rows.Scan(&m.RelPath, &m.FanIn, &m.FanOut, &m.Churn, &m.HotspotScore); err != nil {
+			return nil, fmt.Errorf("scan file_metrics row: %w", err)
+		}
+		snap.Metrics = append(snap.Metrics, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("file_metrics rows: %w", err)
+	}
+
+	// --- Nearby Configs ---
+	rows, err = s.db.Query("SELECT dir, config_type, config_path FROM nearby_configs")
+	if err != nil {
+		return nil, fmt.Errorf("query nearby_configs: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var nc index.NearbyConfig
+		if err := rows.Scan(&nc.Dir, &nc.ConfigType, &nc.ConfigPath); err != nil {
+			return nil, fmt.Errorf("scan nearby_configs row: %w", err)
+		}
+		snap.NearbyConfigs = append(snap.NearbyConfigs, nc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("nearby_configs rows: %w", err)
+	}
+
+	// --- CODEOWNERS ---
+	rows, err = s.db.Query("SELECT priority, pattern, owners FROM codeowners ORDER BY priority")
+	if err != nil {
+		return nil, fmt.Errorf("query codeowners: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var r index.OwnerRule
+		var ownersStr string
+		if err := rows.Scan(&r.Priority, &r.Pattern, &ownersStr); err != nil {
+			return nil, fmt.Errorf("scan codeowners row: %w", err)
+		}
+		r.Owners = strings.Fields(ownersStr)
+		snap.OwnerRules = append(snap.OwnerRules, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("codeowners rows: %w", err)
 	}
 
 	return snap, nil
