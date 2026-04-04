@@ -455,6 +455,44 @@ func collapseMatches(matches []GrepLine) []GrepLine {
 	return result
 }
 
+// ImportedBy returns files that import the given file (reverse dependency edge).
+func (r *Recon) ImportedBy(path string) []string {
+	if r.deps == nil {
+		return nil
+	}
+	return r.deps.ImportedBy(filepath.Clean(path))
+}
+
+// ImportsOf returns files imported by the given file.
+func (r *Recon) ImportsOf(path string) []string {
+	if r.deps == nil {
+		return nil
+	}
+	return r.deps.ImportsOf(filepath.Clean(path))
+}
+
+// CoChangedWith returns files that frequently co-change with the given file.
+func (r *Recon) CoChangedWith(path string, minCount int) []CoChangePair {
+	if r.cochange == nil {
+		return nil
+	}
+	internal := r.cochange.CoChangedWith(filepath.Clean(path), minCount)
+	out := make([]CoChangePair, len(internal))
+	for i, p := range internal {
+		out[i] = CoChangePair{File: p.File, Count: p.Count}
+	}
+	return out
+}
+
+// IsTestFile returns true if the given path is classified as a test file.
+func (r *Recon) IsTestFile(path string) bool {
+	f := r.idx.Get(filepath.Clean(path))
+	if f == nil {
+		return false
+	}
+	return f.Class == scan.ClassTest
+}
+
 // RecentChanges returns a summary of recent git activity.
 func (r *Recon) RecentChanges(since string) ([]ChangeSet, error) {
 	if !r.isGit {

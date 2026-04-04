@@ -132,6 +132,12 @@ type GrepLine struct {
 	Similar   int    `json:"similar,omitempty"` // count of additional lines with identical text
 }
 
+// CoChangePair represents a file that frequently co-changes with another file.
+type CoChangePair struct {
+	File  string `json:"file"`
+	Count int    `json:"count"`
+}
+
 type RelatedOption func(*relatedConfig)
 
 type relatedConfig struct {
