@@ -34,28 +34,57 @@ func (d *DotNetDetector) DetectFrameworks(idx *index.FileIndex, root string) []F
 		content := string(data)
 
 		csprojFws := map[string]string{
-			"Microsoft.AspNetCore":      "ASP.NET Core",
-			"Microsoft.NET.Sdk.Web":     "ASP.NET Core",
-			"Microsoft.EntityFrameworkCore": "Entity Framework Core",
-			"Swashbuckle":               "Swagger/Swashbuckle",
-			"MediatR":                   "MediatR",
-			"AutoMapper":                "AutoMapper",
-			"FluentValidation":          "FluentValidation",
-			"Serilog":                   "Serilog",
-			"NLog":                      "NLog",
-			"Dapper":                    "Dapper",
-			"Newtonsoft.Json":           "Newtonsoft.Json",
-			"xunit":                     "xUnit",
-			"NUnit":                     "NUnit",
-			"MSTest":                    "MSTest",
-			"Moq":                       "Moq",
-			"FluentAssertions":          "FluentAssertions",
-			"Polly":                     "Polly",
-			"MassTransit":               "MassTransit",
-			"Hangfire":                  "Hangfire",
-			"SignalR":                   "SignalR",
-			"Blazor":                    "Blazor",
-			"Microsoft.NET.Sdk.BlazorWebAssembly": "Blazor",
+			// Web
+			"Microsoft.AspNetCore":                 "ASP.NET Core",
+			"Microsoft.NET.Sdk.Web":                "ASP.NET Core",
+			"Microsoft.NET.Sdk.BlazorWebAssembly":  "Blazor",
+			"Blazor":                               "Blazor",
+			"SignalR":                               "SignalR",
+			// MAUI / Mobile / Desktop
+			"Microsoft.Maui":                       ".NET MAUI",
+			"Microsoft.NET.Sdk.Maui":               ".NET MAUI",
+			"Xamarin.Forms":                         "Xamarin.Forms",
+			"Xamarin.Essentials":                    "Xamarin",
+			"Avalonia":                              "Avalonia UI",
+			"Uno.WinUI":                             "Uno Platform",
+			// ORM / Data
+			"Microsoft.EntityFrameworkCore":         "Entity Framework Core",
+			"Dapper":                                "Dapper",
+			"Newtonsoft.Json":                       "Newtonsoft.Json",
+			"System.Text.Json":                      "System.Text.Json",
+			// Patterns / Architecture
+			"MediatR":                               "MediatR",
+			"AutoMapper":                            "AutoMapper",
+			"FluentValidation":                      "FluentValidation",
+			"Polly":                                 "Polly",
+			// Logging / Observability
+			"Serilog":                               "Serilog",
+			"NLog":                                  "NLog",
+			"OpenTelemetry":                         "OpenTelemetry",
+			// API / Docs
+			"Swashbuckle":                           "Swagger/Swashbuckle",
+			"NSwag":                                 "NSwag",
+			// Messaging / Jobs
+			"MassTransit":                           "MassTransit",
+			"Hangfire":                              "Hangfire",
+			"RabbitMQ.Client":                       "RabbitMQ",
+			// Identity / Auth
+			"Microsoft.AspNetCore.Identity":         "ASP.NET Identity",
+			"IdentityServer":                        "IdentityServer",
+			"Duende.IdentityServer":                 "Duende IdentityServer",
+			// Testing
+			"xunit":                                 "xUnit",
+			"NUnit":                                 "NUnit",
+			"MSTest":                                "MSTest",
+			"Moq":                                   "Moq",
+			"NSubstitute":                           "NSubstitute",
+			"FluentAssertions":                      "FluentAssertions",
+			"Bogus":                                 "Bogus",
+			// gRPC
+			"Grpc.AspNetCore":                       "gRPC",
+			"Google.Protobuf":                       "Protobuf",
+			// Worker / Hosted Services
+			"Microsoft.NET.Sdk.Worker":              ".NET Worker Service",
 		}
 
 		for dep, name := range csprojFws {
@@ -95,10 +124,20 @@ func (d *DotNetDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
 		case "Startup.cs":
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "server"})
+		case "MauiProgram.cs":
+			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
+		case "App.xaml.cs":
+			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
+		case "AppShell.xaml.cs":
+			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "route"})
 		}
 
 		// Look for controller files
 		if strings.HasSuffix(base, "Controller.cs") {
+			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "handler"})
+		}
+		// Look for Razor pages / Blazor components
+		if strings.HasSuffix(base, ".razor.cs") {
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "handler"})
 		}
 	}
