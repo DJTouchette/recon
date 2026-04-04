@@ -17,7 +17,7 @@ type RelatedFile struct {
 }
 
 // FindRelated returns files related to the given path, ranked by score.
-func FindRelated(path string, idx *index.FileIndex, deps *index.DepGraph, tests *index.TestMap, cochange *gitpkg.CoChange, maxResults int) []RelatedFile {
+func FindRelated(path string, idx *index.FileIndex, deps *index.DepGraph, tests *index.TestMap, cochange *gitpkg.CoChange, metrics *index.MetricsIndex, ownership *index.Ownership, maxResults int) []RelatedFile {
 	if maxResults <= 0 {
 		maxResults = 20
 	}
@@ -69,17 +69,16 @@ func FindRelated(path string, idx *index.FileIndex, deps *index.DepGraph, tests 
 		pairs := cochange.CoChangedWith(path, 2)
 		for _, p := range pairs {
 			weight := 0.5
-			if p.Count >= 5 {
-				weight = 0.7
-			} else if p.Count >= 10 {
+			if p.Count >= 10 {
 				weight = 0.8
+			} else if p.Count >= 5 {
+				weight = 0.7
 			}
 			addSignal(p.File, weight, "co-change")
 		}
 	}
 
 	// Signal 5: Same package/module (weight 0.2)
-	// Files in sibling directories under the same parent
 	parentDir := filepath.Dir(dir)
 	if parentDir != "." && parentDir != "" {
 		for _, f := range idx.FilesInDir(parentDir) {
@@ -90,7 +89,6 @@ func FindRelated(path string, idx *index.FileIndex, deps *index.DepGraph, tests 
 	}
 
 	// Signal 6: Naming convention (weight 0.6)
-	// Files with similar base names in different directories
 	base := filepath.Base(path)
 	ext := filepath.Ext(base)
 	nameNoExt := strings.TrimSuffix(base, ext)
@@ -106,10 +104,56 @@ func FindRelated(path string, idx *index.FileIndex, deps *index.DepGraph, tests 
 		}
 	}
 
+	// Signal 7: High fan-in importers/imports get a boost (weight 0.3)
+	// If a file that imports/is-imported-by target is itself a hotspot,
+	// it's more likely to be meaningfully related.
+	if metrics != nil {
+		targetMetrics := metrics.Get(path)
+		if deps != nil {
+			for _, imp := range deps.ImportsOf(path) {
+				if m := metrics.Get(imp); m != nil && m.HotspotScore > 0.1 {
+					addSignal(imp, 0.3, "hotspot-dep")
+				}
+			}
+			for _, imp := range deps.ImportedBy(path) {
+				if m := metrics.Get(imp); m != nil && m.HotspotScore > 0.1 {
+					addSignal(imp, 0.3, "hotspot-dep")
+				}
+			}
+		}
+		// If target itself is a hotspot, boost its co-change partners
+		if targetMetrics != nil && targetMetrics.FanIn > 10 && cochange != nil {
+			pairs := cochange.CoChangedWith(path, 1)
+			for _, p := range pairs {
+				addSignal(p.File, 0.2, "hotspot-cochange")
+			}
+		}
+	}
+
+	// Signal 8: Shared ownership (weight 0.15)
+	if ownership != nil && ownership.HasRules() {
+		targetOwners := ownership.OwnersOf(path)
+		if len(targetOwners) > 0 {
+			ownerSet := make(map[string]bool, len(targetOwners))
+			for _, o := range targetOwners {
+				ownerSet[o] = true
+			}
+			// Only check files already in the candidate set to avoid scanning all files
+			for filePath := range scores {
+				fileOwners := ownership.OwnersOf(filePath)
+				for _, o := range fileOwners {
+					if ownerSet[o] {
+						addSignal(filePath, 0.15, "same-owner")
+						break
+					}
+				}
+			}
+		}
+	}
+
 	// Convert to sorted slice
 	result := make([]RelatedFile, 0, len(scores))
 	for _, rf := range scores {
-		// Cap score at 1.0
 		if rf.Score > 1.0 {
 			rf.Score = 1.0
 		}

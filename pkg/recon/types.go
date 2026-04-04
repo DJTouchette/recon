@@ -91,6 +91,14 @@ type HotspotInfo struct {
 	HotspotScore float64 `json:"hotspot_score"`
 }
 
+type SearchResult struct {
+	Path      string      `json:"path"`
+	Score     float64     `json:"score"`
+	MatchType string      `json:"match_type"` // "symbol", "file_path", "preview"
+	Context   string      `json:"context"`
+	Symbol    *SymbolInfo `json:"symbol,omitempty"`
+}
+
 type RelatedOption func(*relatedConfig)
 
 type relatedConfig struct {

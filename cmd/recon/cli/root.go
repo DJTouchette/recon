@@ -43,6 +43,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(relatedCmd())
 	root.AddCommand(testsCmd())
 	root.AddCommand(symbolsCmd())
+	root.AddCommand(searchCmd())
 	root.AddCommand(contextCmd())
 	root.AddCommand(hotspotsCmd())
 	root.AddCommand(changesCmd())
@@ -169,6 +170,35 @@ func symbolsCmd() *cobra.Command {
 			return outputJSON(cmd, symbols)
 		},
 	}
+}
+
+func searchCmd() *cobra.Command {
+	var maxResults int
+	cmd := &cobra.Command{
+		Use:   "search <query>",
+		Short: "Unified search across symbols, file paths, and file previews",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			r, err := recon.New(flagRoot)
+			if err != nil {
+				return err
+			}
+			defer r.Close()
+
+			results, err := r.Search(args[0], maxResults)
+			if err != nil {
+				return err
+			}
+
+			if flagHuman {
+				printSearchHuman(cmd, results)
+				return nil
+			}
+			return outputJSON(cmd, results)
+		},
+	}
+	cmd.Flags().IntVarP(&maxResults, "max", "n", 30, "max results")
+	return cmd
 }
 
 func contextCmd() *cobra.Command {
@@ -374,6 +404,24 @@ func printSymbolsHuman(cmd *cobra.Command, symbols []recon.SymbolInfo) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, s := range symbols {
 		fmt.Fprintf(tw, "  %s\t%s\t%s:%d\t%s\n", s.Kind, s.Name, s.File, s.Line, s.Signature)
+	}
+	tw.Flush()
+}
+
+func printSearchHuman(cmd *cobra.Command, results []recon.SearchResult) {
+	w := cmd.OutOrStdout()
+	if len(results) == 0 {
+		fmt.Fprintln(w, "No results found.")
+		return
+	}
+	fmt.Fprintf(w, "Results (%d):\n", len(results))
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	for _, r := range results {
+		ctx := r.Context
+		if len(ctx) > 100 {
+			ctx = ctx[:100] + "..."
+		}
+		fmt.Fprintf(tw, "  %.2f\t[%s]\t%s\t%s\n", r.Score, r.MatchType, r.Path, ctx)
 	}
 	tw.Flush()
 }

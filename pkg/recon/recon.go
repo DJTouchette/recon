@@ -142,7 +142,7 @@ func (r *Recon) Related(path string, opts ...RelatedOption) ([]RelatedFile, erro
 
 	path = filepath.Clean(path)
 
-	results := relate.FindRelated(path, r.idx, r.deps, r.tests, r.cochange, cfg.maxResults)
+	results := relate.FindRelated(path, r.idx, r.deps, r.tests, r.cochange, r.metrics, r.ownership, cfg.maxResults)
 
 	var out []RelatedFile
 	for _, rf := range results {
@@ -197,6 +197,36 @@ func (r *Recon) Hotspots(n int) ([]HotspotInfo, error) {
 			Churn:        m.Churn,
 			HotspotScore: m.HotspotScore,
 		})
+	}
+	return out, nil
+}
+
+// Search performs a unified search across symbol names, file paths, and file previews.
+func (r *Recon) Search(query string, maxResults int) ([]SearchResult, error) {
+	if maxResults <= 0 {
+		maxResults = 30
+	}
+
+	results := index.Search(query, r.idx, r.symbols, r.extras, maxResults)
+
+	var out []SearchResult
+	for _, sr := range results {
+		res := SearchResult{
+			Path:      sr.Path,
+			Score:     sr.Score,
+			MatchType: sr.MatchType,
+			Context:   sr.Context,
+		}
+		if sr.Symbol != nil {
+			res.Symbol = &SymbolInfo{
+				File:      sr.Symbol.File,
+				Name:      sr.Symbol.Name,
+				Kind:      sr.Symbol.Kind,
+				Line:      sr.Symbol.Line,
+				Signature: sr.Symbol.Signature,
+			}
+		}
+		out = append(out, res)
 	}
 	return out, nil
 }
