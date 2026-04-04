@@ -3,9 +3,17 @@ package detect
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/djtouchette/recon/internal/index"
+)
+
+var (
+	// Matches <artifactId>name</artifactId> in pom.xml
+	pomArtifact = regexp.MustCompile(`<artifactId>([^<]+)</artifactId>`)
+	// Matches implementation("group:artifact:version") or api("group:artifact") in Gradle
+	gradleDep = regexp.MustCompile(`(?:implementation|api|compileOnly|runtimeOnly|testImplementation|kapt|ksp)\s*(?:\(?\s*["'])([^"']+)["']`)
 )
 
 type JavaDetector struct{}
@@ -18,56 +26,48 @@ func (d *JavaDetector) DetectFrameworks(idx *index.FileIndex, root string) []Fra
 	var frameworks []Framework
 	seen := make(map[string]bool)
 
-	// Check pom.xml
-	if data, err := os.ReadFile(filepath.Join(root, "pom.xml")); err == nil {
-		content := string(data)
-		detectJavaDeps(content, "pom.xml", seen, &frameworks)
+	lang := "java"
+	if len(idx.ByLang("kotlin")) > len(idx.ByLang("java")) {
+		lang = "kotlin"
 	}
 
-	// Check build.gradle
+	addDep := func(name, evidence string) {
+		if !seen[name] {
+			seen[name] = true
+			frameworks = append(frameworks, Framework{
+				Name:     name,
+				Language: lang,
+				Evidence: evidence,
+			})
+		}
+	}
+
+	// Parse pom.xml — extract artifactIds
+	if data, err := os.ReadFile(filepath.Join(root, "pom.xml")); err == nil {
+		for _, m := range pomArtifact.FindAllStringSubmatch(string(data), -1) {
+			addDep(m[1], "pom.xml")
+		}
+	}
+
+	// Parse build.gradle / build.gradle.kts — extract dependency coordinates
 	for _, name := range []string{"build.gradle", "build.gradle.kts"} {
-		if data, err := os.ReadFile(filepath.Join(root, name)); err == nil {
-			content := string(data)
-			detectJavaDeps(content, name, seen, &frameworks)
+		data, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			continue
+		}
+		for _, m := range gradleDep.FindAllStringSubmatch(string(data), -1) {
+			coord := m[1]
+			// Parse "group:artifact:version" → use artifact name
+			parts := strings.Split(coord, ":")
+			if len(parts) >= 2 {
+				addDep(parts[1], name)
+			} else {
+				addDep(coord, name)
+			}
 		}
 	}
 
 	return frameworks
-}
-
-func detectJavaDeps(content, source string, seen map[string]bool, frameworks *[]Framework) {
-	fws := map[string]string{
-		"spring-boot":   "Spring Boot",
-		"spring-web":    "Spring Web",
-		"spring-data":   "Spring Data",
-		"micronaut":     "Micronaut",
-		"quarkus":       "Quarkus",
-		"vert.x":        "Vert.x",
-		"hibernate":     "Hibernate",
-		"mybatis":       "MyBatis",
-		"junit":         "JUnit",
-		"mockito":       "Mockito",
-		"lombok":        "Lombok",
-		"jackson":       "Jackson",
-		"grpc":          "gRPC",
-		"kafka":         "Kafka",
-	}
-
-	lang := "java"
-	if strings.Contains(source, ".kts") {
-		lang = "kotlin"
-	}
-
-	for dep, name := range fws {
-		if strings.Contains(content, dep) && !seen[name] {
-			seen[name] = true
-			*frameworks = append(*frameworks, Framework{
-				Name:     name,
-				Language: lang,
-				Evidence: source + ": " + dep,
-			})
-		}
-	}
 }
 
 func (d *JavaDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {

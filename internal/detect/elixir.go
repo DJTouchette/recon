@@ -3,10 +3,14 @@ package detect
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/djtouchette/recon/internal/index"
 )
+
+// Matches {:dep_name, "~> 1.0"} or {:dep_name, ">= 0"} etc. in mix.exs
+var mixDep = regexp.MustCompile(`\{:(\w+),`)
 
 type ElixirDetector struct{}
 
@@ -15,31 +19,22 @@ func (d *ElixirDetector) DetectFrameworks(idx *index.FileIndex, root string) []F
 		return nil
 	}
 
-	var frameworks []Framework
 	data, err := os.ReadFile(filepath.Join(root, "mix.exs"))
 	if err != nil {
 		return nil
 	}
-	content := string(data)
 
-	fws := map[string]string{
-		":phoenix":     "Phoenix",
-		":ecto":        "Ecto",
-		":absinthe":    "Absinthe (GraphQL)",
-		":oban":        "Oban",
-		":tesla":       "Tesla",
-		":broadway":    "Broadway",
-		":ash":         "Ash",
-		":live_view":   "Phoenix LiveView",
-		":phoenix_live_view": "Phoenix LiveView",
-	}
+	var frameworks []Framework
+	seen := make(map[string]bool)
 
-	for dep, name := range fws {
-		if strings.Contains(content, dep) {
+	for _, m := range mixDep.FindAllStringSubmatch(string(data), -1) {
+		dep := m[1]
+		if !seen[dep] {
+			seen[dep] = true
 			frameworks = append(frameworks, Framework{
-				Name:     name,
+				Name:     dep,
 				Language: "elixir",
-				Evidence: "mix.exs: " + dep,
+				Evidence: "mix.exs",
 			})
 		}
 	}
@@ -54,11 +49,20 @@ func (d *ElixirDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
 		eps = append(eps, Entrypoint{Path: "lib/application.ex", Kind: "main"})
 	}
 
-	// Look for router
 	for _, f := range idx.All() {
 		base := filepath.Base(f.RelPath)
 		if base == "router.ex" {
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "route"})
+		}
+	}
+
+	// Look for Application modules in lib/<app>/ directories
+	for _, f := range idx.All() {
+		if f.Lang != "elixir" || !strings.HasPrefix(f.RelPath, "lib/") {
+			continue
+		}
+		if filepath.Base(f.RelPath) == "application.ex" && f.RelPath != "lib/application.ex" {
+			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
 		}
 	}
 

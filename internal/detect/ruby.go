@@ -3,10 +3,14 @@ package detect
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/djtouchette/recon/internal/index"
 )
+
+// Matches gem "name" or gem 'name' in Gemfile
+var gemRe = regexp.MustCompile(`^\s*gem\s+['"]([^'"]+)['"]`)
 
 type RubyDetector struct{}
 
@@ -15,49 +19,36 @@ func (d *RubyDetector) DetectFrameworks(idx *index.FileIndex, root string) []Fra
 		return nil
 	}
 
-	var frameworks []Framework
 	data, err := os.ReadFile(filepath.Join(root, "Gemfile"))
 	if err != nil {
 		return nil
 	}
-	content := strings.ToLower(string(data))
 
-	fws := map[string]string{
-		"rails":    "Ruby on Rails",
-		"sinatra":  "Sinatra",
-		"hanami":   "Hanami",
-		"rspec":    "RSpec",
-		"sidekiq":  "Sidekiq",
-		"grape":    "Grape",
-	}
+	var frameworks []Framework
+	seen := make(map[string]bool)
 
-	for dep, name := range fws {
-		if strings.Contains(content, dep) {
-			frameworks = append(frameworks, Framework{
-				Name:     name,
-				Language: "ruby",
-				Evidence: "Gemfile: " + dep,
-			})
-		}
-	}
-
-	if hasFile(idx, "Rakefile") || hasFile(idx, "config/routes.rb") {
-		found := false
-		for _, f := range frameworks {
-			if f.Name == "Ruby on Rails" {
-				found = true
-				break
-			}
-		}
-		if !found {
-			if hasFile(idx, "config/routes.rb") {
+	for _, line := range strings.Split(string(data), "\n") {
+		if m := gemRe.FindStringSubmatch(line); m != nil {
+			dep := m[1]
+			if !seen[dep] {
+				seen[dep] = true
 				frameworks = append(frameworks, Framework{
-					Name:     "Ruby on Rails",
+					Name:     dep,
 					Language: "ruby",
-					Evidence: "config/routes.rb",
+					Evidence: "Gemfile",
 				})
 			}
 		}
+	}
+
+	// Config file markers
+	if hasFile(idx, "config/routes.rb") && !seen["rails"] {
+		seen["rails"] = true
+		frameworks = append(frameworks, Framework{
+			Name:     "rails",
+			Language: "ruby",
+			Evidence: "config/routes.rb",
+		})
 	}
 
 	return frameworks

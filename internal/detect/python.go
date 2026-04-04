@@ -3,11 +3,15 @@ package detect
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/djtouchette/recon/internal/index"
 	"github.com/djtouchette/recon/internal/scan"
 )
+
+// Matches "package==1.0" or "package>=1.0" or "package~=1.0" or just "package"
+var pyReqRe = regexp.MustCompile(`^([a-zA-Z0-9][a-zA-Z0-9._-]*)`)
 
 type PythonDetector struct{}
 
@@ -19,63 +23,105 @@ func (d *PythonDetector) DetectFrameworks(idx *index.FileIndex, root string) []F
 	var frameworks []Framework
 	seen := make(map[string]bool)
 
-	// Check requirements files
-	reqFiles := []string{"requirements.txt", "requirements.in", "requirements-dev.txt"}
-	for _, rf := range reqFiles {
+	addDep := func(name, evidence string) {
+		if !seen[name] {
+			seen[name] = true
+			frameworks = append(frameworks, Framework{
+				Name:     name,
+				Language: "python",
+				Evidence: evidence,
+			})
+		}
+	}
+
+	// Parse requirements*.txt files
+	for _, rf := range []string{"requirements.txt", "requirements.in", "requirements-dev.txt"} {
 		data, err := os.ReadFile(filepath.Join(root, rf))
 		if err != nil {
 			continue
 		}
-		content := strings.ToLower(string(data))
-		detectPythonDeps(content, rf, seen, &frameworks)
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "-") {
+				continue
+			}
+			if m := pyReqRe.FindStringSubmatch(line); m != nil {
+				addDep(m[1], rf)
+			}
+		}
 	}
 
-	// Check pyproject.toml
+	// Parse pyproject.toml — extract dependency names from [project.dependencies]
 	if data, err := os.ReadFile(filepath.Join(root, "pyproject.toml")); err == nil {
-		content := strings.ToLower(string(data))
-		detectPythonDeps(content, "pyproject.toml", seen, &frameworks)
+		parsePyprojectDeps(string(data), "pyproject.toml", addDep)
 	}
 
-	// Check Pipfile
+	// Parse Pipfile — extract package names from [packages] and [dev-packages]
 	if data, err := os.ReadFile(filepath.Join(root, "Pipfile")); err == nil {
-		content := strings.ToLower(string(data))
-		detectPythonDeps(content, "Pipfile", seen, &frameworks)
+		parsePipfileDeps(string(data), "Pipfile", addDep)
 	}
 
 	// Config file markers
-	if hasFile(idx, "manage.py") && !seen["Django"] {
-		frameworks = append(frameworks, Framework{Name: "Django", Language: "python", Evidence: "manage.py"})
+	if hasFile(idx, "manage.py") {
+		addDep("django", "manage.py")
 	}
 
 	return frameworks
 }
 
-func detectPythonDeps(content, source string, seen map[string]bool, frameworks *[]Framework) {
-	fws := map[string]string{
-		"django":       "Django",
-		"flask":        "Flask",
-		"fastapi":      "FastAPI",
-		"starlette":    "Starlette",
-		"tornado":      "Tornado",
-		"celery":       "Celery",
-		"sqlalchemy":   "SQLAlchemy",
-		"pytest":       "pytest",
-		"pandas":       "pandas",
-		"numpy":        "NumPy",
-		"tensorflow":   "TensorFlow",
-		"torch":        "PyTorch",
-		"scikit-learn": "scikit-learn",
-		"pydantic":     "Pydantic",
+// parsePyprojectDeps extracts dependencies from pyproject.toml.
+// Looks for lines in [project.dependencies] or [project.optional-dependencies.*].
+func parsePyprojectDeps(content, source string, addDep func(string, string)) {
+	inDeps := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "[project]" || strings.HasPrefix(trimmed, "[project.optional-dependencies") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "[") {
+			inDeps = false
+			continue
+		}
+		if trimmed == "dependencies = [" || strings.HasSuffix(trimmed, "= [") {
+			inDeps = true
+			continue
+		}
+		if trimmed == "]" {
+			inDeps = false
+			continue
+		}
+		if inDeps {
+			// Lines look like: "django>=4.0",
+			dep := strings.Trim(trimmed, `",' `)
+			if m := pyReqRe.FindStringSubmatch(dep); m != nil {
+				addDep(m[1], source)
+			}
+		}
 	}
+}
 
-	for dep, name := range fws {
-		if strings.Contains(content, dep) && !seen[name] {
-			seen[name] = true
-			*frameworks = append(*frameworks, Framework{
-				Name:     name,
-				Language: "python",
-				Evidence: source + ": " + dep,
-			})
+// parsePipfileDeps extracts package names from Pipfile [packages] and [dev-packages].
+func parsePipfileDeps(content, source string, addDep func(string, string)) {
+	inPkgs := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "[packages]" || trimmed == "[dev-packages]" {
+			inPkgs = true
+			continue
+		}
+		if strings.HasPrefix(trimmed, "[") {
+			inPkgs = false
+			continue
+		}
+		if inPkgs {
+			// Lines look like: django = "*" or requests = {version = ">=2.0"}
+			eq := strings.IndexByte(trimmed, '=')
+			if eq > 0 {
+				name := strings.TrimSpace(trimmed[:eq])
+				if name != "" && !strings.HasPrefix(name, "#") {
+					addDep(name, source)
+				}
+			}
 		}
 	}
 }
@@ -102,7 +148,6 @@ func (d *PythonDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
 		}
 	}
 
-	// Look for __main__.py in packages
 	for _, f := range idx.All() {
 		if f.Class != scan.ClassSource {
 			continue

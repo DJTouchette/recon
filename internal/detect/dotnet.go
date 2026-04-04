@@ -3,10 +3,20 @@ package detect
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/djtouchette/recon/internal/index"
 	"github.com/djtouchette/recon/internal/scan"
+)
+
+var (
+	// Matches <PackageReference Include="Foo.Bar" ... /> or <PackageReference Include="Foo.Bar">
+	packageRefRe = regexp.MustCompile(`<PackageReference\s+Include="([^"]+)"`)
+	// Matches <PackageVersion Include="Foo.Bar" ... /> (Directory.Packages.props central management)
+	packageVerRe = regexp.MustCompile(`<PackageVersion\s+Include="([^"]+)"`)
+	// Matches Sdk="Microsoft.NET.Sdk.Web" or <Project Sdk="...">
+	sdkRe = regexp.MustCompile(`Sdk="([^"]+)"`)
 )
 
 type DotNetDetector struct{}
@@ -20,95 +30,74 @@ func (d *DotNetDetector) DetectFrameworks(idx *index.FileIndex, root string) []F
 	var frameworks []Framework
 	seen := make(map[string]bool)
 
-	// Check .csproj files for framework references
+	addPkg := func(name, evidence string) {
+		if !seen[name] {
+			seen[name] = true
+			frameworks = append(frameworks, Framework{
+				Name:     name,
+				Language: "csharp",
+				Evidence: evidence,
+			})
+		}
+	}
+
+	// Parse .csproj / .fsproj files
 	for _, f := range idx.ByClass(scan.ClassConfig) {
 		ext := strings.ToLower(filepath.Ext(f.RelPath))
 		if ext != ".csproj" && ext != ".fsproj" {
 			continue
 		}
-
 		data, err := os.ReadFile(filepath.Join(root, f.RelPath))
 		if err != nil {
 			continue
 		}
 		content := string(data)
 
-		csprojFws := map[string]string{
-			// Web
-			"Microsoft.AspNetCore":                 "ASP.NET Core",
-			"Microsoft.NET.Sdk.Web":                "ASP.NET Core",
-			"Microsoft.NET.Sdk.BlazorWebAssembly":  "Blazor",
-			"Blazor":                               "Blazor",
-			"SignalR":                               "SignalR",
-			// MAUI / Mobile / Desktop
-			"Microsoft.Maui":                       ".NET MAUI",
-			"Microsoft.NET.Sdk.Maui":               ".NET MAUI",
-			"Xamarin.Forms":                         "Xamarin.Forms",
-			"Xamarin.Essentials":                    "Xamarin",
-			"Avalonia":                              "Avalonia UI",
-			"Uno.WinUI":                             "Uno Platform",
-			// ORM / Data
-			"Microsoft.EntityFrameworkCore":         "Entity Framework Core",
-			"Dapper":                                "Dapper",
-			"Newtonsoft.Json":                       "Newtonsoft.Json",
-			"System.Text.Json":                      "System.Text.Json",
-			// Patterns / Architecture
-			"MediatR":                               "MediatR",
-			"AutoMapper":                            "AutoMapper",
-			"FluentValidation":                      "FluentValidation",
-			"Polly":                                 "Polly",
-			// Logging / Observability
-			"Serilog":                               "Serilog",
-			"NLog":                                  "NLog",
-			"OpenTelemetry":                         "OpenTelemetry",
-			// API / Docs
-			"Swashbuckle":                           "Swagger/Swashbuckle",
-			"NSwag":                                 "NSwag",
-			// Messaging / Jobs
-			"MassTransit":                           "MassTransit",
-			"Hangfire":                              "Hangfire",
-			"RabbitMQ.Client":                       "RabbitMQ",
-			// Identity / Auth
-			"Microsoft.AspNetCore.Identity":         "ASP.NET Identity",
-			"IdentityServer":                        "IdentityServer",
-			"Duende.IdentityServer":                 "Duende IdentityServer",
-			// Testing
-			"xunit":                                 "xUnit",
-			"NUnit":                                 "NUnit",
-			"MSTest":                                "MSTest",
-			"Moq":                                   "Moq",
-			"NSubstitute":                           "NSubstitute",
-			"FluentAssertions":                      "FluentAssertions",
-			"Bogus":                                 "Bogus",
-			// gRPC
-			"Grpc.AspNetCore":                       "gRPC",
-			"Google.Protobuf":                       "Protobuf",
-			// Worker / Hosted Services
-			"Microsoft.NET.Sdk.Worker":              ".NET Worker Service",
+		// Detect SDK type (ASP.NET, MAUI, Worker, Blazor, etc.)
+		for _, m := range sdkRe.FindAllStringSubmatch(content, -1) {
+			sdk := m[1]
+			if name, ok := sdkNames[sdk]; ok {
+				addPkg(name, f.RelPath+": Sdk="+sdk)
+			}
 		}
 
-		for dep, name := range csprojFws {
-			if strings.Contains(content, dep) && !seen[name] {
-				seen[name] = true
-				frameworks = append(frameworks, Framework{
-					Name:     name,
-					Language: "csharp",
-					Evidence: f.RelPath + ": " + dep,
-				})
-			}
+		// Extract all PackageReferences
+		for _, m := range packageRefRe.FindAllStringSubmatch(content, -1) {
+			addPkg(m[1], f.RelPath)
 		}
 	}
 
-	// Check for .sln file (indicates a .NET solution)
-	for _, f := range idx.ByClass(scan.ClassConfig) {
-		if strings.HasSuffix(strings.ToLower(f.RelPath), ".sln") && !seen[".NET Solution"] {
-			seen[".NET Solution"] = true
-			// Don't add as framework, it's just structure
-			break
+	// Parse Directory.Build.props and Directory.Packages.props
+	for _, propsFile := range []string{
+		"Directory.Build.props",
+		"Directory.Packages.props",
+		"Directory.Build.targets",
+	} {
+		data, err := os.ReadFile(filepath.Join(root, propsFile))
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		for _, m := range packageRefRe.FindAllStringSubmatch(content, -1) {
+			addPkg(m[1], propsFile)
+		}
+		for _, m := range packageVerRe.FindAllStringSubmatch(content, -1) {
+			addPkg(m[1], propsFile)
 		}
 	}
 
 	return frameworks
+}
+
+// sdkNames maps well-known SDK identifiers to friendly names.
+// Everything else comes straight from PackageReference parsing.
+var sdkNames = map[string]string{
+	"Microsoft.NET.Sdk.Web":               "ASP.NET Core",
+	"Microsoft.NET.Sdk.BlazorWebAssembly": "Blazor WebAssembly",
+	"Microsoft.NET.Sdk.Razor":             "Razor",
+	"Microsoft.NET.Sdk.Worker":            ".NET Worker Service",
+	"Microsoft.Maui.Sdk":                  ".NET MAUI",
+	"Tizen.NET.Sdk":                       "Tizen .NET",
 }
 
 func (d *DotNetDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
@@ -132,11 +121,9 @@ func (d *DotNetDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "route"})
 		}
 
-		// Look for controller files
 		if strings.HasSuffix(base, "Controller.cs") {
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "handler"})
 		}
-		// Look for Razor pages / Blazor components
 		if strings.HasSuffix(base, ".razor.cs") {
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "handler"})
 		}

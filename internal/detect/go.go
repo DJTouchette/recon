@@ -3,11 +3,14 @@ package detect
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/djtouchette/recon/internal/index"
 	"github.com/djtouchette/recon/internal/scan"
 )
+
+var goRequireRe = regexp.MustCompile(`^\s+([\w./-]+)\s+v`)
 
 type GoDetector struct{}
 
@@ -16,36 +19,43 @@ func (d *GoDetector) DetectFrameworks(idx *index.FileIndex, root string) []Frame
 		return nil
 	}
 
-	var frameworks []Framework
-
 	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
 	if err != nil {
 		return nil
 	}
-	content := string(data)
 
-	fws := map[string]string{
-		"github.com/gin-gonic/gin":    "Gin",
-		"github.com/labstack/echo":    "Echo",
-		"github.com/gofiber/fiber":    "Fiber",
-		"github.com/gorilla/mux":      "Gorilla Mux",
-		"github.com/go-chi/chi":       "Chi",
-		"github.com/spf13/cobra":      "Cobra",
-		"github.com/urfave/cli":       "urfave/cli",
-		"google.golang.org/grpc":      "gRPC",
-		"github.com/graphql-go/graphql": "GraphQL",
-		"gorm.io/gorm":                "GORM",
-		"entgo.io/ent":                "Ent",
-		"github.com/jmoiron/sqlx":     "sqlx",
-	}
+	var frameworks []Framework
+	seen := make(map[string]bool)
 
-	for dep, name := range fws {
-		if strings.Contains(content, dep) {
-			frameworks = append(frameworks, Framework{
-				Name:     name,
-				Language: "go",
-				Evidence: "go.mod: " + dep,
-			})
+	// Parse require blocks from go.mod
+	inRequire := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "require (" {
+			inRequire = true
+			continue
+		}
+		if trimmed == ")" {
+			inRequire = false
+			continue
+		}
+		if !inRequire {
+			continue
+		}
+		// Skip indirect dependencies
+		if strings.Contains(trimmed, "// indirect") {
+			continue
+		}
+		if m := goRequireRe.FindStringSubmatch(line); m != nil {
+			dep := m[1]
+			if !seen[dep] {
+				seen[dep] = true
+				frameworks = append(frameworks, Framework{
+					Name:     dep,
+					Language: "go",
+					Evidence: "go.mod",
+				})
+			}
 		}
 	}
 

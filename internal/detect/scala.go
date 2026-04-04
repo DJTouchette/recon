@@ -3,17 +3,18 @@ package detect
 import (
 	"os"
 	"path/filepath"
-	"strings"
+	"regexp"
 
 	"github.com/djtouchette/recon/internal/index"
 )
 
+// Matches "org" %% "artifact" or "org" % "artifact" in build.sbt
+var sbtDep = regexp.MustCompile(`"[^"]+"\s+%%?\s+"([^"]+)"`)
+
 type ScalaDetector struct{}
 
 func (d *ScalaDetector) DetectFrameworks(idx *index.FileIndex, root string) []Framework {
-	// Check for build.sbt (SBT projects)
 	hasSBT := hasFile(idx, "build.sbt")
-	// Check for build.sc (Mill projects)
 	hasMill := hasFile(idx, "build.sc")
 
 	if !hasSBT && !hasMill {
@@ -21,55 +22,51 @@ func (d *ScalaDetector) DetectFrameworks(idx *index.FileIndex, root string) []Fr
 	}
 
 	var frameworks []Framework
+	seen := make(map[string]bool)
 
-	// Read build definition for dependency detection
-	var content string
 	if hasSBT {
 		data, err := os.ReadFile(filepath.Join(root, "build.sbt"))
 		if err == nil {
-			content = string(data)
+			for _, m := range sbtDep.FindAllStringSubmatch(string(data), -1) {
+				dep := m[1]
+				if !seen[dep] {
+					seen[dep] = true
+					frameworks = append(frameworks, Framework{
+						Name:     dep,
+						Language: "scala",
+						Evidence: "build.sbt",
+					})
+				}
+			}
 		}
 	}
+
 	if hasMill {
 		data, err := os.ReadFile(filepath.Join(root, "build.sc"))
 		if err == nil {
-			content += "\n" + string(data)
+			// Mill uses ivy"org::artifact:version" syntax
+			for _, m := range sbtDep.FindAllStringSubmatch(string(data), -1) {
+				dep := m[1]
+				if !seen[dep] {
+					seen[dep] = true
+					frameworks = append(frameworks, Framework{
+						Name:     dep,
+						Language: "scala",
+						Evidence: "build.sc",
+					})
+				}
+			}
 		}
 	}
 
-	fws := map[string]string{
-		"play":          "Play Framework",
-		"akka-http":     "Akka HTTP",
-		"akka-actor":    "Akka",
-		"akka-stream":   "Akka Streams",
-		"http4s":        "http4s",
-		"zio":           "ZIO",
-		"cats-effect":   "Cats Effect",
-		"fs2":           "FS2",
-		"slick":         "Slick",
-		"doobie":        "Doobie",
-		"quill":         "Quill",
-		"circe":         "Circe",
-		"tapir":         "Tapir",
-		"scalatest":     "ScalaTest",
-		"specs2":        "Specs2",
-		"munit":         "MUnit",
-		"spark":         "Apache Spark",
-		"flink":         "Apache Flink",
-		"lagom":         "Lagom",
-		"finatra":       "Finatra",
-		"scalatra":      "Scalatra",
-		"pekko":         "Pekko",
-	}
-
-	for dep, name := range fws {
-		if strings.Contains(content, dep) {
-			frameworks = append(frameworks, Framework{
-				Name:     name,
-				Language: "scala",
-				Evidence: "build definition: " + dep,
-			})
-		}
+	// Check for Play Framework routes file
+	if hasFile(idx, "conf/routes") && !seen["play"] {
+		seen["play"] = true
+		frameworks = append(frameworks, Framework{
+			Name:     "play",
+			Language: "scala",
+			Evidence: "conf/routes",
+		})
 	}
 
 	return frameworks
@@ -78,7 +75,6 @@ func (d *ScalaDetector) DetectFrameworks(idx *index.FileIndex, root string) []Fr
 func (d *ScalaDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
 	var eps []Entrypoint
 
-	// Look for common entrypoint patterns
 	for _, f := range idx.All() {
 		if f.Lang != "scala" {
 			continue
@@ -92,7 +88,6 @@ func (d *ScalaDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
 		}
 	}
 
-	// Check for Play Framework routes file
 	if hasFile(idx, "conf/routes") {
 		eps = append(eps, Entrypoint{Path: "conf/routes", Kind: "route"})
 	}

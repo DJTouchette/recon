@@ -3,10 +3,14 @@ package detect
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/djtouchette/recon/internal/index"
 )
+
+// Matches "  dep_name: ^1.0.0" or "  dep_name:" style lines in pubspec.yaml
+var pubspecDep = regexp.MustCompile(`^\s{2,4}(\w[\w_-]*):\s*`)
 
 type DartDetector struct{}
 
@@ -15,41 +19,55 @@ func (d *DartDetector) DetectFrameworks(idx *index.FileIndex, root string) []Fra
 		return nil
 	}
 
-	var frameworks []Framework
 	data, err := os.ReadFile(filepath.Join(root, "pubspec.yaml"))
 	if err != nil {
 		return nil
 	}
-	content := string(data)
 
-	fws := map[string]string{
-		"flutter:":         "Flutter",
-		"flutter_bloc:":    "BLoC",
-		"riverpod:":        "Riverpod",
-		"provider:":        "Provider",
-		"get:":             "GetX",
-		"dio:":             "Dio",
-		"freezed:":         "Freezed",
-		"drift:":           "Drift",
-		"isar:":            "Isar",
-		"hive:":            "Hive",
-		"go_router:":       "GoRouter",
-		"auto_route:":      "AutoRoute",
-		"flutter_test:":    "Flutter Test",
-		"mockito:":         "Mockito",
-		"bloc_test:":       "BLoC Test",
-		"shelf:":           "Shelf",
-		"dart_frog:":       "Dart Frog",
-		"serverpod:":       "Serverpod",
-	}
+	var frameworks []Framework
+	seen := make(map[string]bool)
 
-	for dep, name := range fws {
-		if strings.Contains(content, dep) {
-			frameworks = append(frameworks, Framework{
-				Name:     name,
-				Language: "dart",
-				Evidence: "pubspec.yaml: " + strings.TrimSuffix(dep, ":"),
-			})
+	// Parse dependencies and dev_dependencies sections from pubspec.yaml
+	inDeps := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+
+		// Detect section headers
+		if trimmed == "dependencies:" || trimmed == "dev_dependencies:" || trimmed == "dependency_overrides:" {
+			inDeps = true
+			continue
+		}
+		// Any other top-level key ends the deps section
+		if len(line) > 0 && line[0] != ' ' && line[0] != '\t' && strings.Contains(line, ":") {
+			inDeps = false
+			continue
+		}
+
+		if inDeps {
+			if m := pubspecDep.FindStringSubmatch(line); m != nil {
+				dep := m[1]
+				// Skip the flutter SDK pseudo-dependency
+				if dep == "sdk" || dep == "flutter" {
+					// "flutter" as a dep is actually the Flutter SDK — still worth reporting
+					if dep == "flutter" && !seen[dep] {
+						seen[dep] = true
+						frameworks = append(frameworks, Framework{
+							Name:     "flutter",
+							Language: "dart",
+							Evidence: "pubspec.yaml",
+						})
+					}
+					continue
+				}
+				if !seen[dep] {
+					seen[dep] = true
+					frameworks = append(frameworks, Framework{
+						Name:     dep,
+						Language: "dart",
+						Evidence: "pubspec.yaml",
+					})
+				}
+			}
 		}
 	}
 
@@ -76,7 +94,6 @@ func (d *DartDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
 		}
 	}
 
-	// Look for routes in common Flutter routing locations
 	for _, f := range idx.All() {
 		base := filepath.Base(f.RelPath)
 		if base == "router.dart" || base == "routes.dart" || base == "app_router.dart" {
