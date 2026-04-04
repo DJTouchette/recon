@@ -99,6 +99,39 @@ type SearchResult struct {
 	Symbol    *SymbolInfo `json:"symbol,omitempty"`
 }
 
+// GrepSummary is a quick overview before detailed results.
+type GrepSummary struct {
+	Files       int `json:"files"`
+	Total       int `json:"total"`
+	Definitions int `json:"definitions"`
+	References  int `json:"references"`
+	Tests       int `json:"tests"`
+	Comments    int `json:"comments"`
+	Truncated   int `json:"truncated,omitempty"` // files not shown due to cap
+}
+
+// GrepResult is the top-level grep response.
+type GrepResult struct {
+	Summary GrepSummary      `json:"summary"`
+	Files   []GrepFileResult `json:"files"`
+}
+
+// GrepFileResult groups grep matches by file with shared metrics.
+type GrepFileResult struct {
+	Path         string     `json:"path"`
+	FanIn        int        `json:"fan_in"`
+	HotspotScore float64    `json:"hotspot_score"`
+	Matches      []GrepLine `json:"matches"`
+}
+
+// GrepLine is a single matched line within a file.
+type GrepLine struct {
+	Line      int    `json:"line"`
+	Text      string `json:"text"`
+	MatchType string `json:"type"` // "definition", "reference", "comment", "test"
+	Similar   int    `json:"similar,omitempty"` // count of additional lines with identical text
+}
+
 type RelatedOption func(*relatedConfig)
 
 type relatedConfig struct {

@@ -15,8 +15,9 @@ import (
 )
 
 var (
-	flagHuman bool
-	flagRoot  string
+	flagHuman    bool
+	flagRoot     string
+	flagCacheDir string
 )
 
 // NewRootCmd returns the fully constructed recon command tree.
@@ -38,6 +39,7 @@ func NewRootCmd(version string) *cobra.Command {
 
 	root.PersistentFlags().BoolVar(&flagHuman, "human", false, "human-readable output")
 	root.PersistentFlags().StringVar(&flagRoot, "root", "", "repo root (default: cwd)")
+	root.PersistentFlags().StringVar(&flagCacheDir, "cache-dir", "", "cache directory (default: <root>/.recon/)")
 
 	root.AddCommand(overviewCmd())
 	root.AddCommand(relatedCmd())
@@ -49,6 +51,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(changesCmd())
 	root.AddCommand(refreshCmd())
 	root.AddCommand(rebuildCmd())
+	root.AddCommand(grepCmd())
 	root.AddCommand(&cobra.Command{
 		Use:   "version",
 		Short: "Version info",
@@ -60,13 +63,22 @@ func NewRootCmd(version string) *cobra.Command {
 	return root
 }
 
+// newRecon creates a Recon instance with the current flag values.
+func newRecon() (*recon.Recon, error) {
+	var opts []recon.Option
+	if flagCacheDir != "" {
+		opts = append(opts, recon.WithCacheDir(flagCacheDir))
+	}
+	return recon.New(flagRoot, opts...)
+}
+
 func overviewCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "overview",
 		Short: "Structured repo summary",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			start := time.Now()
-			r, err := recon.New(flagRoot)
+			r, err := newRecon()
 			if err != nil {
 				return err
 			}
@@ -93,7 +105,7 @@ func relatedCmd() *cobra.Command {
 		Short: "Find related files",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			r, err := recon.New(flagRoot)
+			r, err := newRecon()
 			if err != nil {
 				return err
 			}
@@ -116,18 +128,19 @@ func relatedCmd() *cobra.Command {
 }
 
 func testsCmd() *cobra.Command {
-	return &cobra.Command{
+	var maxResults int
+	cmd := &cobra.Command{
 		Use:   "tests <path>",
 		Short: "Find test files for a path",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			r, err := recon.New(flagRoot)
+			r, err := newRecon()
 			if err != nil {
 				return err
 			}
 			defer r.Close()
 
-			tests, err := r.Tests(args[0])
+			tests, err := r.Tests(args[0], maxResults)
 			if err != nil {
 				return err
 			}
@@ -139,15 +152,18 @@ func testsCmd() *cobra.Command {
 			return outputJSON(cmd, tests)
 		},
 	}
+	cmd.Flags().IntVarP(&maxResults, "max", "n", 20, "max results")
+	return cmd
 }
 
 func symbolsCmd() *cobra.Command {
-	return &cobra.Command{
+	var maxResults int
+	cmd := &cobra.Command{
 		Use:   "symbols [query]",
 		Short: "Search symbols (functions, classes, types). Use 'file:path' to list symbols in a file.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			r, err := recon.New(flagRoot)
+			r, err := newRecon()
 			if err != nil {
 				return err
 			}
@@ -158,7 +174,7 @@ func symbolsCmd() *cobra.Command {
 				query = args[0]
 			}
 
-			symbols, err := r.Symbols(query)
+			symbols, err := r.Symbols(query, maxResults)
 			if err != nil {
 				return err
 			}
@@ -170,6 +186,8 @@ func symbolsCmd() *cobra.Command {
 			return outputJSON(cmd, symbols)
 		},
 	}
+	cmd.Flags().IntVarP(&maxResults, "max", "n", 30, "max results")
+	return cmd
 }
 
 func searchCmd() *cobra.Command {
@@ -179,7 +197,7 @@ func searchCmd() *cobra.Command {
 		Short: "Unified search across symbols, file paths, and file previews",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			r, err := recon.New(flagRoot)
+			r, err := newRecon()
 			if err != nil {
 				return err
 			}
@@ -207,7 +225,7 @@ func contextCmd() *cobra.Command {
 		Short: "File context: preview, owners, metrics, nearby configs",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			r, err := recon.New(flagRoot)
+			r, err := newRecon()
 			if err != nil {
 				return err
 			}
@@ -233,7 +251,7 @@ func hotspotsCmd() *cobra.Command {
 		Use:   "hotspots",
 		Short: "Top files by hotspot score (fan-in * churn) — risky to change",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			r, err := recon.New(flagRoot)
+			r, err := newRecon()
 			if err != nil {
 				return err
 			}
@@ -261,7 +279,7 @@ func changesCmd() *cobra.Command {
 		Use:   "changes",
 		Short: "Recent change summary",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			r, err := recon.New(flagRoot)
+			r, err := newRecon()
 			if err != nil {
 				return err
 			}
@@ -289,7 +307,7 @@ func refreshCmd() *cobra.Command {
 		Short: "Incremental cache update",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			start := time.Now()
-			r, err := recon.New(flagRoot)
+			r, err := newRecon()
 			if err != nil {
 				return err
 			}
@@ -310,7 +328,7 @@ func rebuildCmd() *cobra.Command {
 		Short: "Full rescan from scratch",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			start := time.Now()
-			r, err := recon.New(flagRoot)
+			r, err := newRecon()
 			if err != nil {
 				return err
 			}
@@ -485,6 +503,73 @@ func printTestsHuman(cmd *cobra.Command, tests []recon.TestFile) {
 			fmt.Fprintf(w, " — covers %s", t.ForFile)
 		}
 		fmt.Fprintln(w)
+	}
+}
+
+func grepCmd() *cobra.Command {
+	var (
+		maxFiles   int
+		typeFilter string
+	)
+	cmd := &cobra.Command{
+		Use:   "grep <pattern>",
+		Short: "Enriched grep — matches grouped by file with definitions, metrics, and classification",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			r, err := newRecon()
+			if err != nil {
+				return err
+			}
+			defer r.Close()
+
+			result, err := r.Grep(args[0], recon.GrepOptions{
+				MaxFiles:   maxFiles,
+				TypeFilter: typeFilter,
+			})
+			if err != nil {
+				return err
+			}
+
+			if flagHuman {
+				printGrepHuman(cmd, result)
+				return nil
+			}
+			return outputJSON(cmd, result)
+		},
+	}
+	cmd.Flags().IntVarP(&maxFiles, "max", "n", 20, "max files to show")
+	cmd.Flags().StringVarP(&typeFilter, "type", "t", "", "filter by match type: definition, reference, test, comment")
+	return cmd
+}
+
+func printGrepHuman(cmd *cobra.Command, result *recon.GrepResult) {
+	w := cmd.OutOrStdout()
+	s := result.Summary
+	if s.Total == 0 {
+		fmt.Fprintln(w, "No matches.")
+		return
+	}
+
+	fmt.Fprintf(w, "%d matches across %d files", s.Total, s.Files)
+	fmt.Fprintf(w, " (%d def, %d ref, %d test, %d comment)", s.Definitions, s.References, s.Tests, s.Comments)
+	if s.Truncated > 0 {
+		fmt.Fprintf(w, " — showing %d files, %d more with --max %d", len(result.Files), s.Truncated, s.Files)
+	}
+	fmt.Fprintln(w)
+
+	for _, f := range result.Files {
+		fmt.Fprintf(w, "\n  %s  (fan-in: %d, hotspot: %.2f)\n", f.Path, f.FanIn, f.HotspotScore)
+		for _, m := range f.Matches {
+			text := m.Text
+			if len(text) > 90 {
+				text = text[:90] + "..."
+			}
+			suffix := ""
+			if m.Similar > 0 {
+				suffix = fmt.Sprintf("  ... +%d similar", m.Similar)
+			}
+			fmt.Fprintf(w, "    %4d  %-10s  %s%s\n", m.Line, m.MatchType, text, suffix)
+		}
 	}
 }
 

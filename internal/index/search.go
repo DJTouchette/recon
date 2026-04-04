@@ -1,6 +1,9 @@
 package index
 
 import (
+	"bufio"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -11,13 +14,13 @@ import (
 type SearchResult struct {
 	Path      string   `json:"path"`
 	Score     float64  `json:"score"`
-	MatchType string   `json:"match_type"` // "symbol", "file_path", "preview"
+	MatchType string   `json:"match_type"` // "symbol", "file_path", "preview", "content"
 	Context   string   `json:"context"`    // matched symbol signature, preview line, or path
 	Symbol    *Symbol  `json:"symbol,omitempty"`
 }
 
-// Search performs a unified search across symbols, file paths, and previews.
-func Search(query string, idx *FileIndex, symbols *SymbolIndex, extras map[string]*FileExtra, maxResults int) []SearchResult {
+// Search performs a unified search across symbols, file paths, previews, and file content.
+func Search(query string, root string, idx *FileIndex, symbols *SymbolIndex, extras map[string]*FileExtra, maxResults int) []SearchResult {
 	if maxResults <= 0 {
 		maxResults = 30
 	}
@@ -160,6 +163,27 @@ func Search(query string, idx *FileIndex, symbols *SymbolIndex, extras map[strin
 		})
 	}
 
+	// --- Content grep (lowest weight) ---
+	// Only grep files not already matched by higher-tier searches.
+	if root != "" {
+		for _, f := range idx.All() {
+			if f.Class != scan.ClassSource && f.Class != scan.ClassTest && f.Class != scan.ClassConfig {
+				continue
+			}
+			if _, already := scores[f.RelPath]; already {
+				continue
+			}
+			if line := grepFile(filepath.Join(root, f.RelPath), tokens); line != "" {
+				addMatch(f.RelPath, 0.2, SearchResult{
+					Path:      f.RelPath,
+					Score:     0.2,
+					MatchType: "content",
+					Context:   line,
+				})
+			}
+		}
+	}
+
 	// Flatten: pick the best match per file, use accumulated score for ranking
 	var results []SearchResult
 	for _, fs := range scores {
@@ -189,4 +213,35 @@ func Search(query string, idx *FileIndex, symbols *SymbolIndex, extras map[strin
 	}
 
 	return results
+}
+
+// grepFile scans a file line-by-line and returns the first line containing all tokens.
+// Returns empty string if no match or file can't be read.
+func grepFile(path string, tokens []string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		lineLower := strings.ToLower(line)
+		allMatch := true
+		for _, tok := range tokens {
+			if !strings.Contains(lineLower, tok) {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			trimmed := strings.TrimSpace(line)
+			if len(trimmed) > 200 {
+				trimmed = trimmed[:200]
+			}
+			return trimmed
+		}
+	}
+	return ""
 }

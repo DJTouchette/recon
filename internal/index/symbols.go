@@ -321,6 +321,10 @@ func extractSymbols(fullPath, relPath string, patterns []symbolPattern) []Symbol
 			if m == nil {
 				continue
 			}
+			if len(m) < 2 {
+				// Pattern matched but has no capture group (e.g. defstruct).
+				continue
+			}
 			name := m[1]
 			// Skip private/underscore names in some languages
 			if name == "_" || name == "" {

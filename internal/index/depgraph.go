@@ -126,24 +126,40 @@ var (
 	pyImport     = regexp.MustCompile(`^import\s+(\S+)`)
 
 	csUsing = regexp.MustCompile(`^using\s+(?:static\s+)?([A-Za-z][\w.]*)\s*;`)
+
+	// Elixir module reference patterns
+	exModuleRef = regexp.MustCompile(`\b([A-Z][A-Za-z0-9]*(?:\.[A-Z][A-Za-z0-9]*)+)`)
 )
 
 func extractImports(root string, f *scan.FileEntry, goModPath string, idx *FileIndex) []string {
 	fullPath := filepath.Join(root, f.RelPath)
 
-	// Only read the first 150 lines — imports are at the top
-	lines, err := readHeadLines(fullPath, 150)
-	if err != nil {
-		return nil
-	}
-
 	switch f.Lang {
 	case "go":
+		lines, err := readHeadLines(fullPath, 150)
+		if err != nil {
+			return nil
+		}
 		return resolveGoImports(lines, f.RelPath, goModPath, idx)
 	case "javascript", "typescript":
+		lines, err := readHeadLines(fullPath, 150)
+		if err != nil {
+			return nil
+		}
 		return resolveJSImports(lines, f.RelPath, idx)
 	case "python":
+		lines, err := readHeadLines(fullPath, 150)
+		if err != nil {
+			return nil
+		}
 		return resolvePyImports(lines, f.RelPath, idx)
+	case "elixir":
+		// Elixir needs full file scan — module refs appear anywhere, not just top
+		lines, err := readAllLines(fullPath)
+		if err != nil {
+			return nil
+		}
+		return resolveElixirImports(lines, f.RelPath, idx)
 	default:
 		return nil
 	}
@@ -268,6 +284,118 @@ func resolvePyImports(lines []string, filePath string, idx *FileIndex) []string 
 		// We only track relative imports for accuracy
 	}
 	return resolved
+}
+
+func readAllLines(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	return lines, scanner.Err()
+}
+
+// resolveElixirImports finds module references in an Elixir file and resolves
+// them to file paths. Elixir modules are referenced by name (e.g.,
+// QuotePilot.Notifications.Providers.Twilio) and map to file paths by convention.
+func resolveElixirImports(lines []string, filePath string, idx *FileIndex) []string {
+	// Build module name → file path lookup from all .ex files.
+	// Convention: lib/quote_pilot/notifications/sms.ex → QuotePilot.Notifications.Sms
+	modToFile := buildElixirModuleMap(idx)
+
+	// Find the module defined in this file so we don't self-reference.
+	selfModule := ""
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "defmodule ") {
+			parts := strings.Fields(trimmed)
+			if len(parts) >= 2 {
+				selfModule = strings.TrimSuffix(parts[1], ",")
+				break
+			}
+		}
+	}
+
+	seen := make(map[string]bool)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		// Skip comments and module doc strings
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		for _, m := range exModuleRef.FindAllString(line, -1) {
+			if m == selfModule {
+				continue
+			}
+			target, ok := modToFile[m]
+			if !ok {
+				continue
+			}
+			if target == filePath {
+				continue
+			}
+			if !seen[target] {
+				seen[target] = true
+			}
+		}
+	}
+
+	result := make([]string, 0, len(seen))
+	for path := range seen {
+		result = append(result, path)
+	}
+	return result
+}
+
+// buildElixirModuleMap creates a mapping from Elixir module names to file paths
+// by reading the actual defmodule line from each .ex file.
+func buildElixirModuleMap(idx *FileIndex) map[string]string {
+	modMap := make(map[string]string)
+	for _, f := range idx.All() {
+		if f.Lang != "elixir" {
+			continue
+		}
+		if !strings.HasPrefix(f.RelPath, "lib/") {
+			continue
+		}
+		modName := readDefmodule(filepath.Join("lib", strings.TrimPrefix(f.RelPath, "lib/")))
+		if modName != "" {
+			modMap[modName] = f.RelPath
+		}
+	}
+	return modMap
+}
+
+// readDefmodule reads the first defmodule declaration from an Elixir file.
+// Returns the module name (e.g., "QuotePilot.Notifications.SMS") or "".
+func readDefmodule(path string) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "defmodule ") {
+			// Extract module name: "defmodule QuotePilot.Notifications.SMS do"
+			rest := strings.TrimPrefix(line, "defmodule ")
+			// Module name ends at space or comma
+			if idx := strings.IndexAny(rest, " ,"); idx > 0 {
+				return rest[:idx]
+			}
+			return rest
+		}
+	}
+	return ""
 }
 
 func resolvePyRelative(dir, imp string) string {

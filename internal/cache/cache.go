@@ -37,14 +37,20 @@ type Snapshot struct {
 
 // Store manages the SQLite cache database.
 type Store struct {
-	db   *sql.DB
-	Root string
-	path string
+	db       *sql.DB
+	Root     string
+	path     string
+	cacheDir string // directory containing the DB file
 }
 
-// Open creates or opens the cache database.
+// Open creates or opens the cache database in <root>/.recon/.
 func Open(root string) (*Store, error) {
-	dir := filepath.Join(root, cacheDir)
+	return OpenAt(root, filepath.Join(root, cacheDir))
+}
+
+// OpenAt creates or opens the cache database in the given directory.
+// This allows callers (e.g. rivet) to store the cache elsewhere.
+func OpenAt(root, dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
@@ -66,7 +72,7 @@ func Open(root string) (*Store, error) {
 		db.Exec(pragma)
 	}
 
-	s := &Store{db: db, Root: root, path: dbPath}
+	s := &Store{db: db, Root: root, path: dbPath, cacheDir: dir}
 	if err := s.ensureSchema(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
@@ -823,5 +829,5 @@ func (s *Store) UpdateFileExtras(extras []index.FileExtra, removedFiles []string
 // Clear removes the cache database file.
 func (s *Store) Clear() error {
 	s.db.Close()
-	return os.RemoveAll(filepath.Join(s.Root, cacheDir))
+	return os.RemoveAll(s.cacheDir)
 }

@@ -31,15 +31,38 @@ type Recon struct {
 	isGit     bool
 }
 
+// Option configures Recon behaviour.
+type Option func(*options)
+
+type options struct {
+	cacheDir string
+}
+
+// WithCacheDir stores the cache in the given directory instead of <root>/.recon/.
+func WithCacheDir(dir string) Option {
+	return func(o *options) { o.cacheDir = dir }
+}
+
 // New creates a Recon instance rooted at the given directory.
 // It loads from cache when fresh, refreshes when HEAD changed, or rebuilds from scratch.
-func New(root string) (*Recon, error) {
+func New(root string, opts ...Option) (*Recon, error) {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve root: %w", err)
 	}
 
-	store, err := cache.Open(absRoot)
+	var store *cache.Store
+	if o.cacheDir != "" {
+		absCache, _ := filepath.Abs(o.cacheDir)
+		store, err = cache.OpenAt(absRoot, absCache)
+	} else {
+		store, err = cache.Open(absRoot)
+	}
 	if err != nil {
 		// Can't open DB — rebuild without persistent cache
 		r := &Recon{root: absRoot, isGit: gitpkg.IsGitRepo(absRoot)}
@@ -207,7 +230,7 @@ func (r *Recon) Search(query string, maxResults int) ([]SearchResult, error) {
 		maxResults = 30
 	}
 
-	results := index.Search(query, r.idx, r.symbols, r.extras, maxResults)
+	results := index.Search(query, r.root, r.idx, r.symbols, r.extras, maxResults)
 
 	var out []SearchResult
 	for _, sr := range results {
@@ -233,7 +256,12 @@ func (r *Recon) Search(query string, maxResults int) ([]SearchResult, error) {
 
 // Symbols returns symbols matching the query. If query is empty, returns all symbols.
 // If query starts with "file:", returns symbols for that specific file.
-func (r *Recon) Symbols(query string) ([]SymbolInfo, error) {
+// maxResults caps output (0 = default 30, -1 = unlimited).
+func (r *Recon) Symbols(query string, maxResults int) ([]SymbolInfo, error) {
+	if maxResults == 0 {
+		maxResults = 30
+	}
+
 	var syms []index.Symbol
 
 	if strings.HasPrefix(query, "file:") {
@@ -247,6 +275,9 @@ func (r *Recon) Symbols(query string) ([]SymbolInfo, error) {
 
 	var out []SymbolInfo
 	for _, s := range syms {
+		if maxResults > 0 && len(out) >= maxResults {
+			break
+		}
 		out = append(out, SymbolInfo{
 			File:      s.File,
 			Name:      s.Name,
@@ -272,7 +303,11 @@ func (r *Recon) FileDetail(path string) (*FileDetail, error) {
 }
 
 // Tests returns test files relevant to the given path.
-func (r *Recon) Tests(path string) ([]TestFile, error) {
+// maxResults caps output (0 = default 20, -1 = unlimited).
+func (r *Recon) Tests(path string, maxResults int) ([]TestFile, error) {
+	if maxResults == 0 {
+		maxResults = 20
+	}
 	path = filepath.Clean(path)
 
 	testPaths := r.tests.TestsFor(path)
@@ -298,8 +333,126 @@ func (r *Recon) Tests(path string) ([]TestFile, error) {
 			Kind:    index.ClassifyTestKind(tp),
 			ForFile: r.tests.SourceFor(tp),
 		})
+		if maxResults > 0 && len(out) >= maxResults {
+			break
+		}
 	}
 	return out, nil
+}
+
+// GrepOptions configures grep behavior.
+type GrepOptions struct {
+	MaxFiles  int    // max files to return (default 20)
+	TypeFilter string // filter by match type: "definition", "reference", "test", "comment", or ""
+}
+
+// Grep searches file content for a pattern and returns results grouped by file.
+// Each match is classified as definition, reference, comment, or test.
+// Duplicate text within a file is collapsed with a Similar count.
+func (r *Recon) Grep(pattern string, opts GrepOptions) (*GrepResult, error) {
+	if pattern == "" {
+		return nil, fmt.Errorf("pattern is required")
+	}
+	if opts.MaxFiles <= 0 {
+		opts.MaxFiles = 20
+	}
+
+	raw := index.Grep(pattern, r.root, r.idx, r.symbols, r.metrics)
+
+	// Filter by type if requested.
+	if opts.TypeFilter != "" {
+		var filtered []index.GrepMatch
+		for _, m := range raw {
+			if m.MatchType == opts.TypeFilter {
+				filtered = append(filtered, m)
+			}
+		}
+		raw = filtered
+	}
+
+	// Build summary from ALL matches (before file cap).
+	summary := GrepSummary{}
+	fileMap := make(map[string]*GrepFileResult)
+	var order []string
+
+	for _, m := range raw {
+		// Count for summary.
+		summary.Total++
+		switch m.MatchType {
+		case "definition":
+			summary.Definitions++
+		case "reference":
+			summary.References++
+		case "test":
+			summary.Tests++
+		case "comment":
+			summary.Comments++
+		}
+
+		fr, ok := fileMap[m.Path]
+		if !ok {
+			fr = &GrepFileResult{
+				Path:         m.Path,
+				FanIn:        m.FanIn,
+				HotspotScore: m.HotspotScore,
+			}
+			fileMap[m.Path] = fr
+			order = append(order, m.Path)
+		}
+		fr.Matches = append(fr.Matches, GrepLine{
+			Line:      m.Line,
+			Text:      m.Text,
+			MatchType: m.MatchType,
+		})
+	}
+
+	summary.Files = len(order)
+
+	// Collapse duplicate text within each file.
+	for _, fr := range fileMap {
+		fr.Matches = collapseMatches(fr.Matches)
+	}
+
+	// Cap files.
+	var files []GrepFileResult
+	for _, path := range order {
+		if len(files) >= opts.MaxFiles {
+			break
+		}
+		files = append(files, *fileMap[path])
+	}
+	if len(order) > opts.MaxFiles {
+		summary.Truncated = len(order) - opts.MaxFiles
+	}
+
+	return &GrepResult{Summary: summary, Files: files}, nil
+}
+
+// collapseMatches deduplicates lines with identical text within a file.
+// Keeps the first occurrence and sets Similar to the count of duplicates.
+func collapseMatches(matches []GrepLine) []GrepLine {
+	if len(matches) <= 1 {
+		return matches
+	}
+
+	type key struct {
+		text      string
+		matchType string
+	}
+	seen := make(map[key]int) // key → index in result
+	var result []GrepLine
+
+	for _, m := range matches {
+		k := key{text: m.Text, matchType: m.MatchType}
+		if idx, ok := seen[k]; ok {
+			result[idx].Similar++
+		} else {
+			seen[k] = len(result)
+			result = append(result, m)
+		}
+	}
+
+	return result
 }
 
 // RecentChanges returns a summary of recent git activity.
