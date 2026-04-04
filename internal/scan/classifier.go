@@ -219,6 +219,18 @@ func isTestFile(nameNoExt, ext, dir string) bool {
 		if strings.HasSuffix(nameNoExt, "Test") || strings.HasSuffix(nameNoExt, "Tests") || strings.HasSuffix(nameNoExt, "IT") {
 			return true
 		}
+	case ".kt", ".kts":
+		if strings.HasSuffix(nameNoExt, "Test") || strings.HasSuffix(nameNoExt, "Tests") {
+			return true
+		}
+	case ".swift":
+		if strings.HasSuffix(nameNoExt, "Tests") || strings.HasSuffix(nameNoExt, "Test") {
+			return true
+		}
+	case ".php":
+		if strings.HasSuffix(nameNoExt, "Test") {
+			return true
+		}
 	}
 
 	// Directory-based test detection (only for source files)

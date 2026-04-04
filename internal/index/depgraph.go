@@ -2,6 +2,7 @@ package index
 
 import (
 	"bufio"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -127,8 +128,24 @@ var (
 
 	csUsing = regexp.MustCompile(`^using\s+(?:static\s+)?([A-Za-z][\w.]*)\s*;`)
 
+	javaImportRe   = regexp.MustCompile(`^import\s+(?:static\s+)?([A-Za-z][\w.]*)\s*;`)
+	kotlinImportRe = regexp.MustCompile(`^import\s+([A-Za-z][\w.]*)\s*$`)
+
+	rbRequire         = regexp.MustCompile(`^\s*require\s+['"]([^'"]+)['"]`)
+	rbRequireRelative = regexp.MustCompile(`^\s*require_relative\s+['"]([^'"]+)['"]`)
+
 	// Elixir module reference patterns
 	exModuleRef = regexp.MustCompile(`\b([A-Z][A-Za-z0-9]*(?:\.[A-Z][A-Za-z0-9]*)+)`)
+
+	// Rust import patterns
+	rsUseStmt = regexp.MustCompile(`^use\s+((?:crate|self|super)(?:::\w+)+)`)
+	rsModDecl = regexp.MustCompile(`^(?:pub\s+)?mod\s+(\w+)\s*[;{]`)
+
+	// PHP use statement pattern
+	phpUseStmt = regexp.MustCompile(`^use\s+(?:function\s+|const\s+)?([A-Z][\w\\]+)`)
+
+	// Swift import pattern
+	swiftImportRe = regexp.MustCompile(`^import\s+([A-Za-z_]\w*)`)
 )
 
 func extractImports(root string, f *scan.FileEntry, goModPath string, idx *FileIndex) []string {
@@ -153,6 +170,48 @@ func extractImports(root string, f *scan.FileEntry, goModPath string, idx *FileI
 			return nil
 		}
 		return resolvePyImports(lines, f.RelPath, idx)
+	case "java":
+		lines, err := readHeadLines(fullPath, 100)
+		if err != nil {
+			return nil
+		}
+		return resolveJavaImports(lines, f.RelPath, "java", idx)
+	case "kotlin":
+		lines, err := readHeadLines(fullPath, 100)
+		if err != nil {
+			return nil
+		}
+		return resolveJavaImports(lines, f.RelPath, "kotlin", idx)
+	case "csharp":
+		lines, err := readHeadLines(fullPath, 100)
+		if err != nil {
+			return nil
+		}
+		return resolveCSharpImports(lines, f.RelPath, idx)
+	case "ruby":
+		lines, err := readHeadLines(fullPath, 100)
+		if err != nil {
+			return nil
+		}
+		return resolveRubyImports(lines, f.RelPath, idx)
+	case "rust":
+		lines, err := readHeadLines(fullPath, 150)
+		if err != nil {
+			return nil
+		}
+		return resolveRustImports(lines, f.RelPath, idx)
+	case "swift":
+		lines, err := readHeadLines(fullPath, 50)
+		if err != nil {
+			return nil
+		}
+		return resolveSwiftImports(lines, f.RelPath, idx)
+	case "php":
+		lines, err := readHeadLines(fullPath, 100)
+		if err != nil {
+			return nil
+		}
+		return resolvePHPImports(lines, f.RelPath, root, idx)
 	case "elixir":
 		// Elixir needs full file scan — module refs appear anywhere, not just top
 		lines, err := readAllLines(fullPath)
@@ -261,6 +320,318 @@ func resolveJSPath(target string, idx *FileIndex) string {
 	return ""
 }
 
+func resolveRubyImports(lines []string, filePath string, idx *FileIndex) []string {
+	dir := filepath.Dir(filePath)
+	seen := make(map[string]bool)
+	var resolved []string
+
+	for _, line := range lines {
+		// require_relative — resolve relative to the current file's directory
+		if m := rbRequireRelative.FindStringSubmatch(line); m != nil {
+			imp := m[1]
+			target := filepath.Clean(filepath.Join(dir, imp))
+			if !strings.HasSuffix(target, ".rb") {
+				target += ".rb"
+			}
+			if idx.Exists(target) && !seen[target] {
+				seen[target] = true
+				resolved = append(resolved, target)
+			}
+			continue
+		}
+
+		// require — try common Ruby source roots
+		if m := rbRequire.FindStringSubmatch(line); m != nil {
+			imp := m[1]
+			// Skip gem-like requires: no "/" or "." and no local file match
+			if !strings.Contains(imp, "/") && !strings.Contains(imp, ".") {
+				found := false
+				for _, root := range []string{"lib/", "app/", "src/"} {
+					candidate := root + imp + ".rb"
+					if idx.Exists(candidate) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					continue
+				}
+			}
+
+			for _, root := range []string{"lib/", "app/", "src/", ""} {
+				candidate := filepath.Clean(root + imp)
+				if !strings.HasSuffix(candidate, ".rb") {
+					candidate += ".rb"
+				}
+				if idx.Exists(candidate) && !seen[candidate] {
+					seen[candidate] = true
+					resolved = append(resolved, candidate)
+					break
+				}
+			}
+		}
+	}
+	return resolved
+}
+
+func resolveJavaImports(lines []string, filePath string, lang string, idx *FileIndex) []string {
+	seen := make(map[string]bool)
+	var resolved []string
+
+	// Pick regex based on language
+	re := javaImportRe
+	if lang == "kotlin" {
+		re = kotlinImportRe
+	}
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		m := re.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		imp := m[1]
+
+		// Skip standard library imports
+		if strings.HasPrefix(imp, "java.") || strings.HasPrefix(imp, "javax.") ||
+			strings.HasPrefix(imp, "kotlin.") || strings.HasPrefix(imp, "kotlinx.") ||
+			strings.HasPrefix(imp, "android.") {
+			continue
+		}
+
+		// For static imports, take the class part.
+		// If the last segment starts with lowercase, it's a member — strip it.
+		parts := strings.Split(imp, ".")
+		if len(parts) > 1 {
+			last := parts[len(parts)-1]
+			if len(last) > 0 && last[0] >= 'a' && last[0] <= 'z' {
+				parts = parts[:len(parts)-1]
+			}
+		}
+
+		// Convert dots to path separators: com.example.User → com/example/User
+		classPath := strings.Join(parts, "/")
+
+		// Source root prefixes to try (plus root-level with empty prefix)
+		roots := []string{
+			"src/main/java/",
+			"src/main/kotlin/",
+			"src/",
+			"app/src/main/java/",
+			"app/src/main/kotlin/",
+			"",
+		}
+		exts := []string{".java", ".kt"}
+
+		for _, root := range roots {
+			for _, ext := range exts {
+				candidate := root + classPath + ext
+				if idx.Exists(candidate) && candidate != filePath && !seen[candidate] {
+					seen[candidate] = true
+					resolved = append(resolved, candidate)
+				}
+			}
+		}
+	}
+	return resolved
+}
+
+// resolveCSharpImports finds using statements in a C# file and resolves them
+// to file paths by matching namespace segments against the file index. C# has no
+// strict namespace-to-file mapping, so we use directory-based heuristics.
+func resolveCSharpImports(lines []string, filePath string, idx *FileIndex) []string {
+	seen := make(map[string]bool)
+	var resolved []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		m := csUsing.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		ns := m[1]
+
+		// Skip system/framework namespaces
+		if strings.HasPrefix(ns, "System") || strings.HasPrefix(ns, "Microsoft") ||
+			strings.HasPrefix(ns, "NuGet") {
+			continue
+		}
+
+		// Convert dots to path separators: MyApp.Models → MyApp/Models
+		nsPath := strings.ReplaceAll(ns, ".", "/")
+		segments := strings.Split(ns, ".")
+
+		// Build suffix patterns from the last 2–3 segments for looser matching.
+		// E.g., MyApp.Services.Auth → try "Services/Auth", "MyApp/Services/Auth"
+		var suffixes []string
+		for i := len(segments) - 1; i >= 0 && len(segments)-i <= 3; i-- {
+			suffixes = append(suffixes, strings.Join(segments[i:], "/"))
+		}
+
+		// Common .NET source root prefixes
+		roots := []string{"src/", ""}
+
+		// Strategy 1: direct path match under common roots
+		foundDirect := false
+		for _, root := range roots {
+			// Look for any .cs file inside a directory matching the namespace
+			files := idx.FilesInDir(root + nsPath)
+			for _, f := range files {
+				if f.Lang == "csharp" && f.RelPath != filePath && !seen[f.RelPath] {
+					seen[f.RelPath] = true
+					resolved = append(resolved, f.RelPath)
+					foundDirect = true
+				}
+			}
+		}
+
+		// Strategy 2: scan all .cs files for directory paths ending with namespace segments.
+		// Only do the expensive scan if strategy 1 found nothing for this namespace.
+		if !foundDirect {
+			for _, f := range idx.All() {
+				if f.Lang != "csharp" || f.RelPath == filePath || seen[f.RelPath] {
+					continue
+				}
+				relDir := filepath.Dir(f.RelPath)
+				lowerDir := strings.ToLower(filepath.ToSlash(relDir))
+				for _, suffix := range suffixes {
+					lowerSuffix := strings.ToLower(suffix)
+					if strings.HasSuffix(lowerDir, lowerSuffix) || lowerDir == lowerSuffix {
+						seen[f.RelPath] = true
+						resolved = append(resolved, f.RelPath)
+						break
+					}
+				}
+			}
+		}
+	}
+	return resolved
+}
+
+func resolveRustImports(lines []string, filePath string, idx *FileIndex) []string {
+	dir := filepath.Dir(filePath)
+	seen := make(map[string]bool)
+	var resolved []string
+
+	// Find the crate root (src/) relative to the project
+	// Walk up from the file to find the enclosing src/ directory
+	crateRoot := ""
+	parts := strings.Split(filepath.ToSlash(filePath), "/")
+	for i := len(parts) - 1; i >= 0; i-- {
+		if parts[i] == "src" {
+			crateRoot = strings.Join(parts[:i+1], "/")
+			break
+		}
+	}
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// mod declarations: mod child; -> {dir}/child.rs or {dir}/child/mod.rs
+		if m := rsModDecl.FindStringSubmatch(trimmed); m != nil {
+			child := m[1]
+			// Skip common non-import mod keywords
+			if child == "tests" || child == "test" {
+				continue
+			}
+			for _, candidate := range []string{
+				filepath.Join(dir, child+".rs"),
+				filepath.Join(dir, child, "mod.rs"),
+			} {
+				if idx.Exists(candidate) && !seen[candidate] {
+					seen[candidate] = true
+					resolved = append(resolved, candidate)
+					break
+				}
+			}
+			continue
+		}
+
+		// use statements: use crate::a::b, use self::x, use super::x
+		if m := rsUseStmt.FindStringSubmatch(trimmed); m != nil {
+			imp := m[1]
+			segments := strings.Split(imp, "::")
+
+			if len(segments) < 2 {
+				continue
+			}
+
+			switch segments[0] {
+			case "crate":
+				if crateRoot == "" {
+					continue
+				}
+				// Strip "crate", convert remaining segments to path
+				modParts := segments[1:]
+				modPath := strings.Join(modParts, "/")
+
+				// Try full path as file: src/a/b/c.rs
+				// Try full path as dir module: src/a/b/c/mod.rs
+				// Try parent file (item might be defined in parent module): src/a/b.rs
+				candidates := []string{
+					filepath.Join(crateRoot, modPath+".rs"),
+					filepath.Join(crateRoot, modPath, "mod.rs"),
+				}
+				if len(modParts) > 1 {
+					parentPath := strings.Join(modParts[:len(modParts)-1], "/")
+					candidates = append(candidates, filepath.Join(crateRoot, parentPath+".rs"))
+				}
+				for _, candidate := range candidates {
+					if idx.Exists(candidate) && !seen[candidate] && candidate != filePath {
+						seen[candidate] = true
+						resolved = append(resolved, candidate)
+						break
+					}
+				}
+
+			case "super":
+				// use super::x -> go up one directory
+				parentDir := filepath.Dir(dir)
+				modParts := segments[1:]
+				modPath := strings.Join(modParts, "/")
+
+				candidates := []string{
+					filepath.Join(parentDir, modPath+".rs"),
+					filepath.Join(parentDir, modPath, "mod.rs"),
+				}
+				if len(modParts) > 1 {
+					parentPath := strings.Join(modParts[:len(modParts)-1], "/")
+					candidates = append(candidates, filepath.Join(parentDir, parentPath+".rs"))
+				}
+				for _, candidate := range candidates {
+					if idx.Exists(candidate) && !seen[candidate] && candidate != filePath {
+						seen[candidate] = true
+						resolved = append(resolved, candidate)
+						break
+					}
+				}
+
+			case "self":
+				// use self::x -> resolve in same directory
+				modParts := segments[1:]
+				modPath := strings.Join(modParts, "/")
+
+				candidates := []string{
+					filepath.Join(dir, modPath+".rs"),
+					filepath.Join(dir, modPath, "mod.rs"),
+				}
+				if len(modParts) > 1 {
+					parentPath := strings.Join(modParts[:len(modParts)-1], "/")
+					candidates = append(candidates, filepath.Join(dir, parentPath+".rs"))
+				}
+				for _, candidate := range candidates {
+					if idx.Exists(candidate) && !seen[candidate] && candidate != filePath {
+						seen[candidate] = true
+						resolved = append(resolved, candidate)
+						break
+					}
+				}
+			}
+		}
+	}
+	return resolved
+}
+
 func resolvePyImports(lines []string, filePath string, idx *FileIndex) []string {
 	dir := filepath.Dir(filePath)
 	var resolved []string
@@ -284,6 +655,129 @@ func resolvePyImports(lines []string, filePath string, idx *FileIndex) []string 
 		// We only track relative imports for accuracy
 	}
 	return resolved
+}
+
+// resolvePHPImports resolves PHP use statements to local file paths.
+// It parses PSR-4 namespace imports and maps them to files using composer.json
+// autoload config when available, falling back to common directory conventions.
+func resolvePHPImports(lines []string, filePath string, root string, idx *FileIndex) []string {
+	seen := make(map[string]bool)
+	var resolved []string
+
+	// Parse composer.json PSR-4 autoload mappings if available
+	psr4Map := parsePHPComposerPSR4(root)
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+
+		m := phpUseStmt.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		fqcn := m[1]
+
+		// Skip PHP built-in namespaces that won't resolve to local files
+		if isPHPBuiltinNamespace(fqcn) {
+			continue
+		}
+
+		// Convert backslashes to forward slashes for path resolution
+		classPath := strings.ReplaceAll(fqcn, "\\", "/") + ".php"
+
+		// Strategy 1: Try composer.json PSR-4 mappings
+		for prefix, dirs := range psr4Map {
+			nsPrefix := strings.ReplaceAll(prefix, "\\", "/")
+			if strings.HasPrefix(classPath, nsPrefix) {
+				remainder := strings.TrimPrefix(classPath, nsPrefix)
+				for _, dir := range dirs {
+					candidate := filepath.Clean(filepath.Join(dir, remainder))
+					if idx.Exists(candidate) && candidate != filePath && !seen[candidate] {
+						seen[candidate] = true
+						resolved = append(resolved, candidate)
+					}
+				}
+			}
+		}
+
+		// Strategy 2: Try direct path (namespace mirrors directory structure)
+		if idx.Exists(classPath) && classPath != filePath && !seen[classPath] {
+			seen[classPath] = true
+			resolved = append(resolved, classPath)
+		}
+
+		// Strategy 3: Strip first namespace segment and try common root prefixes
+		// e.g., App\Models\User → Models/User.php under src/, app/, lib/
+		parts := strings.SplitN(fqcn, "\\", 2)
+		if len(parts) == 2 {
+			remainder := strings.ReplaceAll(parts[1], "\\", "/") + ".php"
+			for _, prefix := range []string{"src/", "app/", "lib/", ""} {
+				candidate := filepath.Clean(prefix + remainder)
+				if idx.Exists(candidate) && candidate != filePath && !seen[candidate] {
+					seen[candidate] = true
+					resolved = append(resolved, candidate)
+				}
+			}
+		}
+	}
+	return resolved
+}
+
+// parsePHPComposerPSR4 reads composer.json and extracts PSR-4 autoload mappings.
+// Returns a map from namespace prefix to directory paths.
+func parsePHPComposerPSR4(root string) map[string][]string {
+	data, err := os.ReadFile(filepath.Join(root, "composer.json"))
+	if err != nil {
+		return nil
+	}
+
+	var composer struct {
+		Autoload struct {
+			PSR4 map[string]json.RawMessage `json:"psr-4"`
+		} `json:"autoload"`
+	}
+	if err := json.Unmarshal(data, &composer); err != nil {
+		return nil
+	}
+
+	result := make(map[string][]string)
+	for ns, raw := range composer.Autoload.PSR4 {
+		// PSR-4 values can be a string or array of strings
+		var single string
+		if err := json.Unmarshal(raw, &single); err == nil {
+			result[ns] = []string{single}
+			continue
+		}
+		var multiple []string
+		if err := json.Unmarshal(raw, &multiple); err == nil {
+			result[ns] = multiple
+		}
+	}
+	return result
+}
+
+// isPHPBuiltinNamespace returns true for PHP standard/extension namespaces
+// that won't resolve to local project files.
+func isPHPBuiltinNamespace(fqcn string) bool {
+	builtins := []string{
+		"Psr\\",
+		"Symfony\\",
+		"Illuminate\\",
+		"Doctrine\\",
+		"PHPUnit\\",
+		"GuzzleHttp\\",
+		"Monolog\\",
+		"Carbon\\",
+		"Ramsey\\",
+		"Faker\\",
+		"League\\",
+		"Composer\\",
+	}
+	for _, prefix := range builtins {
+		if strings.HasPrefix(fqcn, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func readAllLines(path string) ([]string, error) {
@@ -396,6 +890,152 @@ func readDefmodule(path string) string {
 		}
 	}
 	return ""
+}
+
+// swiftSystemFrameworks lists common Apple/system frameworks to skip during import resolution.
+var swiftSystemFrameworks = map[string]bool{
+	"Foundation": true, "UIKit": true, "SwiftUI": true, "Combine": true,
+	"CoreData": true, "CoreGraphics": true, "CoreLocation": true, "CoreImage": true,
+	"CoreText": true, "CoreFoundation": true, "CoreML": true, "CoreMotion": true,
+	"CoreBluetooth": true, "CoreMedia": true, "CoreVideo": true, "CoreAudio": true,
+	"AVFoundation": true, "ARKit": true, "AppKit": true, "Accelerate": true,
+	"AuthenticationServices": true, "BackgroundTasks": true, "CallKit": true,
+	"CarPlay": true, "CloudKit": true, "Contacts": true, "ContactsUI": true,
+	"CryptoKit": true, "Darwin": true, "Dispatch": true, "EventKit": true,
+	"GameKit": true, "GameplayKit": true, "HealthKit": true, "HomeKit": true,
+	"MapKit": true, "MediaPlayer": true, "MessageUI": true, "Metal": true,
+	"MetalKit": true, "MultipeerConnectivity": true, "NaturalLanguage": true,
+	"Network": true, "NotificationCenter": true, "ObjectiveC": true,
+	"PassKit": true, "PhotosUI": true, "Photos": true, "PushKit": true,
+	"QuartzCore": true, "RealityKit": true, "ReplayKit": true, "SafariServices": true,
+	"SceneKit": true, "Security": true, "SpriteKit": true, "StoreKit": true,
+	"SystemConfiguration": true, "UserNotifications": true, "Vision": true,
+	"WatchKit": true, "WebKit": true, "WidgetKit": true, "XCTest": true,
+	"os": true, "Swift": true, "SwiftData": true, "Observation": true,
+}
+
+// resolveSwiftImports resolves Swift import statements to local source files.
+// It maps cross-module dependencies in Swift Package Manager projects.
+func resolveSwiftImports(lines []string, filePath string, idx *FileIndex) []string {
+	// Collect imported module names
+	var moduleNames []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		m := swiftImportRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		modName := m[1]
+		if swiftSystemFrameworks[modName] {
+			continue
+		}
+		moduleNames = append(moduleNames, modName)
+	}
+	if len(moduleNames) == 0 {
+		return nil
+	}
+
+	// Build a map of local module/target names → source directories
+	localTargets := buildSwiftTargetMap(idx)
+
+	seen := make(map[string]bool)
+	var resolved []string
+	for _, modName := range moduleNames {
+		dirs, ok := localTargets[modName]
+		if !ok {
+			continue
+		}
+		for _, dir := range dirs {
+			for _, f := range idx.FilesInDir(dir) {
+				if f.Lang == "swift" && f.Class == scan.ClassSource && f.RelPath != filePath && !seen[f.RelPath] {
+					seen[f.RelPath] = true
+					resolved = append(resolved, f.RelPath)
+				}
+			}
+		}
+	}
+	return resolved
+}
+
+// buildSwiftTargetMap discovers local Swift package targets and maps their names
+// to source directories. It looks for Package.swift to find .target(name:) definitions,
+// falling back to a directory-based heuristic under Sources/.
+func buildSwiftTargetMap(idx *FileIndex) map[string][]string {
+	targets := make(map[string][]string)
+
+	// Check if Package.swift exists in the index
+	if idx.Exists("Package.swift") {
+		targets = parseSwiftPackageTargets(idx)
+	}
+
+	// Fallback/supplement: look for directories under Sources/
+	for _, f := range idx.All() {
+		if f.Lang != "swift" {
+			continue
+		}
+		if !strings.HasPrefix(f.RelPath, "Sources/") {
+			continue
+		}
+		// Extract the module directory: Sources/<ModuleName>/...
+		rest := strings.TrimPrefix(f.RelPath, "Sources/")
+		parts := strings.SplitN(rest, "/", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		modName := parts[0]
+		modDir := "Sources/" + modName
+		if _, ok := targets[modName]; !ok {
+			targets[modName] = []string{modDir}
+		}
+	}
+
+	return targets
+}
+
+// swiftTargetNameRe matches .target(name: "Foo" or .executableTarget(name: "Foo" patterns.
+var swiftTargetNameRe = regexp.MustCompile(`\.(?:target|executableTarget|testTarget)\s*\(\s*name:\s*"([^"]+)"`)
+
+// swiftTargetPathRe matches path: "some/path" within a target definition.
+var swiftTargetPathRe = regexp.MustCompile(`path:\s*"([^"]+)"`)
+
+// parseSwiftPackageTargets reads Package.swift and extracts target name → directory mappings.
+func parseSwiftPackageTargets(idx *FileIndex) map[string][]string {
+	targets := make(map[string][]string)
+
+	// Read the Package.swift file
+	lines, err := readAllLines("Package.swift")
+	if err != nil {
+		return targets
+	}
+
+	for i, line := range lines {
+		m := swiftTargetNameRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		targetName := m[1]
+		// Skip test targets
+		if strings.Contains(line, ".testTarget") {
+			continue
+		}
+
+		// Look for a path: override in the next few lines
+		customPath := ""
+		for j := i; j < len(lines) && j < i+5; j++ {
+			if pm := swiftTargetPathRe.FindStringSubmatch(lines[j]); pm != nil {
+				customPath = pm[1]
+				break
+			}
+		}
+
+		if customPath != "" {
+			targets[targetName] = []string{customPath}
+		} else {
+			// Default SPM convention: Sources/<TargetName>
+			targets[targetName] = []string{"Sources/" + targetName}
+		}
+	}
+	return targets
 }
 
 func resolvePyRelative(dir, imp string) string {

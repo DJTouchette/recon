@@ -177,6 +177,88 @@ func findSourceForTest(test *scan.FileEntry, sourceByKey map[string]string, idx 
 				candidates = append(candidates, testlessDir+"/"+srcName+ext)
 			}
 		}
+
+	case ".rs":
+		// foo_test.rs → foo.rs (rare but exists)
+		if strings.HasSuffix(name, "_test") {
+			srcName := strings.TrimSuffix(name, "_test")
+			candidates = append(candidates, dir+"/"+srcName+ext)
+		}
+		// Files in tests/ directory → try matching by name against src/ files
+		if strings.Contains(dir, "tests") {
+			srcDir := strings.Replace(dir, "tests", "src", 1)
+			candidates = append(candidates, srcDir+"/"+name+ext)
+		}
+		// src/foo/tests.rs → src/foo/mod.rs or src/foo.rs
+		if name == "tests" {
+			candidates = append(candidates, dir+"/mod.rs")
+			parentDir := filepath.Dir(dir)
+			dirBase := filepath.Base(dir)
+			candidates = append(candidates, parentDir+"/"+dirBase+".rs")
+		}
+
+	case ".kt", ".kts":
+		// FooTest.kt → Foo.kt (same as Java pattern)
+		srcName := name
+		srcName = strings.TrimSuffix(srcName, "Tests")
+		srcName = strings.TrimSuffix(srcName, "Test")
+		if srcName != name {
+			candidates = append(candidates, dir+"/"+srcName+ext)
+			// src/test/kotlin/... → src/main/kotlin/...
+			testlessDir := strings.Replace(dir, "src/test/kotlin", "src/main/kotlin", 1)
+			if testlessDir != dir {
+				candidates = append(candidates, testlessDir+"/"+srcName+ext)
+			}
+			// Also try .java extension (mixed Kotlin/Java projects)
+			candidates = append(candidates, dir+"/"+srcName+".java")
+			if testlessDir != dir {
+				candidates = append(candidates, testlessDir+"/"+srcName+".java")
+			}
+		}
+
+	case ".php":
+		// FooTest.php → Foo.php
+		srcName := name
+		srcName = strings.TrimSuffix(srcName, "Test")
+		if srcName != name {
+			candidates = append(candidates, dir+"/"+srcName+ext)
+			// tests/... → src/... (PSR-4 convention)
+			testlessDir := strings.Replace(dir, "tests/", "src/", 1)
+			if testlessDir != dir {
+				candidates = append(candidates, testlessDir+"/"+srcName+ext)
+			}
+			// tests/Unit/FooTest.php → src/Foo.php or app/Foo.php
+			unitlessDir := strings.Replace(dir, "tests/Unit/", "src/", 1)
+			if unitlessDir != dir {
+				candidates = append(candidates, unitlessDir+"/"+srcName+ext)
+			}
+			appDir := strings.Replace(dir, "tests/Unit/", "app/", 1)
+			if appDir != dir {
+				candidates = append(candidates, appDir+"/"+srcName+ext)
+			}
+			appDir2 := strings.Replace(dir, "tests/", "app/", 1)
+			if appDir2 != dir {
+				candidates = append(candidates, appDir2+"/"+srcName+ext)
+			}
+		}
+
+	case ".swift":
+		// FooTests.swift → Foo.swift; FooTest.swift → Foo.swift
+		srcName := name
+		srcName = strings.TrimSuffix(srcName, "Tests")
+		srcName = strings.TrimSuffix(srcName, "Test")
+		if srcName != name {
+			candidates = append(candidates, dir+"/"+srcName+ext)
+			// Tests/ModuleTests/FooTests.swift → Sources/Module/Foo.swift
+			if strings.HasPrefix(dir, "Tests/") {
+				testModDir := strings.TrimPrefix(dir, "Tests/")
+				// Strip "Tests" suffix from module test directory name
+				testModDir = strings.TrimSuffix(testModDir, "Tests")
+				testModDir = strings.TrimSuffix(testModDir, "Test")
+				srcDir := "Sources/" + testModDir
+				candidates = append(candidates, srcDir+"/"+srcName+ext)
+			}
+		}
 	}
 
 	// Check candidates against the index
