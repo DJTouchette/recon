@@ -43,6 +43,8 @@ var detectors = []Detector{
 	&ElixirDetector{},
 	&DotNetDetector{},
 	&JavaDetector{},
+	&DartDetector{},
+	&ScalaDetector{},
 }
 
 // DetectAll runs all detectors and returns aggregated results.

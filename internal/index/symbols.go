@@ -235,6 +235,14 @@ func isImportLine(line, lang string) bool {
 	case "elixir":
 		return strings.HasPrefix(line, "import ") || strings.HasPrefix(line, "alias ") ||
 			strings.HasPrefix(line, "use ")
+	case "dart":
+		return strings.HasPrefix(line, "import ") || strings.HasPrefix(line, "export ") ||
+			strings.HasPrefix(line, "part ") || strings.HasPrefix(line, "library ")
+	case "scala":
+		return strings.HasPrefix(line, "import ") || strings.HasPrefix(line, "package ")
+	case "php":
+		return strings.HasPrefix(line, "use ") || strings.HasPrefix(line, "namespace ") ||
+			strings.HasPrefix(line, "require ") || strings.HasPrefix(line, "include ")
 	}
 	return false
 }
@@ -291,6 +299,8 @@ var langPatterns = map[string][]symbolPattern{
 	"elixir":      elixirPatterns,
 	"php":         phpPatterns,
 	"swift":       swiftPatterns,
+	"dart":        dartPatterns,
+	"scala":       scalaPatterns,
 }
 
 func patternsForLang(lang string) []symbolPattern {
@@ -446,6 +456,31 @@ var phpPatterns = compilePatterns([]rawPattern{
 	{`trait\s+(\w+)`, "trait"},
 	{`(?:public|protected|private)\s+(?:static\s+)?function\s+(\w+)`, "method"},
 	{`^function\s+(\w+)`, "function"},
+})
+
+var dartPatterns = compilePatterns([]rawPattern{
+	{`^class\s+(\w+)`, "class"},
+	{`^abstract\s+class\s+(\w+)`, "class"},
+	{`^mixin\s+(\w+)`, "class"},
+	{`^enum\s+(\w+)`, "enum"},
+	{`^extension\s+(\w+)`, "type"},
+	{`^typedef\s+(\w+)`, "type"},
+	{`^\s+(?:static\s+)?(?:Future|Stream|void|int|double|bool|String|dynamic|[\w<>]+)\s+(\w+)\s*\(`, "method"},
+	{`^(?:Future|Stream|void|int|double|bool|String|dynamic|[\w<>]+)\s+(\w+)\s*\(`, "function"},
+	{`^const\s+(\w+)\s*=`, "constant"},
+	{`^final\s+(\w+)\s*=`, "constant"},
+})
+
+var scalaPatterns = compilePatterns([]rawPattern{
+	{`(?:abstract\s+)?class\s+(\w+)`, "class"},
+	{`(?:sealed\s+)?trait\s+(\w+)`, "trait"},
+	{`object\s+(\w+)`, "module"},
+	{`case\s+class\s+(\w+)`, "class"},
+	{`case\s+object\s+(\w+)`, "module"},
+	{`def\s+(\w+)`, "function"},
+	{`type\s+(\w+)`, "type"},
+	{`val\s+(\w+)`, "constant"},
+	{`lazy\s+val\s+(\w+)`, "constant"},
 })
 
 var swiftPatterns = compilePatterns([]rawPattern{

@@ -146,6 +146,12 @@ var (
 
 	// Swift import pattern
 	swiftImportRe = regexp.MustCompile(`^import\s+([A-Za-z_]\w*)`)
+
+	// Dart import/export pattern
+	dartImportRe = regexp.MustCompile(`^(?:import|export)\s+['"]([^'"]+)['"]`)
+
+	// Scala import pattern
+	scalaImportRe = regexp.MustCompile(`^import\s+([A-Za-z_][\w.]*)(?:\.\{|\.[\w*]+)`)
 )
 
 func extractImports(root string, f *scan.FileEntry, goModPath string, idx *FileIndex) []string {
@@ -212,6 +218,18 @@ func extractImports(root string, f *scan.FileEntry, goModPath string, idx *FileI
 			return nil
 		}
 		return resolvePHPImports(lines, f.RelPath, root, idx)
+	case "dart":
+		lines, err := readHeadLines(fullPath, 100)
+		if err != nil {
+			return nil
+		}
+		return resolveDartImports(lines, f.RelPath, root, idx)
+	case "scala":
+		lines, err := readHeadLines(fullPath, 100)
+		if err != nil {
+			return nil
+		}
+		return resolveScalaImports(lines, f.RelPath, idx)
 	case "elixir":
 		// Elixir needs full file scan — module refs appear anywhere, not just top
 		lines, err := readAllLines(fullPath)
@@ -778,6 +796,136 @@ func isPHPBuiltinNamespace(fqcn string) bool {
 		}
 	}
 	return false
+}
+
+// resolveDartImports resolves Dart import/export statements to local file paths.
+// Dart imports use either:
+//   - 'package:myapp/models/user.dart' → maps to lib/models/user.dart
+//   - 'relative/path.dart' → relative to current file
+//   - 'dart:core' → SDK, skipped
+func resolveDartImports(lines []string, filePath string, root string, idx *FileIndex) []string {
+	dir := filepath.Dir(filePath)
+	pkgName := detectDartPackageName(root)
+
+	seen := make(map[string]bool)
+	var resolved []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		m := dartImportRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		imp := m[1]
+
+		// Skip SDK imports
+		if strings.HasPrefix(imp, "dart:") {
+			continue
+		}
+
+		var target string
+		if strings.HasPrefix(imp, "package:") {
+			// package:myapp/models/user.dart → lib/models/user.dart
+			pkgPath := strings.TrimPrefix(imp, "package:")
+			slash := strings.IndexByte(pkgPath, '/')
+			if slash < 0 {
+				continue
+			}
+			pkg := pkgPath[:slash]
+			rest := pkgPath[slash+1:]
+			// Only resolve imports from our own package
+			if pkgName != "" && pkg != pkgName {
+				continue
+			}
+			target = filepath.Join("lib", rest)
+		} else {
+			// Relative import
+			target = filepath.Clean(filepath.Join(dir, imp))
+		}
+
+		if target != "" && target != filePath && idx.Exists(target) && !seen[target] {
+			seen[target] = true
+			resolved = append(resolved, target)
+		}
+	}
+
+	return resolved
+}
+
+// detectDartPackageName reads the package name from pubspec.yaml.
+func detectDartPackageName(root string) string {
+	data, err := os.ReadFile(filepath.Join(root, "pubspec.yaml"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "name:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "name:"))
+		}
+	}
+	return ""
+}
+
+// resolveScalaImports resolves Scala import statements to local file paths.
+// Scala imports look like: import com.example.models.User or import com.example.models._
+// Resolution uses the same source root conventions as Java.
+func resolveScalaImports(lines []string, filePath string, idx *FileIndex) []string {
+	seen := make(map[string]bool)
+	var resolved []string
+
+	// Standard library prefixes to skip
+	skipPrefixes := []string{"scala.", "java.", "javax.", "akka.", "cats.", "zio."}
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		m := scalaImportRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		imp := m[1]
+
+		// Skip standard library / common external packages
+		skip := false
+		for _, prefix := range skipPrefixes {
+			if strings.HasPrefix(imp, prefix) {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+
+		// Convert dots to path separators
+		classPath := strings.ReplaceAll(imp, ".", "/")
+
+		// Try source roots with both .scala and .java extensions
+		roots := []string{"src/main/scala/", "src/main/java/", "src/", "app/", ""}
+		exts := []string{".scala", ".java"}
+
+		for _, root := range roots {
+			for _, ext := range exts {
+				target := root + classPath + ext
+				if target != filePath && idx.Exists(target) && !seen[target] {
+					seen[target] = true
+					resolved = append(resolved, target)
+				}
+			}
+			// Also try as a directory (wildcard import: import com.example.models._)
+			// Find all source files in the directory
+			dirTarget := root + classPath
+			for _, f := range idx.ByDir(dirTarget) {
+				if f.RelPath != filePath && (f.Lang == "scala" || f.Lang == "java") &&
+					f.Class == scan.ClassSource && !seen[f.RelPath] {
+					seen[f.RelPath] = true
+					resolved = append(resolved, f.RelPath)
+				}
+			}
+		}
+	}
+
+	return resolved
 }
 
 func readAllLines(path string) ([]string, error) {

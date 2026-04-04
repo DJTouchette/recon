@@ -231,6 +231,15 @@ func isTestFile(nameNoExt, ext, dir string) bool {
 		if strings.HasSuffix(nameNoExt, "Test") {
 			return true
 		}
+	case ".dart":
+		if strings.HasSuffix(nameNoExt, "_test") {
+			return true
+		}
+	case ".scala":
+		if strings.HasSuffix(nameNoExt, "Spec") || strings.HasSuffix(nameNoExt, "Test") ||
+			strings.HasSuffix(nameNoExt, "Tests") || strings.HasSuffix(nameNoExt, "Suite") {
+			return true
+		}
 	}
 
 	// Directory-based test detection (only for source files)

@@ -259,6 +259,44 @@ func findSourceForTest(test *scan.FileEntry, sourceByKey map[string]string, idx 
 				candidates = append(candidates, srcDir+"/"+srcName+ext)
 			}
 		}
+
+	case ".dart":
+		// foo_test.dart → foo.dart
+		if strings.HasSuffix(name, "_test") {
+			srcName := strings.TrimSuffix(name, "_test")
+			candidates = append(candidates, dir+"/"+srcName+ext)
+			// test/models/user_test.dart → lib/models/user.dart
+			testlessDir := strings.Replace(dir, "test/", "lib/", 1)
+			if testlessDir != dir {
+				candidates = append(candidates, testlessDir+"/"+srcName+ext)
+			}
+			// Also try: test/user_test.dart → lib/src/user.dart
+			testlessDir2 := strings.Replace(dir, "test", "lib/src", 1)
+			if testlessDir2 != dir {
+				candidates = append(candidates, testlessDir2+"/"+srcName+ext)
+			}
+		}
+
+	case ".scala":
+		// FooSpec.scala → Foo.scala; FooTest.scala → Foo.scala; FooSuite.scala → Foo.scala
+		srcName := name
+		srcName = strings.TrimSuffix(srcName, "Spec")
+		srcName = strings.TrimSuffix(srcName, "Test")
+		srcName = strings.TrimSuffix(srcName, "Tests")
+		srcName = strings.TrimSuffix(srcName, "Suite")
+		if srcName != name {
+			candidates = append(candidates, dir+"/"+srcName+ext)
+			// src/test/scala/... → src/main/scala/...
+			testlessDir := strings.Replace(dir, "src/test/", "src/main/", 1)
+			if testlessDir != dir {
+				candidates = append(candidates, testlessDir+"/"+srcName+ext)
+			}
+			// Also try .java extension (mixed projects)
+			candidates = append(candidates, dir+"/"+srcName+".java")
+			if testlessDir != dir {
+				candidates = append(candidates, testlessDir+"/"+srcName+".java")
+			}
+		}
 	}
 
 	// Check candidates against the index
