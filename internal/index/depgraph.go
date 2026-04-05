@@ -29,12 +29,21 @@ func NewDepGraph(root string, idx *FileIndex) *DepGraph {
 	// Detect Go module path
 	goModPath := detectGoModulePath(root)
 
+	// Scan both source and test files for imports.
+	// Test files need import resolution for languages like C# where
+	// test projects have non-matching names and the import graph is
+	// the only way to connect tests to source files.
 	sources := idx.ByClass(scan.ClassSource)
+	tests := idx.ByClass(scan.ClassTest)
+	allFiles := make([]*scan.FileEntry, 0, len(sources)+len(tests))
+	allFiles = append(allFiles, sources...)
+	allFiles = append(allFiles, tests...)
+
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0)*2)
 
-	for _, f := range sources {
+	for _, f := range allFiles {
 		f := f
 		wg.Add(1)
 		go func() {
