@@ -475,36 +475,44 @@ func resolveCSharpImports(lines []string, filePath string, idx *FileIndex) []str
 			continue
 		}
 
-		// Convert dots to path separators: MyApp.Models → MyApp/Models
-		nsPath := strings.ReplaceAll(ns, ".", "/")
+		// .NET namespaces map to directories in two forms:
+		//   1. Dots as slashes:  Public.Common → Public/Common
+		//   2. Dots kept as-is:  Public.Common → Public.Common (standard .NET project naming)
+		nsSlashed := strings.ReplaceAll(ns, ".", "/")
+		nsDotted := ns
 		segments := strings.Split(ns, ".")
 
-		// Build suffix patterns from the last 2–3 segments for looser matching.
-		// E.g., MyApp.Services.Auth → try "Services/Auth", "MyApp/Services/Auth"
-		var suffixes []string
+		// Build suffix patterns from the last 1–3 segments in both forms.
+		// E.g., Public.Domain.Discount.Models → try:
+		//   slash: "Models", "Discount/Models", "Domain/Discount/Models"
+		//   dotted: "Models", "Discount.Models", "Domain.Discount.Models"
+		var slashSuffixes, dottedSuffixes []string
 		for i := len(segments) - 1; i >= 0 && len(segments)-i <= 3; i-- {
-			suffixes = append(suffixes, strings.Join(segments[i:], "/"))
+			slashSuffixes = append(slashSuffixes, strings.Join(segments[i:], "/"))
+			dottedSuffixes = append(dottedSuffixes, strings.Join(segments[i:], "."))
 		}
 
-		// Common .NET source root prefixes
-		roots := []string{"src/", ""}
-
-		// Strategy 1: direct path match under common roots
+		// Strategy 1: direct directory match under the full namespace path.
+		// Try both dotted (Public.Common) and slashed (Public/Common) forms,
+		// with common root prefixes.
 		foundDirect := false
-		for _, root := range roots {
-			// Look for any .cs file inside a directory matching the namespace
-			files := idx.FilesInDir(root + nsPath)
-			for _, f := range files {
-				if f.Lang == "csharp" && f.RelPath != filePath && !seen[f.RelPath] {
-					seen[f.RelPath] = true
-					resolved = append(resolved, f.RelPath)
-					foundDirect = true
+		dirCandidates := []string{nsSlashed, nsDotted}
+		for _, candidate := range dirCandidates {
+			// Try bare, under src/, and with any intermediate directories.
+			for _, prefix := range []string{"", "src/"} {
+				files := idx.FilesInDir(prefix + candidate)
+				for _, f := range files {
+					if f.Lang == "csharp" && f.RelPath != filePath && !seen[f.RelPath] {
+						seen[f.RelPath] = true
+						resolved = append(resolved, f.RelPath)
+						foundDirect = true
+					}
 				}
 			}
 		}
 
 		// Strategy 2: scan all .cs files for directory paths ending with namespace segments.
-		// Only do the expensive scan if strategy 1 found nothing for this namespace.
+		// Match against both slash-separated and dot-separated directory names.
 		if !foundDirect {
 			for _, f := range idx.All() {
 				if f.Lang != "csharp" || f.RelPath == filePath || seen[f.RelPath] {
@@ -512,13 +520,29 @@ func resolveCSharpImports(lines []string, filePath string, idx *FileIndex) []str
 				}
 				relDir := filepath.Dir(f.RelPath)
 				lowerDir := strings.ToLower(filepath.ToSlash(relDir))
-				for _, suffix := range suffixes {
-					lowerSuffix := strings.ToLower(suffix)
-					if strings.HasSuffix(lowerDir, lowerSuffix) || lowerDir == lowerSuffix {
-						seen[f.RelPath] = true
-						resolved = append(resolved, f.RelPath)
+
+				matched := false
+				// Try slash-separated suffixes (Discount/Models).
+				for _, suffix := range slashSuffixes {
+					lower := strings.ToLower(suffix)
+					if strings.HasSuffix(lowerDir, "/"+lower) || lowerDir == lower {
+						matched = true
 						break
 					}
+				}
+				// Try dotted suffixes (Public.Domain, DataLayer.Tests).
+				if !matched {
+					for _, suffix := range dottedSuffixes {
+						lower := strings.ToLower(suffix)
+						if strings.HasSuffix(lowerDir, "/"+lower) || lowerDir == lower {
+							matched = true
+							break
+						}
+					}
+				}
+				if matched {
+					seen[f.RelPath] = true
+					resolved = append(resolved, f.RelPath)
 				}
 			}
 		}
