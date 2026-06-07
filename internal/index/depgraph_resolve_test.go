@@ -38,7 +38,7 @@ func TestResolveGoImports_Basic(t *testing.T) {
 		`)`,
 	}
 
-	got := resolveGoImports(lines, "cmd/main.go", "github.com/example/myapp", idx)
+	got := resolveGoSpecs(goRegexSpecs(lines), "cmd/main.go", "github.com/example/myapp", idx)
 	sort.Strings(got)
 
 	want := []string{
@@ -63,7 +63,7 @@ func TestResolveGoImports_SingleImport(t *testing.T) {
 
 	lines := []string{`import "github.com/acme/app/internal/store"`}
 
-	got := resolveGoImports(lines, "main.go", "github.com/acme/app", idx)
+	got := resolveGoSpecs(goRegexSpecs(lines), "main.go", "github.com/acme/app", idx)
 	if len(got) != 1 || got[0] != "internal/store/store.go" {
 		t.Fatalf("got %v, want [internal/store/store.go]", got)
 	}
@@ -82,7 +82,7 @@ func TestResolveGoImports_SkipsExternalPackages(t *testing.T) {
 		`)`,
 	}
 
-	got := resolveGoImports(lines, "main.go", "github.com/example/myapp", idx)
+	got := resolveGoSpecs(goRegexSpecs(lines), "main.go", "github.com/example/myapp", idx)
 	if len(got) != 0 {
 		t.Fatalf("expected no imports, got %v", got)
 	}
@@ -92,7 +92,7 @@ func TestResolveGoImports_EmptyModPath(t *testing.T) {
 	idx := mkIdx(scan.FileEntry{RelPath: "pkg/auth/auth.go", Lang: "go", Class: scan.ClassSource})
 	lines := []string{`import "github.com/acme/app/pkg/auth"`}
 
-	got := resolveGoImports(lines, "main.go", "", idx)
+	got := resolveGoSpecs(goRegexSpecs(lines), "main.go", "", idx)
 	if len(got) != 0 {
 		t.Fatalf("expected nil/empty when goModPath is empty, got %v", got)
 	}
@@ -108,7 +108,7 @@ func TestResolveGoImports_SkipsTestFiles(t *testing.T) {
 
 	lines := []string{`import "github.com/example/app/pkg/auth"`}
 
-	got := resolveGoImports(lines, "main.go", "github.com/example/app", idx)
+	got := resolveGoSpecs(goRegexSpecs(lines), "main.go", "github.com/example/app", idx)
 	// Should only find the ClassSource file.
 	if len(got) != 1 || got[0] != "pkg/auth/auth.go" {
 		t.Fatalf("got %v, want [pkg/auth/auth.go]", got)
@@ -325,7 +325,7 @@ func TestResolveJavaImports_Basic(t *testing.T) {
 		"import com.example.UserService;",
 	}
 
-	got := resolveJavaImports(lines, "src/main/java/com/example/UserController.java", "java", idx)
+	got := resolveJavaSpecs(javaRegexSpecs(lines), "src/main/java/com/example/UserController.java", "java", idx)
 	sort.Strings(got)
 
 	want := []string{
@@ -348,7 +348,7 @@ func TestResolveJavaImports_StaticImport(t *testing.T) {
 	)
 
 	lines := []string{"import static com.example.MathUtils.pow;"}
-	got := resolveJavaImports(lines, "src/main/java/com/example/Calculator.java", "java", idx)
+	got := resolveJavaSpecs(javaRegexSpecs(lines), "src/main/java/com/example/Calculator.java", "java", idx)
 	if len(got) != 1 || got[0] != "src/main/java/com/example/MathUtils.java" {
 		t.Fatalf("got %v, want [src/main/java/com/example/MathUtils.java]", got)
 	}
@@ -363,7 +363,7 @@ func TestResolveJavaImports_SkipsStdLib(t *testing.T) {
 		"import java.util.List;",
 		"import javax.servlet.http.HttpServlet;",
 	}
-	got := resolveJavaImports(lines, "src/Foo.java", "java", idx)
+	got := resolveJavaSpecs(javaRegexSpecs(lines), "src/Foo.java", "java", idx)
 	if len(got) != 0 {
 		t.Fatalf("expected no results for stdlib imports, got %v", got)
 	}
@@ -375,7 +375,7 @@ func TestResolveJavaImports_RootLevelFallback(t *testing.T) {
 	)
 
 	lines := []string{"import com.example.Config;"}
-	got := resolveJavaImports(lines, "com/example/Main.java", "java", idx)
+	got := resolveJavaSpecs(javaRegexSpecs(lines), "com/example/Main.java", "java", idx)
 	if len(got) != 1 || got[0] != "com/example/Config.java" {
 		t.Fatalf("got %v, want [com/example/Config.java]", got)
 	}
@@ -388,7 +388,7 @@ func TestResolveJavaImports_KotlinLang(t *testing.T) {
 
 	// Kotlin imports don't have semicolons
 	lines := []string{"import com.example.Repository"}
-	got := resolveJavaImports(lines, "src/main/kotlin/com/example/Service.kt", "kotlin", idx)
+	got := resolveJavaSpecs(kotlinRegexSpecs(lines), "src/main/kotlin/com/example/Service.kt", "kotlin", idx)
 	if len(got) != 1 || got[0] != "src/main/kotlin/com/example/Repository.kt" {
 		t.Fatalf("got %v, want [src/main/kotlin/com/example/Repository.kt]", got)
 	}
@@ -401,7 +401,7 @@ func TestResolveJavaImports_SkipsSelf(t *testing.T) {
 
 	lines := []string{"import com.example.User;"}
 	// The file itself is in the same location — should not self-reference.
-	got := resolveJavaImports(lines, "src/main/java/com/example/User.java", "java", idx)
+	got := resolveJavaSpecs(javaRegexSpecs(lines), "src/main/java/com/example/User.java", "java", idx)
 	if len(got) != 0 {
 		t.Fatalf("expected no self-reference, got %v", got)
 	}
@@ -417,7 +417,7 @@ func TestResolveCSharpImports_SlashedDirectoryMatch(t *testing.T) {
 	)
 
 	lines := []string{"using Public.Common.Services;"}
-	got := resolveCSharpImports(lines, "OtherProject/Startup.cs", idx)
+	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "OtherProject/Startup.cs", idx)
 	sort.Strings(got)
 
 	want := []string{
@@ -444,7 +444,7 @@ func TestResolveCSharpImports_SkipsSystemNamespaces(t *testing.T) {
 		"using System.Linq;",
 		"using Microsoft.Extensions.DependencyInjection;",
 	}
-	got := resolveCSharpImports(lines, "src/App.cs", idx)
+	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "src/App.cs", idx)
 	if len(got) != 0 {
 		t.Fatalf("expected no results for system namespaces, got %v", got)
 	}
@@ -459,7 +459,7 @@ func TestResolveCSharpImports_SuffixMatching(t *testing.T) {
 	)
 
 	lines := []string{"using MyApp.Domain.Models;"}
-	got := resolveCSharpImports(lines, "src/MyApp.Web/Controllers/UserController.cs", idx)
+	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "src/MyApp.Web/Controllers/UserController.cs", idx)
 	sort.Strings(got)
 
 	if len(got) == 0 {
@@ -479,7 +479,7 @@ func TestResolveCSharpImports_UsingStatic(t *testing.T) {
 
 	lines := []string{"using static App.MathHelpers;"}
 	// Should match strategy-2 suffix on "MathHelpers" or "App/MathHelpers"
-	got := resolveCSharpImports(lines, "src/App/Calculator.cs", idx)
+	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "src/App/Calculator.cs", idx)
 	_ = got // result depends on which segment suffixes match; just ensure no panic
 }
 
@@ -489,7 +489,7 @@ func TestResolveCSharpImports_SkipsSelf(t *testing.T) {
 	)
 
 	lines := []string{"using Models;"}
-	got := resolveCSharpImports(lines, "src/Models/User.cs", idx)
+	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "src/Models/User.cs", idx)
 	for _, g := range got {
 		if g == "src/Models/User.cs" {
 			t.Errorf("self-reference included in result")
@@ -686,7 +686,7 @@ func TestResolvePHPImports_DirectPath(t *testing.T) {
 
 	lines := []string{"use App\\Models\\User;"}
 	// Strategy 2: direct path (App/Models/User.php)
-	got := resolvePHPImports(lines, "App/Controllers/UserController.php", "", idx)
+	got := resolvePHPSpecs(phpRegexSpecs(lines), "App/Controllers/UserController.php", "", idx)
 	if len(got) != 1 || got[0] != "App/Models/User.php" {
 		t.Fatalf("got %v, want [App/Models/User.php]", got)
 	}
@@ -699,7 +699,7 @@ func TestResolvePHPImports_StripFirstSegment(t *testing.T) {
 	)
 
 	lines := []string{"use App\\Models\\Order;"}
-	got := resolvePHPImports(lines, "src/Controllers/OrderController.php", "", idx)
+	got := resolvePHPSpecs(phpRegexSpecs(lines), "src/Controllers/OrderController.php", "", idx)
 	if len(got) != 1 || got[0] != "src/Models/Order.php" {
 		t.Fatalf("got %v, want [src/Models/Order.php]", got)
 	}
@@ -714,7 +714,7 @@ func TestResolvePHPImports_SkipsBuiltinNamespaces(t *testing.T) {
 		"use Psr\\Log\\LoggerInterface;",
 		"use Symfony\\Component\\HttpFoundation\\Request;",
 	}
-	got := resolvePHPImports(lines, "src/Service.php", "", idx)
+	got := resolvePHPSpecs(phpRegexSpecs(lines), "src/Service.php", "", idx)
 	if len(got) != 0 {
 		t.Fatalf("expected no results for builtin namespaces, got %v", got)
 	}
@@ -726,7 +726,7 @@ func TestResolvePHPImports_SkipsSelf(t *testing.T) {
 	)
 
 	lines := []string{"use App\\Models\\User;"}
-	got := resolvePHPImports(lines, "App/Models/User.php", "", idx)
+	got := resolvePHPSpecs(phpRegexSpecs(lines), "App/Models/User.php", "", idx)
 	for _, g := range got {
 		if g == "App/Models/User.php" {
 			t.Errorf("self-reference included")
@@ -742,7 +742,7 @@ func TestResolveScalaImports_Basic(t *testing.T) {
 	)
 
 	lines := []string{"import com.example.User"}
-	got := resolveScalaImports(lines, "src/main/scala/com/example/Service.scala", idx)
+	got := resolveScalaSpecs(scalaRegexSpecs(lines), "src/main/scala/com/example/Service.scala", idx)
 	if len(got) != 1 || got[0] != "src/main/scala/com/example/User.scala" {
 		t.Fatalf("got %v, want [src/main/scala/com/example/User.scala]", got)
 	}
@@ -756,7 +756,7 @@ func TestResolveScalaImports_WildcardDirectory(t *testing.T) {
 
 	// Wildcard import: import com.example.models._
 	lines := []string{"import com.example.models.{User, Order}"}
-	got := resolveScalaImports(lines, "src/main/scala/com/example/Service.scala", idx)
+	got := resolveScalaSpecs(scalaRegexSpecs(lines), "src/main/scala/com/example/Service.scala", idx)
 	sort.Strings(got)
 
 	if len(got) == 0 {
@@ -770,7 +770,7 @@ func TestResolveScalaImports_SkipsStdLib(t *testing.T) {
 	)
 
 	lines := []string{"import scala.collection.mutable.Map"}
-	got := resolveScalaImports(lines, "src/main/scala/App.scala", idx)
+	got := resolveScalaSpecs(scalaRegexSpecs(lines), "src/main/scala/App.scala", idx)
 	if len(got) != 0 {
 		t.Fatalf("expected no results for scala stdlib, got %v", got)
 	}
@@ -782,7 +782,7 @@ func TestResolveScalaImports_SkipsSelf(t *testing.T) {
 	)
 
 	lines := []string{"import com.example.User"}
-	got := resolveScalaImports(lines, "src/main/scala/com/example/User.scala", idx)
+	got := resolveScalaSpecs(scalaRegexSpecs(lines), "src/main/scala/com/example/User.scala", idx)
 	for _, g := range got {
 		if g == "src/main/scala/com/example/User.scala" {
 			t.Errorf("self-reference included")

@@ -170,11 +170,8 @@ func extractImports(root string, f *scan.FileEntry, goModPath string, idx *FileI
 
 	switch f.Lang {
 	case "go":
-		lines, err := readHeadLines(fullPath, 150)
-		if err != nil {
-			return nil
-		}
-		return resolveGoImports(lines, f.RelPath, goModPath, idx)
+		specs := importSpecs(fullPath, f.Lang, 150, goRegexSpecs)
+		return resolveGoSpecs(specs, f.RelPath, goModPath, idx)
 	case "javascript", "typescript":
 		specs := importSpecs(fullPath, f.Lang, 150, jsRegexSpecs)
 		return resolveJSSpecs(specs, f.RelPath, idx)
@@ -194,23 +191,14 @@ func extractImports(root string, f *scan.FileEntry, goModPath string, idx *FileI
 		specs := importSpecs(fullPath, f.Lang, 200, noRegexSpecs)
 		return resolveShellSpecs(specs, f.RelPath, idx)
 	case "java":
-		lines, err := readHeadLines(fullPath, 100)
-		if err != nil {
-			return nil
-		}
-		return resolveJavaImports(lines, f.RelPath, "java", idx)
+		specs := importSpecs(fullPath, f.Lang, 100, javaRegexSpecs)
+		return resolveJavaSpecs(specs, f.RelPath, "java", idx)
 	case "kotlin":
-		lines, err := readHeadLines(fullPath, 100)
-		if err != nil {
-			return nil
-		}
-		return resolveJavaImports(lines, f.RelPath, "kotlin", idx)
+		specs := importSpecs(fullPath, f.Lang, 100, kotlinRegexSpecs)
+		return resolveJavaSpecs(specs, f.RelPath, "kotlin", idx)
 	case "csharp":
-		lines, err := readHeadLines(fullPath, 100)
-		if err != nil {
-			return nil
-		}
-		return resolveCSharpImports(lines, f.RelPath, idx)
+		specs := importSpecs(fullPath, f.Lang, 100, csharpRegexSpecs)
+		return resolveCSharpSpecs(specs, f.RelPath, idx)
 	case "ruby":
 		lines, err := readHeadLines(fullPath, 100)
 		if err != nil {
@@ -230,11 +218,8 @@ func extractImports(root string, f *scan.FileEntry, goModPath string, idx *FileI
 		}
 		return resolveSwiftImports(lines, f.RelPath, idx)
 	case "php":
-		lines, err := readHeadLines(fullPath, 100)
-		if err != nil {
-			return nil
-		}
-		return resolvePHPImports(lines, f.RelPath, root, idx)
+		specs := importSpecs(fullPath, f.Lang, 100, phpRegexSpecs)
+		return resolvePHPSpecs(specs, f.RelPath, root, idx)
 	case "dart":
 		lines, err := readHeadLines(fullPath, 100)
 		if err != nil {
@@ -242,11 +227,8 @@ func extractImports(root string, f *scan.FileEntry, goModPath string, idx *FileI
 		}
 		return resolveDartImports(lines, f.RelPath, root, idx)
 	case "scala":
-		lines, err := readHeadLines(fullPath, 100)
-		if err != nil {
-			return nil
-		}
-		return resolveScalaImports(lines, f.RelPath, idx)
+		specs := importSpecs(fullPath, f.Lang, 100, scalaRegexSpecs)
+		return resolveScalaSpecs(specs, f.RelPath, idx)
 	case "elixir":
 		// Elixir needs full file scan — module refs appear anywhere, not just top
 		lines, err := readAllLines(fullPath)
@@ -274,30 +256,36 @@ func readHeadLines(path string, maxLines int) ([]string, error) {
 	return lines, nil
 }
 
-func resolveGoImports(lines []string, filePath, goModPath string, idx *FileIndex) []string {
-	if goModPath == "" {
-		return nil
-	}
-
+// goRegexSpecs is the regex fallback extractor for Go import specifiers. It
+// returns the bare module paths (no quotes), matching what tree-sitter captures.
+func goRegexSpecs(lines []string) []string {
 	content := strings.Join(lines, "\n")
-	var rawImports []string
+	var specs []string
 
 	// Single imports
 	for _, m := range goImportSingle.FindAllStringSubmatch(content, -1) {
-		rawImports = append(rawImports, m[1])
+		specs = append(specs, m[1])
 	}
 
 	// Block imports
 	for _, block := range goImportBlock.FindAllStringSubmatch(content, -1) {
 		for _, m := range goImportLine.FindAllStringSubmatch(block[1], -1) {
-			rawImports = append(rawImports, m[1])
+			specs = append(specs, m[1])
 		}
+	}
+	return specs
+}
+
+// resolveGoSpecs resolves Go import paths under the module path to local files.
+func resolveGoSpecs(specs []string, filePath, goModPath string, idx *FileIndex) []string {
+	if goModPath == "" {
+		return nil
 	}
 
 	// Resolve to local files
 	var resolved []string
 	prefix := goModPath + "/"
-	for _, imp := range rawImports {
+	for _, imp := range specs {
 		if !strings.HasPrefix(imp, prefix) {
 			continue
 		}
@@ -436,24 +424,35 @@ func resolveRubyImports(lines []string, filePath string, idx *FileIndex) []strin
 	return resolved
 }
 
-func resolveJavaImports(lines []string, filePath string, lang string, idx *FileIndex) []string {
+// javaRegexSpecs is the regex fallback extractor for Java import specifiers
+// (dotted names, e.g. com.example.User).
+func javaRegexSpecs(lines []string) []string {
+	return javaLikeRegexSpecs(lines, javaImportRe)
+}
+
+// kotlinRegexSpecs is the regex fallback extractor for Kotlin import specifiers.
+func kotlinRegexSpecs(lines []string) []string {
+	return javaLikeRegexSpecs(lines, kotlinImportRe)
+}
+
+func javaLikeRegexSpecs(lines []string, re *regexp.Regexp) []string {
+	var specs []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if m := re.FindStringSubmatch(line); m != nil {
+			specs = append(specs, m[1])
+		}
+	}
+	return specs
+}
+
+// resolveJavaSpecs resolves Java/Kotlin dotted import names to local files using
+// the standard source-root conventions.
+func resolveJavaSpecs(specs []string, filePath string, lang string, idx *FileIndex) []string {
 	seen := make(map[string]bool)
 	var resolved []string
 
-	// Pick regex based on language
-	re := javaImportRe
-	if lang == "kotlin" {
-		re = kotlinImportRe
-	}
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		m := re.FindStringSubmatch(line)
-		if m == nil {
-			continue
-		}
-		imp := m[1]
-
+	for _, imp := range specs {
 		// Skip standard library imports
 		if strings.HasPrefix(imp, "java.") || strings.HasPrefix(imp, "javax.") ||
 			strings.HasPrefix(imp, "kotlin.") || strings.HasPrefix(imp, "kotlinx.") ||
@@ -498,21 +497,27 @@ func resolveJavaImports(lines []string, filePath string, lang string, idx *FileI
 	return resolved
 }
 
-// resolveCSharpImports finds using statements in a C# file and resolves them
-// to file paths by matching namespace segments against the file index. C# has no
-// strict namespace-to-file mapping, so we use directory-based heuristics.
-func resolveCSharpImports(lines []string, filePath string, idx *FileIndex) []string {
+// csharpRegexSpecs is the regex fallback extractor for C# using directives
+// (dotted namespaces, e.g. Public.Common.Services).
+func csharpRegexSpecs(lines []string) []string {
+	var specs []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if m := csUsing.FindStringSubmatch(line); m != nil {
+			specs = append(specs, m[1])
+		}
+	}
+	return specs
+}
+
+// resolveCSharpSpecs resolves C# using namespaces to file paths by matching
+// namespace segments against the file index. C# has no strict namespace-to-file
+// mapping, so we use directory-based heuristics.
+func resolveCSharpSpecs(specs []string, filePath string, idx *FileIndex) []string {
 	seen := make(map[string]bool)
 	var resolved []string
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		m := csUsing.FindStringSubmatch(line)
-		if m == nil {
-			continue
-		}
-		ns := m[1]
-
+	for _, ns := range specs {
 		// Skip system/framework namespaces
 		if strings.HasPrefix(ns, "System") || strings.HasPrefix(ns, "Microsoft") ||
 			strings.HasPrefix(ns, "NuGet") {
@@ -830,25 +835,30 @@ func resolvePySpecs(specs []string, filePath string, idx *FileIndex) []string {
 	return resolved
 }
 
-// resolvePHPImports resolves PHP use statements to local file paths.
+// phpRegexSpecs is the regex fallback extractor for PHP use statements. It
+// returns FQCNs (backslash-separated, e.g. App\Models\User).
+func phpRegexSpecs(lines []string) []string {
+	var specs []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if m := phpUseStmt.FindStringSubmatch(line); m != nil {
+			specs = append(specs, m[1])
+		}
+	}
+	return specs
+}
+
+// resolvePHPSpecs resolves PHP use FQCNs to local file paths.
 // It parses PSR-4 namespace imports and maps them to files using composer.json
 // autoload config when available, falling back to common directory conventions.
-func resolvePHPImports(lines []string, filePath string, root string, idx *FileIndex) []string {
+func resolvePHPSpecs(specs []string, filePath string, root string, idx *FileIndex) []string {
 	seen := make(map[string]bool)
 	var resolved []string
 
 	// Parse composer.json PSR-4 autoload mappings if available
 	psr4Map := parsePHPComposerPSR4(root)
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-
-		m := phpUseStmt.FindStringSubmatch(line)
-		if m == nil {
-			continue
-		}
-		fqcn := m[1]
-
+	for _, fqcn := range specs {
 		// Skip PHP built-in namespaces that won't resolve to local files
 		if isPHPBuiltinNamespace(fqcn) {
 			continue
@@ -1022,23 +1032,52 @@ func detectDartPackageName(root string) string {
 	return ""
 }
 
-// resolveScalaImports resolves Scala import statements to local file paths.
-// Scala imports look like: import com.example.models.User or import com.example.models._
+// scalaRegexSpecs is the regex fallback extractor for Scala import statements.
+// It returns the dotted import prefix (e.g. "com.example" for
+// "import com.example.User", "com.example.models" for a selector/wildcard
+// import), matching the historical resolver input.
+func scalaRegexSpecs(lines []string) []string {
+	var specs []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if m := scalaImportRe.FindStringSubmatch(line); m != nil {
+			specs = append(specs, m[1])
+		}
+	}
+	return specs
+}
+
+// scalaNormalizeSpec converts a tree-sitter-captured import statement (the full
+// "import …" text) into the dotted prefix the resolver consumes, using the same
+// regex as the fallback. Specs that are already normalized (no "import" prefix)
+// pass through unchanged.
+func scalaNormalizeSpec(spec string) string {
+	spec = strings.TrimSpace(spec)
+	if m := scalaImportRe.FindStringSubmatch(spec); m != nil {
+		return m[1]
+	}
+	// A full "import …" statement that the regex couldn't normalize (an exotic
+	// form) is dropped rather than fed verbatim to the resolver.
+	if strings.HasPrefix(spec, "import") {
+		return ""
+	}
+	return spec
+}
+
+// resolveScalaSpecs resolves Scala dotted import prefixes to local file paths.
 // Resolution uses the same source root conventions as Java.
-func resolveScalaImports(lines []string, filePath string, idx *FileIndex) []string {
+func resolveScalaSpecs(specs []string, filePath string, idx *FileIndex) []string {
 	seen := make(map[string]bool)
 	var resolved []string
 
 	// Standard library prefixes to skip
 	skipPrefixes := []string{"scala.", "java.", "javax.", "akka.", "cats.", "zio."}
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		m := scalaImportRe.FindStringSubmatch(line)
-		if m == nil {
+	for _, raw := range specs {
+		imp := scalaNormalizeSpec(raw)
+		if imp == "" {
 			continue
 		}
-		imp := m[1]
 
 		// Skip standard library / common external packages
 		skip := false
