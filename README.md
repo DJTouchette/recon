@@ -64,7 +64,7 @@ All commands emit JSON by default (built to be consumed by tools). Add `--human`
 
 Symbol and import analysis covers **Go, JavaScript/TypeScript, Python, Java, Kotlin, C#, Ruby, Rust, PHP, Dart, Scala, Swift, Elixir** — with language-aware resolution (Go modules, JS relative paths + `node_modules`, Java/Kotlin namespaces, C# namespaces, PHP/Composer PSR-4, Dart packages, Swift SPM targets, and more). File classification recognizes 50+ extensions across source, test, config, generated, docs, and assets.
 
-Symbol extraction uses **tree-sitter** grammars (real parsing — no false matches from strings or comments, accurate multi-line signatures) for languages that have one registered, currently **Go**, and falls back to fast regex patterns for the rest. More grammars are being ported over incrementally.
+Symbol extraction uses **tree-sitter** grammars (real parsing — no false matches from strings or comments, accurate multi-line signatures) for **Go, Python, JavaScript, TypeScript, Rust, Ruby, Java, C#, PHP, Scala, Kotlin, C, and C++**, and falls back to fast regex patterns for the remaining languages (Elixir, Swift, Dart, and others). Each grammar's symbol query lives in `internal/index/queries/<lang>.scm`, so adding or tuning a language is just editing a query file.
 
 ## How It Works
 

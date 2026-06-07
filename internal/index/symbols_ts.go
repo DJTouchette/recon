@@ -1,13 +1,27 @@
 package index
 
 import (
-	"fmt"
+	"embed"
 	"strings"
 	"sync"
 	"unsafe"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
-	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
+
+	ts_c "github.com/tree-sitter/tree-sitter-c/bindings/go"
+	ts_csharp "github.com/tree-sitter/tree-sitter-c-sharp/bindings/go"
+	ts_cpp "github.com/tree-sitter/tree-sitter-cpp/bindings/go"
+	ts_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
+	ts_java "github.com/tree-sitter/tree-sitter-java/bindings/go"
+	ts_js "github.com/tree-sitter/tree-sitter-javascript/bindings/go"
+	ts_php "github.com/tree-sitter/tree-sitter-php/bindings/go"
+	ts_python "github.com/tree-sitter/tree-sitter-python/bindings/go"
+	ts_ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
+	ts_rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
+	ts_scala "github.com/tree-sitter/tree-sitter-scala/bindings/go"
+	ts_ts "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
+
+	ts_kotlin "github.com/tree-sitter-grammars/tree-sitter-kotlin/bindings/go"
 )
 
 // Tree-sitter based symbol extraction.
@@ -18,10 +32,15 @@ import (
 // declaration. Languages without a registered grammar fall back to the regex
 // patterns in symbols.go.
 //
-// Each grammar registers a query whose capture names are the symbol kind
-// (e.g. @function, @method, @struct). A separate @def capture marks the whole
-// declaration node so we can build a clean signature. Adding a language is just
-// registering its grammar + a query; no Go code changes.
+// Each grammar has a query in queries/<lang>.scm. By convention the capture
+// name on the identifier IS the symbol kind (e.g. @function, @method, @struct),
+// and a sibling @def capture marks the whole declaration node so we can build a
+// clean signature. Captures whose name starts with "_" are query-internal
+// helpers (used only by #match?/#eq? predicates) and are ignored. Adding a
+// language is registering a grammar + writing its query — no Go code changes.
+
+//go:embed queries/*.scm
+var queryFS embed.FS
 
 type tsLang struct {
 	lang  *tree_sitter.Language
@@ -35,15 +54,54 @@ var tsRegistry = map[string]*tsLang{}
 // shared freely; each goroutine gets its own parser and query cursor.
 var tsParserPool = sync.Pool{New: func() any { return tree_sitter.NewParser() }}
 
-func registerTSLang(name string, langPtr unsafe.Pointer, query string) {
+// tsGrammar pairs a recon language key with a grammar pointer and its query
+// file. Some grammars expose more than one language (TypeScript/TSX, PHP); we
+// pick the variant that parses the broadest set of files recon classifies under
+// that key (TSX parses both .ts and .tsx; the full PHP grammar handles inline
+// HTML).
+type tsGrammar struct {
+	lang    string
+	langPtr unsafe.Pointer
+	query   string // filename under queries/
+}
+
+var tsGrammars = []tsGrammar{
+	{"go", ts_go.Language(), "go.scm"},
+	{"python", ts_python.Language(), "python.scm"},
+	{"javascript", ts_js.Language(), "javascript.scm"},
+	{"typescript", ts_ts.LanguageTSX(), "typescript.scm"},
+	{"rust", ts_rust.Language(), "rust.scm"},
+	{"ruby", ts_ruby.Language(), "ruby.scm"},
+	{"java", ts_java.Language(), "java.scm"},
+	{"csharp", ts_csharp.Language(), "csharp.scm"},
+	{"php", ts_php.LanguagePHP(), "php.scm"},
+	{"scala", ts_scala.Language(), "scala.scm"},
+	{"kotlin", ts_kotlin.Language(), "kotlin.scm"},
+	{"c", ts_c.Language(), "c.scm"},
+	{"cpp", ts_cpp.Language(), "cpp.scm"},
+}
+
+func init() {
+	for _, g := range tsGrammars {
+		// A query that fails to compile (e.g. a grammar bumped a node name)
+		// simply leaves that language on the regex fallback rather than
+		// crashing recon. TestQueriesCompile guards against this in CI.
+		_ = registerTSLang(g.lang, g.langPtr, g.query)
+	}
+}
+
+func registerTSLang(name string, langPtr unsafe.Pointer, queryFile string) error {
+	src, err := queryFS.ReadFile("queries/" + queryFile)
+	if err != nil {
+		return err
+	}
 	l := tree_sitter.NewLanguage(langPtr)
-	q, qerr := tree_sitter.NewQuery(l, query)
+	q, qerr := tree_sitter.NewQuery(l, string(src))
 	if qerr != nil {
-		// A malformed query is a programming error in this package; fail loud
-		// so it's caught by tests rather than silently disabling a language.
-		panic(fmt.Sprintf("recon: invalid tree-sitter query for %q: %v", name, qerr))
+		return qerr
 	}
 	tsRegistry[name] = &tsLang{lang: l, query: q}
+	return nil
 }
 
 // hasTSLang reports whether a tree-sitter grammar is registered for lang.
@@ -81,6 +139,7 @@ func extractSymbolsTS(source []byte, relPath, lang string) ([]Symbol, bool) {
 	matches := qc.Matches(tl.query, root, source)
 
 	var syms []Symbol
+	seen := make(map[string]bool)
 	for {
 		m := matches.Next()
 		if m == nil {
@@ -92,12 +151,15 @@ func extractSymbolsTS(source []byte, relPath, lang string) ([]Symbol, bool) {
 		for i := range m.Captures {
 			c := &m.Captures[i]
 			capName := names[c.Index]
-			if capName == "def" {
+			switch {
+			case capName == "def":
 				defNode = &c.Node
-				continue
+			case strings.HasPrefix(capName, "_"):
+				// query-internal helper capture (predicate target); ignore
+			default:
+				kind = capName
+				nameNode = &c.Node
 			}
-			kind = capName
-			nameNode = &c.Node
 		}
 		if nameNode == nil {
 			continue
@@ -107,12 +169,21 @@ func extractSymbolsTS(source []byte, relPath, lang string) ([]Symbol, bool) {
 		if name == "" || name == "_" {
 			continue
 		}
+		line := int(nameNode.StartPosition().Row) + 1
+
+		// One grammar can have overlapping patterns match the same declaration
+		// (e.g. a generic "type" rule and a specific one). De-dup on name+line.
+		key := name + ":" + kind + ":" + itoa(line)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 
 		syms = append(syms, Symbol{
 			File:      relPath,
 			Name:      name,
 			Kind:      kind,
-			Line:      int(nameNode.StartPosition().Row) + 1,
+			Line:      line,
 			Signature: trimSig(tsSignature(defNode, nameNode, source)),
 		})
 	}
@@ -158,39 +229,3 @@ func lineAtByte(source []byte, off uint) string {
 	}
 	return string(source[start : int(off)+end])
 }
-
-func init() {
-	registerTSLang("go", tree_sitter_go.Language(), goTSQuery)
-}
-
-// goTSQuery captures top-level and method declarations. The capture name on the
-// identifier is the symbol kind; @def marks the whole declaration for the
-// signature. The three type patterns are mutually exclusive by body kind so a
-// struct/interface is never also reported as a plain "type".
-const goTSQuery = `
-(function_declaration name: (identifier) @function) @def
-(method_declaration name: (field_identifier) @method) @def
-
-(source_file (type_declaration
-  (type_spec name: (type_identifier) @struct type: (struct_type))) @def)
-(source_file (type_declaration
-  (type_spec name: (type_identifier) @interface type: (interface_type))) @def)
-(source_file (type_declaration
-  (type_spec name: (type_identifier) @type
-    type: [
-      (type_identifier)
-      (qualified_type)
-      (pointer_type)
-      (map_type)
-      (slice_type)
-      (array_type)
-      (channel_type)
-      (function_type)
-      (generic_type)
-    ])) @def)
-(source_file (type_declaration
-  (type_alias name: (type_identifier) @type)) @def)
-
-(source_file (const_declaration (const_spec name: (identifier) @constant)))
-(source_file (var_declaration (var_spec name: (identifier) @var)))
-`
