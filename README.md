@@ -9,7 +9,7 @@ Recon is the codebase-intelligence layer of the [Rivet](https://github.com/djtou
 ## What It Does
 
 - **Dependency graph** — import resolution and reverse lookups across 14 languages (`imports of` / `imported by`)
-- **Symbol search** — functions, types, classes, methods, extracted with per-language patterns
+- **Symbol search** — functions, types, classes, methods, parsed from a real grammar (tree-sitter) where available, with regex fallback elsewhere
 - **Co-change history** — files that always change together, mined from git log
 - **Hotspot detection** — high fan-in × high churn = the code that's risky to touch
 - **Enriched grep** — classifies every match as a definition, reference, test, or comment
@@ -64,6 +64,8 @@ All commands emit JSON by default (built to be consumed by tools). Add `--human`
 
 Symbol and import analysis covers **Go, JavaScript/TypeScript, Python, Java, Kotlin, C#, Ruby, Rust, PHP, Dart, Scala, Swift, Elixir** — with language-aware resolution (Go modules, JS relative paths + `node_modules`, Java/Kotlin namespaces, C# namespaces, PHP/Composer PSR-4, Dart packages, Swift SPM targets, and more). File classification recognizes 50+ extensions across source, test, config, generated, docs, and assets.
 
+Symbol extraction uses **tree-sitter** grammars (real parsing — no false matches from strings or comments, accurate multi-line signatures) for languages that have one registered, currently **Go**, and falls back to fast regex patterns for the rest. More grammars are being ported over incrementally.
+
 ## How It Works
 
 ```
@@ -104,7 +106,7 @@ make lint        # golangci-lint
 make clean       # remove bin/ and .recon/
 ```
 
-Requires Go 1.25+.
+Requires Go 1.25+ and a C compiler (tree-sitter uses CGo, so builds need `CGO_ENABLED=1` and a working `cc`/`gcc`).
 
 ## License
 

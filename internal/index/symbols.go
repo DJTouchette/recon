@@ -51,8 +51,7 @@ func NewSymbolIndex(root string, idx *FileIndex) *SymbolIndex {
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0)*2)
 
 	for _, f := range sources {
-		patterns := patternsForLang(f.Lang)
-		if len(patterns) == 0 {
+		if !hasExtractor(f.Lang) {
 			continue
 		}
 
@@ -63,7 +62,7 @@ func NewSymbolIndex(root string, idx *FileIndex) *SymbolIndex {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			syms := extractSymbols(filepath.Join(root, f.RelPath), f.RelPath, patterns)
+			syms := extractFileSymbols(root, f)
 			if len(syms) == 0 {
 				return
 			}
@@ -307,6 +306,33 @@ func patternsForLang(lang string) []symbolPattern {
 	return langPatterns[lang]
 }
 
+// hasExtractor reports whether symbols can be extracted for lang by either the
+// tree-sitter grammar or the regex pattern set.
+func hasExtractor(lang string) bool {
+	return hasTSLang(lang) || len(patternsForLang(lang)) > 0
+}
+
+// extractFileSymbols extracts symbols for one file, preferring the tree-sitter
+// grammar and falling back to the regex patterns when no grammar is registered
+// (or the file can't be read for the tree-sitter path).
+func extractFileSymbols(root string, f *scan.FileEntry) []Symbol {
+	fullPath := filepath.Join(root, f.RelPath)
+
+	if hasTSLang(f.Lang) {
+		if data, err := os.ReadFile(fullPath); err == nil {
+			if syms, ok := extractSymbolsTS(data, f.RelPath, f.Lang); ok {
+				return syms
+			}
+		}
+	}
+
+	patterns := patternsForLang(f.Lang)
+	if len(patterns) == 0 {
+		return nil
+	}
+	return extractSymbols(fullPath, f.RelPath, patterns)
+}
+
 func extractSymbols(fullPath, relPath string, patterns []symbolPattern) []Symbol {
 	file, err := os.Open(fullPath)
 	if err != nil {
@@ -512,12 +538,10 @@ func compilePatterns(raw []rawPattern) []symbolPattern {
 func ScanFileSymbols(root string, files []*scan.FileEntry) []Symbol {
 	var all []Symbol
 	for _, f := range files {
-		patterns := patternsForLang(f.Lang)
-		if len(patterns) == 0 {
+		if !hasExtractor(f.Lang) {
 			continue
 		}
-		syms := extractSymbols(filepath.Join(root, f.RelPath), f.RelPath, patterns)
-		all = append(all, syms...)
+		all = append(all, extractFileSymbols(root, f)...)
 	}
 	return all
 }
