@@ -174,17 +174,11 @@ func extractImports(root string, f *scan.FileEntry, goModPath string, idx *FileI
 		}
 		return resolveGoImports(lines, f.RelPath, goModPath, idx)
 	case "javascript", "typescript":
-		lines, err := readHeadLines(fullPath, 150)
-		if err != nil {
-			return nil
-		}
-		return resolveJSImports(lines, f.RelPath, idx)
+		specs := importSpecs(fullPath, f.Lang, 150, jsRegexSpecs)
+		return resolveJSSpecs(specs, f.RelPath, idx)
 	case "python":
-		lines, err := readHeadLines(fullPath, 150)
-		if err != nil {
-			return nil
-		}
-		return resolvePyImports(lines, f.RelPath, idx)
+		specs := importSpecs(fullPath, f.Lang, 150, pyRegexSpecs)
+		return resolvePySpecs(specs, f.RelPath, idx)
 	case "java":
 		lines, err := readHeadLines(fullPath, 100)
 		if err != nil {
@@ -305,23 +299,50 @@ func resolveGoImports(lines []string, filePath, goModPath string, idx *FileIndex
 	return resolved
 }
 
-func resolveJSImports(lines []string, filePath string, idx *FileIndex) []string {
-	dir := filepath.Dir(filePath)
-	var resolved []string
+// importSpecs returns the raw import specifiers for a file, preferring
+// tree-sitter extraction and falling back to a per-language regex extractor
+// (over the first maxLines lines) when no grammar/import-query is available or
+// the parse fails.
+func importSpecs(fullPath, lang string, maxLines int, regexFallback func([]string) []string) []string {
+	if hasTSImports(lang) {
+		if data, err := os.ReadFile(fullPath); err == nil {
+			if specs, ok := tsImportSpecs(data, lang); ok {
+				return specs
+			}
+		}
+	}
+	lines, err := readHeadLines(fullPath, maxLines)
+	if err != nil {
+		return nil
+	}
+	return regexFallback(lines)
+}
 
+// jsRegexSpecs is the regex fallback extractor for JS/TS import specifiers.
+func jsRegexSpecs(lines []string) []string {
+	var specs []string
 	for _, line := range lines {
-		matches := jsImportFrom.FindAllStringSubmatch(line, -1)
-		for _, m := range matches {
-			imp := m[1]
-			if !strings.HasPrefix(imp, ".") {
-				continue // external package
-			}
-			// Resolve relative to the importing file's directory
-			target := filepath.Clean(filepath.Join(dir, imp))
-			found := resolveJSPath(target, idx)
-			if found != "" {
-				resolved = append(resolved, found)
-			}
+		for _, m := range jsImportFrom.FindAllStringSubmatch(line, -1) {
+			specs = append(specs, m[1])
+		}
+	}
+	return specs
+}
+
+// resolveJSSpecs resolves relative JS/TS module specifiers to local files.
+func resolveJSSpecs(specs []string, filePath string, idx *FileIndex) []string {
+	dir := filepath.Dir(filePath)
+	seen := make(map[string]bool)
+	var resolved []string
+	for _, imp := range specs {
+		if !strings.HasPrefix(imp, ".") {
+			continue // external package
+		}
+		target := filepath.Clean(filepath.Join(dir, imp))
+		found := resolveJSPath(target, idx)
+		if found != "" && !seen[found] {
+			seen[found] = true
+			resolved = append(resolved, found)
 		}
 	}
 	return resolved
@@ -683,27 +704,33 @@ func resolveRustImports(lines []string, filePath string, idx *FileIndex) []strin
 	return resolved
 }
 
-func resolvePyImports(lines []string, filePath string, idx *FileIndex) []string {
-	dir := filepath.Dir(filePath)
-	var resolved []string
-
+// pyRegexSpecs is the regex fallback extractor for Python from-import modules.
+func pyRegexSpecs(lines []string) []string {
+	var specs []string
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-
-		// from .module import something (relative)
 		if m := pyImportFrom.FindStringSubmatch(line); m != nil {
-			imp := m[1]
-			if strings.HasPrefix(imp, ".") {
-				target := resolvePyRelative(dir, imp)
-				if target != "" && idx.Exists(target) {
-					resolved = append(resolved, target)
-				}
-			}
+			specs = append(specs, m[1])
+		}
+	}
+	return specs
+}
+
+// resolvePySpecs resolves relative Python from-import modules to local files.
+// Absolute imports are intentionally ignored (kept for accuracy).
+func resolvePySpecs(specs []string, filePath string, idx *FileIndex) []string {
+	dir := filepath.Dir(filePath)
+	seen := make(map[string]bool)
+	var resolved []string
+	for _, imp := range specs {
+		if !strings.HasPrefix(imp, ".") {
 			continue
 		}
-
-		// import module (could be relative in some contexts, usually absolute)
-		// We only track relative imports for accuracy
+		target := resolvePyRelative(dir, imp)
+		if target != "" && idx.Exists(target) && !seen[target] {
+			seen[target] = true
+			resolved = append(resolved, target)
+		}
 	}
 	return resolved
 }

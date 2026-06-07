@@ -66,6 +66,8 @@ Symbol and import analysis covers **Go, JavaScript/TypeScript, Python, Java, Kot
 
 Symbol extraction uses **tree-sitter** grammars (real parsing — no false matches from strings or comments, accurate multi-line signatures) for **Go, Python, JavaScript, TypeScript, Rust, Ruby, Java, C#, PHP, Scala, Kotlin, C, and C++**, and falls back to fast regex patterns for the remaining languages (Elixir, Swift, Dart, and others). Each grammar's symbol query lives in `internal/index/queries/<lang>.scm`, so adding or tuning a language is just editing a query file.
 
+Import extraction for **JavaScript, TypeScript, and Python** also uses tree-sitter (queries in `internal/index/queries/imports/`), which correctly handles multi-line imports and `export … from` re-exports that a line-based regex misses; the per-language resolution of those imports to local files is unchanged. Other languages still extract imports with regex.
+
 ## How It Works
 
 ```
