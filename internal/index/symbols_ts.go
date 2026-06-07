@@ -139,7 +139,7 @@ func extractSymbolsTS(source []byte, relPath, lang string) ([]Symbol, bool) {
 	matches := qc.Matches(tl.query, root, source)
 
 	var syms []Symbol
-	seen := make(map[string]bool)
+	at := make(map[string]int) // name+line -> index in syms
 	for {
 		m := matches.Next()
 		if m == nil {
@@ -171,24 +171,44 @@ func extractSymbolsTS(source []byte, relPath, lang string) ([]Symbol, bool) {
 		}
 		line := int(nameNode.StartPosition().Row) + 1
 
-		// One grammar can have overlapping patterns match the same declaration
-		// (e.g. a generic "type" rule and a specific one). De-dup on name+line.
-		key := name + ":" + kind + ":" + itoa(line)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-
-		syms = append(syms, Symbol{
+		// Several patterns can match the same declaration — e.g. a top-level
+		// arrow-function `const` matches both the @function rule and the broad
+		// @constant rule. Keep the most specific kind for a given name+line.
+		key := name + ":" + itoa(line)
+		sym := Symbol{
 			File:      relPath,
 			Name:      name,
 			Kind:      kind,
 			Line:      line,
 			Signature: trimSig(tsSignature(defNode, nameNode, source)),
-		})
+		}
+		if idx, ok := at[key]; ok {
+			if kindRank(kind) < kindRank(syms[idx].Kind) {
+				syms[idx] = sym
+			}
+			continue
+		}
+		at[key] = len(syms)
+		syms = append(syms, sym)
 	}
 
 	return syms, true
+}
+
+// kindRank orders symbol kinds by specificity so the de-dup keeps the most
+// meaningful label when several patterns hit the same name+line. Lower is more
+// specific; "constant"/"var" are the generic fallbacks that lose to anything.
+func kindRank(kind string) int {
+	switch kind {
+	case "var":
+		return 4
+	case "constant":
+		return 3
+	case "type", "property":
+		return 2
+	default:
+		return 1
+	}
 }
 
 // tsSignature builds a one-line signature from the declaration node, cutting

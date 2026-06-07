@@ -48,8 +48,8 @@ class Widget { render() {} }
 // function Decoy() {}
 const s = "class Fake {}";
 `,
-			want:   map[string]string{"foo": "function", "Bar": "function", "MAX_N": "constant", "Widget": "class", "render": "method"},
-			forbid: []string{"Decoy", "Fake", "s"},
+			want:   map[string]string{"foo": "function", "Bar": "function", "MAX_N": "constant", "Widget": "class", "render": "method", "s": "constant"},
+			forbid: []string{"Decoy", "Fake"},
 		},
 		{
 			lang: "typescript",

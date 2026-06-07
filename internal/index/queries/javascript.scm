@@ -11,9 +11,11 @@
   name: (identifier) @function
   value: [(arrow_function) (function_expression)]) @def
 
-; top-level UPPER_SNAKE constants
+; top-level and exported value bindings. Arrow-function bindings also match the
+; @function rule above and win the de-dup, so they stay functions.
 (program (lexical_declaration
-  (variable_declarator
-    name: (identifier) @constant
-    value: [(number) (string) (template_string) (object) (array) (true) (false)]) @def)
-  (#match? @constant "^[A-Z_][A-Z0-9_]*$"))
+  (variable_declarator name: (identifier) @constant) @def))
+(program (variable_declaration
+  (variable_declarator name: (identifier) @constant) @def))
+(program (export_statement (lexical_declaration
+  (variable_declarator name: (identifier) @constant) @def)))
