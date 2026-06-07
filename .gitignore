@@ -1,3 +1,4 @@
 bin/
 .recon/
 *.prof
+/recon

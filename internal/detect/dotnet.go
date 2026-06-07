@@ -124,7 +124,7 @@ func (d *DotNetDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
 		if strings.HasSuffix(base, "Controller.cs") {
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "handler"})
 		}
-		if strings.HasSuffix(base, ".razor.cs") {
+		if strings.HasSuffix(base, ".razor.cs") || strings.HasSuffix(base, ".cshtml.cs") {
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "handler"})
 		}
 	}
