@@ -47,11 +47,13 @@ func FindRelated(path string, idx *index.FileIndex, deps *index.DepGraph, tests 
 	}
 
 	// Signal 2: Test pair (weight 0.9)
-	for _, t := range tests.TestsFor(path) {
-		addSignal(t, 0.9, "test-pair")
-	}
-	if src := tests.SourceFor(path); src != "" {
-		addSignal(src, 0.9, "test-pair")
+	if tests != nil {
+		for _, t := range tests.TestsFor(path) {
+			addSignal(t, 0.9, "test-pair")
+		}
+		if src := tests.SourceFor(path); src != "" {
+			addSignal(src, 0.9, "test-pair")
+		}
 	}
 
 	// Signal 3: Import edges (weight 0.7)

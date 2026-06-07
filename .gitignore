@@ -2,3 +2,4 @@ bin/
 .recon/
 *.prof
 /recon
+.claude/
