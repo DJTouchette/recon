@@ -200,17 +200,9 @@ func extractImports(root string, f *scan.FileEntry, goModPath string, idx *FileI
 		specs := importSpecs(fullPath, f.Lang, 100, csharpRegexSpecs)
 		return resolveCSharpSpecs(specs, f.RelPath, idx)
 	case "ruby":
-		lines, err := readHeadLines(fullPath, 100)
-		if err != nil {
-			return nil
-		}
-		return resolveRubyImports(lines, f.RelPath, idx)
+		return resolveRubySpecs(rubyImportSpecs(fullPath), f.RelPath, idx)
 	case "rust":
-		lines, err := readHeadLines(fullPath, 150)
-		if err != nil {
-			return nil
-		}
-		return resolveRustImports(lines, f.RelPath, idx)
+		return resolveRustSpecs(rustImportSpecs(fullPath), f.RelPath, idx)
 	case "swift":
 		lines, err := readHeadLines(fullPath, 50)
 		if err != nil {
@@ -370,15 +362,93 @@ func resolveJSPath(target string, idx *FileIndex) string {
 	return ""
 }
 
+// rubyImportSpecs returns tagged Ruby import specifiers, preferring tree-sitter
+// and falling back to regex.
+func rubyImportSpecs(fullPath string) []string {
+	if hasTSImports("ruby") {
+		if data, err := os.ReadFile(fullPath); err == nil {
+			var specs []string
+			if tsImportEachMatch(data, "ruby", func(caps map[string]string) {
+				path := caps["path"]
+				if path == "" {
+					return
+				}
+				if caps["_m"] == "require_relative" {
+					specs = append(specs, "rel:"+path)
+				} else {
+					specs = append(specs, "abs:"+path)
+				}
+			}) {
+				return specs
+			}
+		}
+	}
+	lines, err := readHeadLines(fullPath, 100)
+	if err != nil {
+		return nil
+	}
+	return rubyRegexSpecs(lines)
+}
+
+// rustImportSpecs returns tagged Rust import specifiers, preferring tree-sitter
+// and falling back to regex.
+func rustImportSpecs(fullPath string) []string {
+	if hasTSImports("rust") {
+		if data, err := os.ReadFile(fullPath); err == nil {
+			var specs []string
+			if tsImportEachMatch(data, "rust", func(caps map[string]string) {
+				if u := caps["use"]; u != "" {
+					specs = append(specs, "use:"+u)
+				}
+				if md := caps["mod"]; md != "" {
+					specs = append(specs, "mod:"+md)
+				}
+			}) {
+				return specs
+			}
+		}
+	}
+	lines, err := readHeadLines(fullPath, 150)
+	if err != nil {
+		return nil
+	}
+	return rustRegexSpecs(lines)
+}
+
+// resolveRubyImports is the line-based entry point kept for tests; it extracts
+// specifiers with regex and resolves them.
 func resolveRubyImports(lines []string, filePath string, idx *FileIndex) []string {
+	return resolveRubySpecs(rubyRegexSpecs(lines), filePath, idx)
+}
+
+// rubyRegexSpecs is the regex fallback extractor for Ruby. Specifiers are tagged
+// with their directive: "rel:<path>" for require_relative, "abs:<path>" for
+// require — the resolver needs the distinction.
+func rubyRegexSpecs(lines []string) []string {
+	var specs []string
+	for _, line := range lines {
+		if m := rbRequireRelative.FindStringSubmatch(line); m != nil {
+			specs = append(specs, "rel:"+m[1])
+			continue
+		}
+		if m := rbRequire.FindStringSubmatch(line); m != nil {
+			specs = append(specs, "abs:"+m[1])
+		}
+	}
+	return specs
+}
+
+// resolveRubySpecs resolves tagged Ruby require/require_relative specifiers.
+func resolveRubySpecs(specs []string, filePath string, idx *FileIndex) []string {
 	dir := filepath.Dir(filePath)
 	seen := make(map[string]bool)
 	var resolved []string
 
-	for _, line := range lines {
-		// require_relative — resolve relative to the current file's directory
-		if m := rbRequireRelative.FindStringSubmatch(line); m != nil {
-			imp := m[1]
+	for _, spec := range specs {
+		kind, imp, _ := strings.Cut(spec, ":")
+
+		if kind == "rel" {
+			// require_relative — resolve relative to the current file's directory
 			target := filepath.Clean(filepath.Join(dir, imp))
 			if !strings.HasSuffix(target, ".rb") {
 				target += ".rb"
@@ -390,34 +460,30 @@ func resolveRubyImports(lines []string, filePath string, idx *FileIndex) []strin
 			continue
 		}
 
-		// require — try common Ruby source roots
-		if m := rbRequire.FindStringSubmatch(line); m != nil {
-			imp := m[1]
-			// Skip gem-like requires: no "/" or "." and no local file match
-			if !strings.Contains(imp, "/") && !strings.Contains(imp, ".") {
-				found := false
-				for _, root := range []string{"lib/", "app/", "src/"} {
-					candidate := root + imp + ".rb"
-					if idx.Exists(candidate) {
-						found = true
-						break
-					}
-				}
-				if !found {
-					continue
-				}
-			}
-
-			for _, root := range []string{"lib/", "app/", "src/", ""} {
-				candidate := filepath.Clean(root + imp)
-				if !strings.HasSuffix(candidate, ".rb") {
-					candidate += ".rb"
-				}
-				if idx.Exists(candidate) && !seen[candidate] {
-					seen[candidate] = true
-					resolved = append(resolved, candidate)
+		// require — try common Ruby source roots.
+		// Skip gem-like requires: no "/" or "." and no local file match.
+		if !strings.Contains(imp, "/") && !strings.Contains(imp, ".") {
+			found := false
+			for _, root := range []string{"lib/", "app/", "src/"} {
+				if idx.Exists(root + imp + ".rb") {
+					found = true
 					break
 				}
+			}
+			if !found {
+				continue
+			}
+		}
+
+		for _, root := range []string{"lib/", "app/", "src/", ""} {
+			candidate := filepath.Clean(root + imp)
+			if !strings.HasSuffix(candidate, ".rb") {
+				candidate += ".rb"
+			}
+			if idx.Exists(candidate) && !seen[candidate] {
+				seen[candidate] = true
+				resolved = append(resolved, candidate)
+				break
 			}
 		}
 	}
@@ -599,13 +665,35 @@ func resolveCSharpSpecs(specs []string, filePath string, idx *FileIndex) []strin
 	return resolved
 }
 
+// resolveRustImports is the line-based entry point kept for tests.
 func resolveRustImports(lines []string, filePath string, idx *FileIndex) []string {
+	return resolveRustSpecs(rustRegexSpecs(lines), filePath, idx)
+}
+
+// rustRegexSpecs is the regex fallback extractor for Rust. Specifiers are tagged
+// "use:<path>" (use crate::/self::/super:: paths) or "mod:<name>" (mod decls).
+func rustRegexSpecs(lines []string) []string {
+	var specs []string
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		if m := rsModDecl.FindStringSubmatch(t); m != nil {
+			specs = append(specs, "mod:"+m[1])
+			continue
+		}
+		if m := rsUseStmt.FindStringSubmatch(t); m != nil {
+			specs = append(specs, "use:"+m[1])
+		}
+	}
+	return specs
+}
+
+// resolveRustSpecs resolves tagged Rust use-paths and mod declarations.
+func resolveRustSpecs(specs []string, filePath string, idx *FileIndex) []string {
 	dir := filepath.Dir(filePath)
 	seen := make(map[string]bool)
 	var resolved []string
 
-	// Find the crate root (src/) relative to the project
-	// Walk up from the file to find the enclosing src/ directory
+	// Find the crate root (the enclosing src/ directory).
 	crateRoot := ""
 	parts := strings.Split(filepath.ToSlash(filePath), "/")
 	for i := len(parts) - 1; i >= 0; i-- {
@@ -615,19 +703,38 @@ func resolveRustImports(lines []string, filePath string, idx *FileIndex) []strin
 		}
 	}
 
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
+	// resolveUnder tries {base}/{modPath}.rs, {base}/{modPath}/mod.rs, and the
+	// parent module file (the imported item may be defined in the parent module).
+	resolveUnder := func(base string, modParts []string) {
+		modPath := strings.Join(modParts, "/")
+		candidates := []string{
+			filepath.Join(base, modPath+".rs"),
+			filepath.Join(base, modPath, "mod.rs"),
+		}
+		if len(modParts) > 1 {
+			parentPath := strings.Join(modParts[:len(modParts)-1], "/")
+			candidates = append(candidates, filepath.Join(base, parentPath+".rs"))
+		}
+		for _, candidate := range candidates {
+			if idx.Exists(candidate) && !seen[candidate] && candidate != filePath {
+				seen[candidate] = true
+				resolved = append(resolved, candidate)
+				break
+			}
+		}
+	}
 
-		// mod declarations: mod child; -> {dir}/child.rs or {dir}/child/mod.rs
-		if m := rsModDecl.FindStringSubmatch(trimmed); m != nil {
-			child := m[1]
-			// Skip common non-import mod keywords
-			if child == "tests" || child == "test" {
+	for _, spec := range specs {
+		kind, imp, _ := strings.Cut(spec, ":")
+
+		if kind == "mod" {
+			// mod child; -> {dir}/child.rs or {dir}/child/mod.rs
+			if imp == "tests" || imp == "test" {
 				continue
 			}
 			for _, candidate := range []string{
-				filepath.Join(dir, child+".rs"),
-				filepath.Join(dir, child, "mod.rs"),
+				filepath.Join(dir, imp+".rs"),
+				filepath.Join(dir, imp, "mod.rs"),
 			} {
 				if idx.Exists(candidate) && !seen[candidate] {
 					seen[candidate] = true
@@ -638,86 +745,21 @@ func resolveRustImports(lines []string, filePath string, idx *FileIndex) []strin
 			continue
 		}
 
-		// use statements: use crate::a::b, use self::x, use super::x
-		if m := rsUseStmt.FindStringSubmatch(trimmed); m != nil {
-			imp := m[1]
-			segments := strings.Split(imp, "::")
-
-			if len(segments) < 2 {
-				continue
+		// use crate::a::b / use self::x / use super::x
+		segments := strings.Split(imp, "::")
+		if len(segments) < 2 {
+			continue
+		}
+		modParts := segments[1:]
+		switch segments[0] {
+		case "crate":
+			if crateRoot != "" {
+				resolveUnder(crateRoot, modParts)
 			}
-
-			switch segments[0] {
-			case "crate":
-				if crateRoot == "" {
-					continue
-				}
-				// Strip "crate", convert remaining segments to path
-				modParts := segments[1:]
-				modPath := strings.Join(modParts, "/")
-
-				// Try full path as file: src/a/b/c.rs
-				// Try full path as dir module: src/a/b/c/mod.rs
-				// Try parent file (item might be defined in parent module): src/a/b.rs
-				candidates := []string{
-					filepath.Join(crateRoot, modPath+".rs"),
-					filepath.Join(crateRoot, modPath, "mod.rs"),
-				}
-				if len(modParts) > 1 {
-					parentPath := strings.Join(modParts[:len(modParts)-1], "/")
-					candidates = append(candidates, filepath.Join(crateRoot, parentPath+".rs"))
-				}
-				for _, candidate := range candidates {
-					if idx.Exists(candidate) && !seen[candidate] && candidate != filePath {
-						seen[candidate] = true
-						resolved = append(resolved, candidate)
-						break
-					}
-				}
-
-			case "super":
-				// use super::x -> go up one directory
-				parentDir := filepath.Dir(dir)
-				modParts := segments[1:]
-				modPath := strings.Join(modParts, "/")
-
-				candidates := []string{
-					filepath.Join(parentDir, modPath+".rs"),
-					filepath.Join(parentDir, modPath, "mod.rs"),
-				}
-				if len(modParts) > 1 {
-					parentPath := strings.Join(modParts[:len(modParts)-1], "/")
-					candidates = append(candidates, filepath.Join(parentDir, parentPath+".rs"))
-				}
-				for _, candidate := range candidates {
-					if idx.Exists(candidate) && !seen[candidate] && candidate != filePath {
-						seen[candidate] = true
-						resolved = append(resolved, candidate)
-						break
-					}
-				}
-
-			case "self":
-				// use self::x -> resolve in same directory
-				modParts := segments[1:]
-				modPath := strings.Join(modParts, "/")
-
-				candidates := []string{
-					filepath.Join(dir, modPath+".rs"),
-					filepath.Join(dir, modPath, "mod.rs"),
-				}
-				if len(modParts) > 1 {
-					parentPath := strings.Join(modParts[:len(modParts)-1], "/")
-					candidates = append(candidates, filepath.Join(dir, parentPath+".rs"))
-				}
-				for _, candidate := range candidates {
-					if idx.Exists(candidate) && !seen[candidate] && candidate != filePath {
-						seen[candidate] = true
-						resolved = append(resolved, candidate)
-						break
-					}
-				}
-			}
+		case "super":
+			resolveUnder(filepath.Dir(dir), modParts)
+		case "self":
+			resolveUnder(dir, modParts)
 		}
 	}
 	return resolved

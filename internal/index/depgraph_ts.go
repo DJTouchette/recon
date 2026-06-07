@@ -91,3 +91,45 @@ func tsImportSpecs(source []byte, lang string) ([]string, bool) {
 	}
 	return specs, true
 }
+
+// tsImportEachMatch runs the import query for lang and invokes fn once per match
+// with a map of capture-name → captured text. Used by languages (Ruby, Rust)
+// whose specifiers carry a directive that a flat @path list can't express.
+// Returns false when no query is registered or the parse fails.
+func tsImportEachMatch(source []byte, lang string, fn func(caps map[string]string)) bool {
+	tl := tsImportRegistry[lang]
+	if tl == nil {
+		return false
+	}
+
+	p := tsParserPool.Get().(*tree_sitter.Parser)
+	defer tsParserPool.Put(p)
+	if err := p.SetLanguage(tl.lang); err != nil {
+		return false
+	}
+
+	tree := p.Parse(source, nil)
+	if tree == nil {
+		return false
+	}
+	defer tree.Close()
+
+	qc := tree_sitter.NewQueryCursor()
+	defer qc.Close()
+
+	names := tl.query.CaptureNames()
+	matches := qc.Matches(tl.query, tree.RootNode(), source)
+	for {
+		m := matches.Next()
+		if m == nil {
+			break
+		}
+		caps := make(map[string]string, len(m.Captures))
+		for i := range m.Captures {
+			c := &m.Captures[i]
+			caps[names[c.Index]] = c.Node.Utf8Text(source)
+		}
+		fn(caps)
+	}
+	return true
+}

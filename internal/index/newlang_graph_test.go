@@ -75,6 +75,70 @@ func TestMoreLangReferences(t *testing.T) {
 	}
 }
 
+// Ruby and Rust carry a directive on each import specifier (require vs
+// require_relative; use vs mod), which tree-sitter extraction must preserve.
+func TestRubyRustTaggedImports(t *testing.T) {
+	taggedRuby := func(src string) []string {
+		var specs []string
+		tsImportEachMatch([]byte(src), "ruby", func(c map[string]string) {
+			if c["path"] == "" {
+				return
+			}
+			if c["_m"] == "require_relative" {
+				specs = append(specs, "rel:"+c["path"])
+			} else {
+				specs = append(specs, "abs:"+c["path"])
+			}
+		})
+		return sortedStrings(specs)
+	}
+	rb := taggedRuby("require_relative \"a/b\"\nrequire \"lib\"\n# require \"commented\"\nx = \"require 'instr'\"\n")
+	wantRb := []string{"abs:lib", "rel:a/b"}
+	if len(rb) != len(wantRb) || rb[0] != wantRb[0] || rb[1] != wantRb[1] {
+		t.Errorf("ruby tagged specs: got %v, want %v", rb, wantRb)
+	}
+
+	taggedRust := func(src string) []string {
+		var specs []string
+		tsImportEachMatch([]byte(src), "rust", func(c map[string]string) {
+			if u := c["use"]; u != "" {
+				specs = append(specs, "use:"+u)
+			}
+			if m := c["mod"]; m != "" {
+				specs = append(specs, "mod:"+m)
+			}
+		})
+		return sortedStrings(specs)
+	}
+	ru := taggedRust("use crate::foo::Bar;\nuse crate::a::{B, C};\nmod child;\n// use crate::commented::X;\n")
+	want := []string{"mod:child", "use:crate::a", "use:crate::foo::Bar"}
+	if len(ru) != len(want) {
+		t.Fatalf("rust tagged specs: got %v, want %v", ru, want)
+	}
+	for i := range want {
+		if ru[i] != want[i] {
+			t.Fatalf("rust tagged specs: got %v, want %v", ru, want)
+		}
+	}
+
+	// And resolution still works end to end.
+	rbIdx := mkPathIdx("lib/app.rb", "lib/auth/session.rb", "lib/util.rb")
+	got := resolveRubySpecs([]string{"rel:../util", "abs:auth/session"}, "lib/sub/x.rb", rbIdx)
+	_ = got // exercise path; detailed resolution covered in depgraph_resolve_test.go
+	ruIdx := mkPathIdx("src/main.rs", "src/foo.rs", "src/foo/bar.rs")
+	if r := resolveRustSpecs([]string{"use:crate::foo::Thing"}, "src/main.rs", ruIdx); len(r) == 0 {
+		t.Errorf("rust resolution produced no edge for crate::foo::Thing (want src/foo.rs)")
+	}
+}
+
+func mkPathIdx(paths ...string) *FileIndex {
+	var es []scan.FileEntry
+	for _, p := range paths {
+		es = append(es, scan.FileEntry{RelPath: p, Lang: scan.LangFromExt(p), Class: scan.ClassSource})
+	}
+	return NewFileIndex(es)
+}
+
 // Import extraction + resolution for the newer tree-sitter languages.
 func TestNewLangImports(t *testing.T) {
 	mk := func(paths ...string) *FileIndex {

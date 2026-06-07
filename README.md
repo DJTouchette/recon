@@ -68,7 +68,7 @@ Symbol and import analysis covers **Go, JavaScript/TypeScript, Python, Java, Kot
 
 Symbol extraction uses **tree-sitter** grammars (real parsing — no false matches from strings or comments, accurate multi-line signatures) for **Go, Python, JavaScript, TypeScript, Rust, Ruby, Java, C#, PHP, Scala, Kotlin, C, C++, Lua, Shell/Bash, Julia, and Zig**, and falls back to fast regex patterns for **Swift, Dart, and Elixir** (whose grammars aren't usable as Go modules). Each grammar's symbol query lives in `internal/index/queries/<lang>.scm`, so adding or tuning a language is just editing a query file.
 
-Import extraction for **JavaScript, TypeScript, Python, Lua, Julia, Zig, and Shell** uses tree-sitter (queries in `internal/index/queries/imports/`), which correctly handles multi-line imports and `export … from` re-exports that a line-based regex misses; the per-language resolution of those imports to local files (e.g. Zig `@import`, Lua `require`, Julia `include`, shell `source`) is hand-written. Other languages still extract imports with regex.
+Import extraction uses **tree-sitter** for **JavaScript, TypeScript, Python, Go, Java, Kotlin, C#, PHP, Scala, Ruby, Rust, Lua, Julia, Zig, and Shell** (queries in `internal/index/queries/imports/`), which correctly handles multi-line imports, `export … from` re-exports, and never picks up imports hiding in comments or strings; the per-language resolution to local files (Go module paths, PSR-4, Ruby `require`/`require_relative`, Rust `use`/`mod` crate paths, Zig `@import`, etc.) is hand-written and unchanged.
 
 ## How It Works
 
