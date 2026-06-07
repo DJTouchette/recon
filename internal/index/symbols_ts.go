@@ -22,6 +22,11 @@ import (
 	ts_ts "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
 
 	ts_kotlin "github.com/tree-sitter-grammars/tree-sitter-kotlin/bindings/go"
+	ts_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
+
+	ts_bash "github.com/tree-sitter/tree-sitter-bash/bindings/go"
+	ts_zig "github.com/tree-sitter-grammars/tree-sitter-zig/bindings/go"
+	ts_julia "github.com/tree-sitter/tree-sitter-julia/bindings/go"
 )
 
 // Tree-sitter based symbol extraction.
@@ -79,6 +84,10 @@ var tsGrammars = []tsGrammar{
 	{"kotlin", ts_kotlin.Language(), "kotlin.scm"},
 	{"c", ts_c.Language(), "c.scm"},
 	{"cpp", ts_cpp.Language(), "cpp.scm"},
+	{"lua", ts_lua.Language(), "lua.scm"},
+	{"shell", ts_bash.Language(), "shell.scm"},
+	{"julia", ts_julia.Language(), "julia.scm"},
+	{"zig", ts_zig.Language(), "zig.scm"},
 }
 
 func init() {

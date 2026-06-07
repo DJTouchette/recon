@@ -185,6 +185,50 @@ double Shape::area() { return 0; }
 `,
 			want: map[string]string{"geo": "module", "Shape": "class", "Vec": "struct", "Color": "enum", "add": "function", "area": "method"},
 		},
+		{
+			lang: "lua",
+			src: `local M = {}
+function M.greet(name) return "hi" end
+function standalone() end
+function M:method1() end
+local helper = function() end
+return M
+`,
+			want:   map[string]string{"greet": "function", "standalone": "function", "method1": "method", "helper": "function"},
+			forbid: []string{"M"},
+		},
+		{
+			lang: "shell",
+			src: `#!/bin/bash
+greet() { echo hi; }
+function deploy { echo go; }
+x="not a func"
+`,
+			want:   map[string]string{"greet": "function", "deploy": "function"},
+			forbid: []string{"x"},
+		},
+		{
+			lang: "julia",
+			src: `module Foo
+struct Point x::Int end
+abstract type Shape end
+function area(s) 0 end
+macro mymac(x) end
+end
+`,
+			want: map[string]string{"Foo": "module", "Point": "struct", "Shape": "type", "area": "function", "mymac": "macro"},
+		},
+		{
+			lang: "zig",
+			src: `const std = @import("std");
+const Point = struct { x: i32, y: i32 };
+const Color = enum { red, green };
+pub fn add(a: i32, b: i32) i32 { return a + b; }
+fn helper() void {}
+`,
+			want:   map[string]string{"Point": "type", "Color": "type", "add": "function", "helper": "function"},
+			forbid: []string{"std"},
+		},
 	}
 
 	for _, tc := range cases {

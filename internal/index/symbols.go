@@ -43,8 +43,10 @@ func NewSymbolIndex(root string, idx *FileIndex) *SymbolIndex {
 		byFile: make(map[string][]Symbol),
 	}
 
-	sources := make([]*scan.FileEntry, 0, len(idx.ByClass(scan.ClassSource))+len(idx.ByClass(scan.ClassTest)))
+	sources := make([]*scan.FileEntry, 0, len(idx.ByClass(scan.ClassSource))+len(idx.ByClass(scan.ClassScript)))
 	sources = append(sources, idx.ByClass(scan.ClassSource)...)
+	// Script files (shell, etc.) define functions worth indexing too.
+	sources = append(sources, idx.ByClass(scan.ClassScript)...)
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
