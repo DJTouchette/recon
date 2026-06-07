@@ -10,6 +10,7 @@ Recon is the codebase-intelligence layer of the [Rivet](https://github.com/djtou
 
 - **Dependency graph** — import resolution and reverse lookups across 14 languages (`imports of` / `imported by`)
 - **Symbol search** — functions, types, classes, methods, parsed from a real grammar (tree-sitter) where available, with regex fallback elsewhere
+- **Call graph** — `callers` finds every site that references a symbol, resolved against its definitions via the import graph (tree-sitter, for Go, JS/TS, Python, C#, Java, Rust, Ruby, PHP)
 - **Co-change history** — files that always change together, mined from git log
 - **Hotspot detection** — high fan-in × high churn = the code that's risky to touch
 - **Enriched grep** — classifies every match as a definition, reference, test, or comment
@@ -43,6 +44,7 @@ All commands emit JSON by default (built to be consumed by tools). Add `--human`
 | `recon grep <pattern>` | Enriched grep with definition/reference/test/comment classification (`--type`) |
 | `recon related <path>` | Files related to a path (imports, co-change, naming, test pairs) |
 | `recon symbols [query]` | Search or list functions, types, classes. `file:<path>` lists a file's symbols |
+| `recon callers <name>` | Where a symbol is defined and every call site that references it |
 | `recon context <path>` | File preview, fan-in/fan-out, churn, ownership, nearby configs |
 | `recon hotspots` | Top files ranked by risk (fan-in × churn) |
 | `recon tests <path>` | Find test files for a source file |

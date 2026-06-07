@@ -21,9 +21,10 @@ type Recon struct {
 	store     *cache.Store
 	idx       *index.FileIndex
 	deps      *index.DepGraph
-	tests     *index.TestMap
-	symbols   *index.SymbolIndex
-	extras    map[string]*index.FileExtra
+	tests      *index.TestMap
+	symbols    *index.SymbolIndex
+	references *index.ReferenceIndex
+	extras     map[string]*index.FileExtra
 	metrics   *index.MetricsIndex
 	nearby    *index.NearbyIndex
 	ownership *index.Ownership
@@ -289,6 +290,72 @@ func (r *Recon) Symbols(query string, maxResults int) ([]SymbolInfo, error) {
 	return out, nil
 }
 
+// Callers finds all call sites referencing the given symbol name and resolves
+// them against the symbol definitions. Definitions are the symbols exactly
+// named `name`; references are all call sites for that name. A reference is
+// marked Resolved when its file plausibly reaches a definition — either it
+// imports a definition file, or it sits in the same directory as one — which
+// filters out unrelated calls that merely share the name.
+func (r *Recon) Callers(name string) CallersResult {
+	result := CallersResult{Name: name}
+	if name == "" {
+		return result
+	}
+
+	// Definitions: symbols exactly named `name`.
+	defFiles := make(map[string]bool)
+	defDirs := make(map[string]bool)
+	if r.symbols != nil {
+		for _, s := range r.symbols.Exact(name) {
+			result.Definitions = append(result.Definitions, SymbolInfo{
+				File:      s.File,
+				Name:      s.Name,
+				Kind:      s.Kind,
+				Line:      s.Line,
+				Signature: s.Signature,
+			})
+			defFiles[s.File] = true
+			defDirs[filepath.Dir(s.File)] = true
+		}
+	}
+
+	// References: all call sites for `name`, resolved against definition files.
+	if r.references != nil {
+		for _, ref := range r.references.ForName(name) {
+			result.References = append(result.References, Reference{
+				File:     ref.File,
+				Line:     ref.Line,
+				Resolved: r.referenceResolves(ref.File, defFiles, defDirs),
+			})
+		}
+	}
+
+	return result
+}
+
+// referenceResolves reports whether a referencing file plausibly reaches one of
+// the definition files: it is itself a definition file, imports one, or shares a
+// directory with one.
+func (r *Recon) referenceResolves(file string, defFiles, defDirs map[string]bool) bool {
+	if len(defFiles) == 0 {
+		return false
+	}
+	if defFiles[file] {
+		return true
+	}
+	if defDirs[filepath.Dir(file)] {
+		return true
+	}
+	if r.deps != nil {
+		for _, imp := range r.deps.ImportsOf(file) {
+			if defFiles[imp] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // FileDetail returns preview and content hash for a file.
 func (r *Recon) FileDetail(path string) (*FileDetail, error) {
 	path = filepath.Clean(path)
@@ -531,6 +598,7 @@ func (r *Recon) Rebuild() error {
 	r.tests = index.NewTestMap(r.idx)
 	r.deps = index.NewDepGraph(r.root, r.idx)
 	r.symbols = index.NewSymbolIndex(r.root, r.idx)
+	r.references = index.NewReferenceIndex(r.root, r.idx)
 	r.buildExtrasMap(index.ExtractFileExtras(r.root, r.idx))
 	r.nearby = index.NewNearbyIndex(index.FindNearbyConfigs(r.root, r.idx))
 	r.ownership = index.ParseCodeowners(r.root)
@@ -578,6 +646,9 @@ func (r *Recon) Refresh() error {
 	var upsert []scan.FileEntry
 	var remove []string
 	var changedSourceFiles []*scan.FileEntry
+	// References are extracted from both source and test files, so refreshing
+	// them requires tracking changed test files too.
+	var changedRefFiles []*scan.FileEntry
 	currentPaths := make(map[string]bool, len(walkResult.Files))
 
 	for i := range walkResult.Files {
@@ -588,6 +659,9 @@ func (r *Recon) Refresh() error {
 			upsert = append(upsert, *f)
 			if f.Class == scan.ClassSource {
 				changedSourceFiles = append(changedSourceFiles, f)
+			}
+			if f.Class == scan.ClassSource || f.Class == scan.ClassTest {
+				changedRefFiles = append(changedRefFiles, f)
 			}
 		}
 	}
@@ -644,6 +718,19 @@ func (r *Recon) Refresh() error {
 		r.store.UpdateFileExtras(nil, remove)
 	}
 
+	// Re-extract references for changed/added source+test files
+	if len(changedRefFiles) > 0 {
+		refChangedPaths := make([]string, 0, len(changedRefFiles)+len(remove))
+		for _, f := range changedRefFiles {
+			refChangedPaths = append(refChangedPaths, f.RelPath)
+		}
+		refChangedPaths = append(refChangedPaths, remove...)
+		newRefs := index.ScanFileReferences(r.root, changedRefFiles)
+		r.store.UpdateReferences(newRefs, refChangedPaths)
+	} else if len(remove) > 0 {
+		r.store.UpdateReferences(nil, remove)
+	}
+
 	// Re-parse git if HEAD changed
 	storedHead, _ := r.store.GetMeta("head_sha")
 	currentHead := gitpkg.GetHEAD(r.root)
@@ -663,6 +750,7 @@ func (r *Recon) Refresh() error {
 
 	r.deps = index.NewDepGraphFromData(snap.Imports)
 	r.symbols = index.NewSymbolIndexFromData(snap.Symbols)
+	r.references = index.NewReferenceIndexFromData(snap.References)
 	r.buildExtrasMap(snap.FileExtras)
 	r.metrics = index.NewMetricsIndex(snap.Metrics)
 	r.nearby = index.NewNearbyIndex(snap.NearbyConfigs)
@@ -691,6 +779,7 @@ func (r *Recon) loadFromCache() error {
 	r.tests = index.NewTestMapFromData(snap.SourceToTest, snap.TestToSource)
 	r.cochange = gitpkg.NewCoChangeFromData(snap.CoChangePairs, snap.Churn)
 	r.symbols = index.NewSymbolIndexFromData(snap.Symbols)
+	r.references = index.NewReferenceIndexFromData(snap.References)
 	r.buildExtrasMap(snap.FileExtras)
 	r.metrics = index.NewMetricsIndex(snap.Metrics)
 	r.nearby = index.NewNearbyIndex(snap.NearbyConfigs)
@@ -710,6 +799,7 @@ func (r *Recon) rebuildNoPersist() error {
 	r.tests = index.NewTestMap(r.idx)
 	r.deps = index.NewDepGraph(r.root, r.idx)
 	r.symbols = index.NewSymbolIndex(r.root, r.idx)
+	r.references = index.NewReferenceIndex(r.root, r.idx)
 	r.buildExtrasMap(index.ExtractFileExtras(r.root, r.idx))
 	r.nearby = index.NewNearbyIndex(index.FindNearbyConfigs(r.root, r.idx))
 	r.ownership = index.ParseCodeowners(r.root)
@@ -735,6 +825,7 @@ func (r *Recon) toSnapshot(files []scan.FileEntry) *cache.Snapshot {
 		CoChangePairs: nil,
 		Churn:         nil,
 		Symbols:       r.symbols.All(),
+		References:    r.references.All(),
 		Metrics:       r.metrics.All(),
 		NearbyConfigs: r.nearby.All(),
 		OwnerRules:    r.ownership.Rules(),

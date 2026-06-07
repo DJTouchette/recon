@@ -45,6 +45,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(relatedCmd())
 	root.AddCommand(testsCmd())
 	root.AddCommand(symbolsCmd())
+	root.AddCommand(callersCmd())
 	root.AddCommand(searchCmd())
 	root.AddCommand(contextCmd())
 	root.AddCommand(hotspotsCmd())
@@ -188,6 +189,29 @@ func symbolsCmd() *cobra.Command {
 	}
 	cmd.Flags().IntVarP(&maxResults, "max", "n", 30, "max results")
 	return cmd
+}
+
+func callersCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "callers <name>",
+		Short: "Find callers/references of a symbol, resolved against its definitions",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			r, err := newRecon()
+			if err != nil {
+				return err
+			}
+			defer r.Close()
+
+			result := r.Callers(args[0])
+
+			if flagHuman {
+				printCallersHuman(cmd, result)
+				return nil
+			}
+			return outputJSON(cmd, result)
+		},
+	}
 }
 
 func searchCmd() *cobra.Command {
@@ -422,6 +446,43 @@ func printSymbolsHuman(cmd *cobra.Command, symbols []recon.SymbolInfo) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, s := range symbols {
 		fmt.Fprintf(tw, "  %s\t%s\t%s:%d\t%s\n", s.Kind, s.Name, s.File, s.Line, s.Signature)
+	}
+	tw.Flush()
+}
+
+func printCallersHuman(cmd *cobra.Command, result recon.CallersResult) {
+	w := cmd.OutOrStdout()
+
+	if len(result.Definitions) == 0 {
+		fmt.Fprintf(w, "No definition found for %q.\n", result.Name)
+	} else {
+		fmt.Fprintf(w, "Defined in:\n")
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		for _, d := range result.Definitions {
+			fmt.Fprintf(tw, "  %s\t%s:%d\t%s\n", d.Kind, d.File, d.Line, d.Signature)
+		}
+		tw.Flush()
+	}
+
+	if len(result.References) == 0 {
+		fmt.Fprintf(w, "\nNo references found.\n")
+		return
+	}
+
+	resolved := 0
+	for _, ref := range result.References {
+		if ref.Resolved {
+			resolved++
+		}
+	}
+	fmt.Fprintf(w, "\nReferenced from (%d total, %d resolved):\n", len(result.References), resolved)
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	for _, ref := range result.References {
+		mark := "ambiguous"
+		if ref.Resolved {
+			mark = "resolved"
+		}
+		fmt.Fprintf(tw, "  %s:%d\t[%s]\n", ref.File, ref.Line, mark)
 	}
 	tw.Flush()
 }

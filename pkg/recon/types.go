@@ -65,6 +65,20 @@ type SymbolInfo struct {
 	Signature string `json:"signature"`
 }
 
+// CallersResult is the response for a "find callers/references" query.
+type CallersResult struct {
+	Name        string       `json:"name"`
+	Definitions []SymbolInfo `json:"definitions"`
+	References  []Reference  `json:"references"`
+}
+
+// Reference is a single resolved call site for a symbol.
+type Reference struct {
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+	Resolved bool   `json:"resolved"`
+}
+
 type FileDetail struct {
 	Path        string `json:"path"`
 	Preview     string `json:"preview,omitempty"`

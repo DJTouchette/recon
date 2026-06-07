@@ -16,7 +16,7 @@ import (
 const (
 	cacheDir   = ".recon"
 	dbFile     = "recon.db"
-	schemaVer  = 3
+	schemaVer  = 4
 )
 
 // Snapshot holds all indexed data for save/load.
@@ -29,6 +29,7 @@ type Snapshot struct {
 	CoChangePairs map[string]map[string]int
 	Churn         map[string]int
 	Symbols       []index.Symbol
+	References    []index.Reference
 	FileExtras    []index.FileExtra
 	Metrics       []index.FileMetrics
 	NearbyConfigs []index.NearbyConfig
@@ -100,7 +101,7 @@ func (s *Store) ensureSchema() error {
 	}
 
 	// Drop and recreate all tables
-	for _, table := range []string{"meta", "files", "imports", "tests", "cochange", "churn", "symbols", "file_extras", "file_metrics", "nearby_configs", "codeowners"} {
+	for _, table := range []string{"meta", "files", "imports", "tests", "cochange", "churn", "symbols", "references_", "file_extras", "file_metrics", "nearby_configs", "codeowners"} {
 		s.db.Exec("DROP TABLE IF EXISTS " + table)
 	}
 
@@ -153,6 +154,11 @@ CREATE TABLE symbols (
 	line INTEGER NOT NULL DEFAULT 0,
 	signature TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE references_ (
+	name TEXT NOT NULL,
+	file_path TEXT NOT NULL,
+	line INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE file_extras (
 	rel_path TEXT PRIMARY KEY,
 	preview TEXT NOT NULL DEFAULT '',
@@ -185,6 +191,7 @@ CREATE TABLE codeowners (
 CREATE INDEX idx_symbols_file ON symbols(file_path);
 CREATE INDEX idx_symbols_name ON symbols(name);
 CREATE INDEX idx_symbols_kind ON symbols(kind);
+CREATE INDEX idx_references_name ON references_(name);
 CREATE INDEX idx_metrics_hotspot ON file_metrics(hotspot_score);
 CREATE INDEX idx_nearby_dir ON nearby_configs(dir);
 `
@@ -225,7 +232,7 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 	defer tx.Rollback()
 
 	// Clear data tables (not meta)
-	for _, table := range []string{"files", "imports", "tests", "cochange", "churn", "symbols", "file_extras", "file_metrics", "nearby_configs", "codeowners"} {
+	for _, table := range []string{"files", "imports", "tests", "cochange", "churn", "symbols", "references_", "file_extras", "file_metrics", "nearby_configs", "codeowners"} {
 		if _, err := tx.Exec("DELETE FROM " + table); err != nil {
 			return fmt.Errorf("clear %s: %w", table, err)
 		}
@@ -320,6 +327,20 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 		for i := range snap.Symbols {
 			s := &snap.Symbols[i]
 			symStmt.Exec(s.File, s.Name, s.Kind, s.Line, s.Signature)
+		}
+	}
+
+	// --- References ---
+	if len(snap.References) > 0 {
+		refStmt, err := tx.Prepare("INSERT INTO references_ (name, file_path, line) VALUES (?, ?, ?)")
+		if err != nil {
+			return fmt.Errorf("prepare references: %w", err)
+		}
+		defer refStmt.Close()
+
+		for i := range snap.References {
+			r := &snap.References[i]
+			refStmt.Exec(r.Name, r.File, r.Line)
 		}
 	}
 
@@ -507,6 +528,24 @@ func (s *Store) LoadSnapshot() (*Snapshot, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("symbol rows: %w", err)
+	}
+
+	// --- References ---
+	rows, err = s.db.Query("SELECT name, file_path, line FROM references_")
+	if err != nil {
+		return nil, fmt.Errorf("query references: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var ref index.Reference
+		if err := rows.Scan(&ref.Name, &ref.File, &ref.Line); err != nil {
+			return nil, fmt.Errorf("scan reference row: %w", err)
+		}
+		snap.References = append(snap.References, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reference rows: %w", err)
 	}
 
 	// --- File Extras ---
@@ -786,6 +825,47 @@ func (s *Store) UpdateSymbols(symbols []index.Symbol, removedFiles []string) err
 		for i := range symbols {
 			s := &symbols[i]
 			insStmt.Exec(s.File, s.Name, s.Kind, s.Line, s.Signature)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// UpdateReferences deletes old references for given files and inserts new ones.
+func (s *Store) UpdateReferences(refs []index.Reference, removedFiles []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	delStmt, err := tx.Prepare("DELETE FROM references_ WHERE file_path=?")
+	if err != nil {
+		return err
+	}
+	defer delStmt.Close()
+
+	// Collect files that have new references.
+	changedFiles := make(map[string]bool)
+	for i := range refs {
+		changedFiles[refs[i].File] = true
+	}
+	for f := range changedFiles {
+		delStmt.Exec(f)
+	}
+	for _, f := range removedFiles {
+		delStmt.Exec(f)
+	}
+
+	if len(refs) > 0 {
+		insStmt, err := tx.Prepare("INSERT INTO references_ (name, file_path, line) VALUES (?, ?, ?)")
+		if err != nil {
+			return err
+		}
+		defer insStmt.Close()
+		for i := range refs {
+			r := &refs[i]
+			insStmt.Exec(r.Name, r.File, r.Line)
 		}
 	}
 

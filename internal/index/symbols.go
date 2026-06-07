@@ -107,6 +107,20 @@ func (si *SymbolIndex) All() []Symbol {
 	return si.all
 }
 
+// Exact returns symbols whose name exactly matches the given name.
+func (si *SymbolIndex) Exact(name string) []Symbol {
+	if si == nil {
+		return nil
+	}
+	var results []Symbol
+	for i := range si.all {
+		if si.all[i].Name == name {
+			results = append(results, si.all[i])
+		}
+	}
+	return results
+}
+
 // Search returns symbols whose name contains the query (case-insensitive).
 func (si *SymbolIndex) Search(query string) []Symbol {
 	if si == nil {
