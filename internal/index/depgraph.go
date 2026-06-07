@@ -35,9 +35,11 @@ func NewDepGraph(root string, idx *FileIndex) *DepGraph {
 	// the only way to connect tests to source files.
 	sources := idx.ByClass(scan.ClassSource)
 	tests := idx.ByClass(scan.ClassTest)
-	allFiles := make([]*scan.FileEntry, 0, len(sources)+len(tests))
+	scripts := idx.ByClass(scan.ClassScript)
+	allFiles := make([]*scan.FileEntry, 0, len(sources)+len(tests)+len(scripts))
 	allFiles = append(allFiles, sources...)
 	allFiles = append(allFiles, tests...)
+	allFiles = append(allFiles, scripts...)
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -179,6 +181,18 @@ func extractImports(root string, f *scan.FileEntry, goModPath string, idx *FileI
 	case "python":
 		specs := importSpecs(fullPath, f.Lang, 150, pyRegexSpecs)
 		return resolvePySpecs(specs, f.RelPath, idx)
+	case "zig":
+		specs := importSpecs(fullPath, f.Lang, 300, noRegexSpecs)
+		return resolveZigSpecs(specs, f.RelPath, idx)
+	case "lua":
+		specs := importSpecs(fullPath, f.Lang, 150, noRegexSpecs)
+		return resolveLuaSpecs(specs, f.RelPath, idx)
+	case "julia":
+		specs := importSpecs(fullPath, f.Lang, 300, noRegexSpecs)
+		return resolveJuliaSpecs(specs, f.RelPath, idx)
+	case "shell":
+		specs := importSpecs(fullPath, f.Lang, 200, noRegexSpecs)
+		return resolveShellSpecs(specs, f.RelPath, idx)
 	case "java":
 		lines, err := readHeadLines(fullPath, 100)
 		if err != nil {
@@ -714,6 +728,87 @@ func pyRegexSpecs(lines []string) []string {
 		}
 	}
 	return specs
+}
+
+// noRegexSpecs is the no-op fallback for languages whose import extraction is
+// tree-sitter-only (no regex extractor).
+func noRegexSpecs([]string) []string { return nil }
+
+// resolveZigSpecs resolves Zig @import("path.zig") specifiers (relative to the
+// importing file). Non-file imports like "std"/"builtin" are skipped.
+func resolveZigSpecs(specs []string, filePath string, idx *FileIndex) []string {
+	dir := filepath.Dir(filePath)
+	seen := make(map[string]bool)
+	var resolved []string
+	for _, imp := range specs {
+		if !strings.HasSuffix(imp, ".zig") {
+			continue
+		}
+		target := filepath.Clean(filepath.Join(dir, imp))
+		if idx.Exists(target) && target != filePath && !seen[target] {
+			seen[target] = true
+			resolved = append(resolved, target)
+		}
+	}
+	return resolved
+}
+
+// resolveLuaSpecs resolves Lua require("a.b.c") specifiers. Lua module names map
+// to paths with dots as separators; we try common source roots and relative.
+func resolveLuaSpecs(specs []string, filePath string, idx *FileIndex) []string {
+	dir := filepath.Dir(filePath)
+	seen := make(map[string]bool)
+	var resolved []string
+	add := func(p string) {
+		if idx.Exists(p) && p != filePath && !seen[p] {
+			seen[p] = true
+			resolved = append(resolved, p)
+		}
+	}
+	for _, imp := range specs {
+		rel := strings.ReplaceAll(imp, ".", "/") + ".lua"
+		add(filepath.Clean(filepath.Join(dir, rel)))
+		for _, root := range []string{"", "src/", "lua/", "lib/"} {
+			add(filepath.Clean(root + rel))
+		}
+	}
+	return resolved
+}
+
+// resolveJuliaSpecs resolves Julia include("file.jl") paths (relative to the
+// including file). using/import target packages, not local files, so the query
+// only captures include() and we resolve those here.
+func resolveJuliaSpecs(specs []string, filePath string, idx *FileIndex) []string {
+	dir := filepath.Dir(filePath)
+	seen := make(map[string]bool)
+	var resolved []string
+	for _, imp := range specs {
+		target := filepath.Clean(filepath.Join(dir, imp))
+		if idx.Exists(target) && target != filePath && !seen[target] {
+			seen[target] = true
+			resolved = append(resolved, target)
+		}
+	}
+	return resolved
+}
+
+// resolveShellSpecs resolves shell `source path` / `. path` includes (relative
+// to the sourcing script). Specifiers containing shell variables are skipped.
+func resolveShellSpecs(specs []string, filePath string, idx *FileIndex) []string {
+	dir := filepath.Dir(filePath)
+	seen := make(map[string]bool)
+	var resolved []string
+	for _, imp := range specs {
+		if strings.ContainsAny(imp, "$*?") {
+			continue
+		}
+		target := filepath.Clean(filepath.Join(dir, imp))
+		if idx.Exists(target) && target != filePath && !seen[target] {
+			seen[target] = true
+			resolved = append(resolved, target)
+		}
+	}
+	return resolved
 }
 
 // resolvePySpecs resolves relative Python from-import modules to local files.

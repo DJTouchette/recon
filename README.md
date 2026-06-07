@@ -10,7 +10,7 @@ Recon is the codebase-intelligence layer of the [Rivet](https://github.com/djtou
 
 - **Dependency graph** — import resolution and reverse lookups across 14 languages (`imports of` / `imported by`)
 - **Symbol search** — functions, types, classes, methods, parsed from a real grammar (tree-sitter) where available, with regex fallback elsewhere
-- **Call graph** — `callers` finds every site that references a symbol, resolved against its definitions via the import graph (tree-sitter, for Go, JS/TS, Python, C#, Java, Rust, Ruby, PHP)
+- **Call graph** — `callers` finds every site that references a symbol, resolved against its definitions via the import graph (tree-sitter, for Go, JS/TS, Python, C#, Java, Rust, Ruby, PHP, Lua, Shell, Julia, Zig)
 - **Co-change history** — files that always change together, mined from git log
 - **Hotspot detection** — high fan-in × high churn = the code that's risky to touch
 - **Enriched grep** — classifies every match as a definition, reference, test, or comment
@@ -68,7 +68,7 @@ Symbol and import analysis covers **Go, JavaScript/TypeScript, Python, Java, Kot
 
 Symbol extraction uses **tree-sitter** grammars (real parsing — no false matches from strings or comments, accurate multi-line signatures) for **Go, Python, JavaScript, TypeScript, Rust, Ruby, Java, C#, PHP, Scala, Kotlin, C, C++, Lua, Shell/Bash, Julia, and Zig**, and falls back to fast regex patterns for **Swift, Dart, and Elixir** (whose grammars aren't usable as Go modules). Each grammar's symbol query lives in `internal/index/queries/<lang>.scm`, so adding or tuning a language is just editing a query file.
 
-Import extraction for **JavaScript, TypeScript, and Python** also uses tree-sitter (queries in `internal/index/queries/imports/`), which correctly handles multi-line imports and `export … from` re-exports that a line-based regex misses; the per-language resolution of those imports to local files is unchanged. Other languages still extract imports with regex.
+Import extraction for **JavaScript, TypeScript, Python, Lua, Julia, Zig, and Shell** uses tree-sitter (queries in `internal/index/queries/imports/`), which correctly handles multi-line imports and `export … from` re-exports that a line-based regex misses; the per-language resolution of those imports to local files (e.g. Zig `@import`, Lua `require`, Julia `include`, shell `source`) is hand-written. Other languages still extract imports with regex.
 
 ## How It Works
 

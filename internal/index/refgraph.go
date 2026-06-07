@@ -75,9 +75,11 @@ func NewReferenceIndex(root string, idx *FileIndex) *ReferenceIndex {
 
 	sources := idx.ByClass(scan.ClassSource)
 	tests := idx.ByClass(scan.ClassTest)
-	allFiles := make([]*scan.FileEntry, 0, len(sources)+len(tests))
+	scripts := idx.ByClass(scan.ClassScript)
+	allFiles := make([]*scan.FileEntry, 0, len(sources)+len(tests)+len(scripts))
 	allFiles = append(allFiles, sources...)
 	allFiles = append(allFiles, tests...)
+	allFiles = append(allFiles, scripts...)
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup

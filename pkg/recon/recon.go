@@ -657,10 +657,10 @@ func (r *Recon) Refresh() error {
 		storedMtime, exists := storedMtimes[f.RelPath]
 		if !exists || f.ModTime != storedMtime {
 			upsert = append(upsert, *f)
-			if f.Class == scan.ClassSource {
+			if f.Class == scan.ClassSource || f.Class == scan.ClassScript {
 				changedSourceFiles = append(changedSourceFiles, f)
 			}
-			if f.Class == scan.ClassSource || f.Class == scan.ClassTest {
+			if f.Class == scan.ClassSource || f.Class == scan.ClassTest || f.Class == scan.ClassScript {
 				changedRefFiles = append(changedRefFiles, f)
 			}
 		}
