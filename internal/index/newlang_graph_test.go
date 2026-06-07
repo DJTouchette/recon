@@ -43,6 +43,38 @@ func TestNewLangReferences(t *testing.T) {
 	}
 }
 
+// Call-site extraction for the remaining tree-sitter languages that previously
+// had symbols but no call graph.
+func TestMoreLangReferences(t *testing.T) {
+	cases := []struct {
+		lang string
+		src  string
+		want []string
+	}{
+		{"c", "int main(){ foo(); bar(1); return 0; }\n", []string{"bar", "foo"}},
+		{"cpp", "void f(){ foo(); obj.method(); ns::func(); }\n", []string{"foo", "func", "method"}},
+		{"scala", "object M { def f() = { foo(); obj.bar() } }\n", []string{"bar", "foo"}},
+		{"kotlin", "fun f() { foo(); obj.bar(); a.b.chain() }\n", []string{"bar", "chain", "foo"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.lang, func(t *testing.T) {
+			refs, ok := extractReferencesTS([]byte(tc.src), "f", tc.lang)
+			if !ok {
+				t.Fatalf("%s: references not handled", tc.lang)
+			}
+			got := map[string]bool{}
+			for _, r := range refs {
+				got[r.Name] = true
+			}
+			for _, w := range tc.want {
+				if !got[w] {
+					t.Errorf("%s: missing call %q", tc.lang, w)
+				}
+			}
+		})
+	}
+}
+
 // Import extraction + resolution for the newer tree-sitter languages.
 func TestNewLangImports(t *testing.T) {
 	mk := func(paths ...string) *FileIndex {
