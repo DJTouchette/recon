@@ -16,7 +16,7 @@ import (
 const (
 	cacheDir   = ".recon"
 	dbFile     = "recon.db"
-	schemaVer  = 4
+	schemaVer  = 5
 )
 
 // Snapshot holds all indexed data for save/load.
@@ -30,6 +30,7 @@ type Snapshot struct {
 	Churn         map[string]int
 	Symbols       []index.Symbol
 	References    []index.Reference
+	ContextDocs   []index.ContextDoc
 	FileExtras    []index.FileExtra
 	Metrics       []index.FileMetrics
 	NearbyConfigs []index.NearbyConfig
@@ -101,7 +102,7 @@ func (s *Store) ensureSchema() error {
 	}
 
 	// Drop and recreate all tables
-	for _, table := range []string{"meta", "files", "imports", "tests", "cochange", "churn", "symbols", "references_", "file_extras", "file_metrics", "nearby_configs", "codeowners"} {
+	for _, table := range []string{"meta", "files", "imports", "tests", "cochange", "churn", "symbols", "references_", "file_extras", "file_metrics", "nearby_configs", "codeowners", "context_docs"} {
 		s.db.Exec("DROP TABLE IF EXISTS " + table)
 	}
 
@@ -188,6 +189,17 @@ CREATE TABLE codeowners (
 	pattern TEXT NOT NULL,
 	owners TEXT NOT NULL
 );
+CREATE TABLE context_docs (
+	file_path TEXT NOT NULL,
+	symbol TEXT NOT NULL DEFAULT '',
+	line INTEGER NOT NULL DEFAULT 0,
+	source TEXT NOT NULL,
+	origin_path TEXT NOT NULL,
+	body TEXT NOT NULL
+);
+CREATE INDEX idx_ctxdocs_file ON context_docs(file_path);
+CREATE INDEX idx_ctxdocs_symbol ON context_docs(symbol);
+CREATE INDEX idx_ctxdocs_origin ON context_docs(origin_path);
 CREATE INDEX idx_symbols_file ON symbols(file_path);
 CREATE INDEX idx_symbols_name ON symbols(name);
 CREATE INDEX idx_symbols_kind ON symbols(kind);
@@ -232,7 +244,7 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 	defer tx.Rollback()
 
 	// Clear data tables (not meta)
-	for _, table := range []string{"files", "imports", "tests", "cochange", "churn", "symbols", "references_", "file_extras", "file_metrics", "nearby_configs", "codeowners"} {
+	for _, table := range []string{"files", "imports", "tests", "cochange", "churn", "symbols", "references_", "file_extras", "file_metrics", "nearby_configs", "codeowners", "context_docs"} {
 		if _, err := tx.Exec("DELETE FROM " + table); err != nil {
 			return fmt.Errorf("clear %s: %w", table, err)
 		}
@@ -341,6 +353,20 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 		for i := range snap.References {
 			r := &snap.References[i]
 			refStmt.Exec(r.Name, r.File, r.Line)
+		}
+	}
+
+	// --- Context Docs ---
+	if len(snap.ContextDocs) > 0 {
+		cdStmt, err := tx.Prepare("INSERT INTO context_docs (file_path, symbol, line, source, origin_path, body) VALUES (?, ?, ?, ?, ?, ?)")
+		if err != nil {
+			return fmt.Errorf("prepare context_docs: %w", err)
+		}
+		defer cdStmt.Close()
+
+		for i := range snap.ContextDocs {
+			d := &snap.ContextDocs[i]
+			cdStmt.Exec(d.File, d.Symbol, d.Line, d.Source, d.Origin, d.Body)
 		}
 	}
 
@@ -546,6 +572,24 @@ func (s *Store) LoadSnapshot() (*Snapshot, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("reference rows: %w", err)
+	}
+
+	// --- Context Docs ---
+	rows, err = s.db.Query("SELECT file_path, symbol, line, source, origin_path, body FROM context_docs")
+	if err != nil {
+		return nil, fmt.Errorf("query context_docs: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var d index.ContextDoc
+		if err := rows.Scan(&d.File, &d.Symbol, &d.Line, &d.Source, &d.Origin, &d.Body); err != nil {
+			return nil, fmt.Errorf("scan context_doc row: %w", err)
+		}
+		snap.ContextDocs = append(snap.ContextDocs, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("context_doc rows: %w", err)
 	}
 
 	// --- File Extras ---
@@ -866,6 +910,50 @@ func (s *Store) UpdateReferences(refs []index.Reference, removedFiles []string) 
 		for i := range refs {
 			r := &refs[i]
 			insStmt.Exec(r.Name, r.File, r.Line)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// UpdateContextDocs deletes old context docs whose origin is one of the
+// changed/removed files and inserts the freshly extracted ones. Docs are keyed
+// by origin_path (the file the doc text lives in — a source file for comment
+// docs, a .context/*.md file for sidecars) so editing either kind of file
+// replaces exactly its own docs.
+func (s *Store) UpdateContextDocs(docs []index.ContextDoc, changedOrigins []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	delStmt, err := tx.Prepare("DELETE FROM context_docs WHERE origin_path=?")
+	if err != nil {
+		return err
+	}
+	defer delStmt.Close()
+
+	origins := make(map[string]bool)
+	for i := range docs {
+		origins[docs[i].Origin] = true
+	}
+	for _, o := range changedOrigins {
+		origins[o] = true
+	}
+	for o := range origins {
+		delStmt.Exec(o)
+	}
+
+	if len(docs) > 0 {
+		insStmt, err := tx.Prepare("INSERT INTO context_docs (file_path, symbol, line, source, origin_path, body) VALUES (?, ?, ?, ?, ?, ?)")
+		if err != nil {
+			return err
+		}
+		defer insStmt.Close()
+		for i := range docs {
+			d := &docs[i]
+			insStmt.Exec(d.File, d.Symbol, d.Line, d.Source, d.Origin, d.Body)
 		}
 	}
 

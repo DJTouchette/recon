@@ -95,6 +95,18 @@ type FileContext struct {
 	Churn         int               `json:"churn"`
 	HotspotScore  float64           `json:"hotspot_score"`
 	NearbyConfigs map[string]string `json:"nearby_configs,omitempty"` // type → path
+	Docs          []ContextDocInfo  `json:"docs,omitempty"`           // context docs attached to this file
+}
+
+// ContextDocInfo is a context doc extracted from a rivet:context code comment
+// or a .context/ sidecar markdown file, attached to a file or symbol.
+type ContextDocInfo struct {
+	File   string `json:"file"`
+	Symbol string `json:"symbol,omitempty"` // "" = file-level
+	Line   int    `json:"line,omitempty"`   // marker line for comment docs
+	Source string `json:"source"`           // "comment" or "sidecar"
+	Origin string `json:"origin"`           // where the doc text lives
+	Body   string `json:"body"`
 }
 
 type HotspotInfo struct {

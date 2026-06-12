@@ -49,6 +49,7 @@ All commands emit JSON by default (built to be consumed by tools). Add `--human`
 | `recon hotspots` | Top files ranked by risk (fan-in × churn) |
 | `recon tests <path>` | Find test files for a source file |
 | `recon changes` | Recent git change summary (`--since 2w`) |
+| `recon docs [query]` | Context docs from `rivet:context` comments and `.context/` sidecar markdown. `file:<path>` or `symbol:<Name>` to filter |
 | `recon refresh` | Incremental cache update |
 | `recon rebuild` | Full rescan from scratch |
 | `recon version` | Version info |
@@ -61,6 +62,35 @@ All commands emit JSON by default (built to be consumed by tools). Add `--human`
 | `--cache-dir <path>` | Cache directory (default: `<root>/.recon/`) |
 | `--human` | Human-readable output instead of JSON |
 | `-n, --max <n>` | Limit number of results |
+
+## Context Docs in Code
+
+Recon can index context notes that live in the code itself, in two forms:
+
+**Marked comments** — any comment whose first line starts with `rivet:context` becomes a context doc. A comment directly above a declaration attaches to that symbol automatically; `rivet:context(SymbolName)` attaches explicitly from anywhere in the file; otherwise the doc attaches to the file. Works with line and block comments across 25+ languages.
+
+```go
+// rivet:context
+// Never call this inside a transaction — the retry
+// scheduler owns rollback.
+func ProcessPayment(o Order) error {
+```
+
+```python
+# rivet:context: Cron must never run on Tuesdays (billing close).
+def run_billing():
+```
+
+**Sidecar markdown** — a `.context/` folder next to your code holds one markdown file per source file, matched by name: `.context/handler.md` attaches to `handler.go` (or any `handler.*` code file); `.context/handler.go.md` attaches to exactly `handler.go`.
+
+```
+src/orders/
+  handler.go
+  .context/
+    handler.md      ← context doc for handler.go
+```
+
+Query with `recon docs`, `recon docs file:src/orders/handler.go`, or `recon docs symbol:ProcessPayment`. Docs also appear in `recon context <path>` output. [Rivet](https://github.com/djtouchette/rivet) folds them into its context recommendation engine automatically.
 
 ## Language Support
 

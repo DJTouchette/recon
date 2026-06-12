@@ -53,6 +53,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(refreshCmd())
 	root.AddCommand(rebuildCmd())
 	root.AddCommand(grepCmd())
+	root.AddCommand(docsCmd())
 	root.AddCommand(&cobra.Command{
 		Use:   "version",
 		Short: "Version info",
@@ -630,6 +631,65 @@ func printGrepHuman(cmd *cobra.Command, result *recon.GrepResult) {
 				suffix = fmt.Sprintf("  ... +%d similar", m.Similar)
 			}
 			fmt.Fprintf(w, "    %4d  %-10s  %s%s\n", m.Line, m.MatchType, text, suffix)
+		}
+	}
+}
+
+func docsCmd() *cobra.Command {
+	var maxResults int
+	cmd := &cobra.Command{
+		Use:   "docs [query]",
+		Short: "Context docs from rivet:context code comments and .context/ sidecar markdown. Use 'file:path' or 'symbol:Name' to filter.",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			r, err := newRecon()
+			if err != nil {
+				return err
+			}
+			defer r.Close()
+
+			query := ""
+			if len(args) > 0 {
+				query = args[0]
+			}
+
+			docs, err := r.Docs(query, maxResults)
+			if err != nil {
+				return err
+			}
+
+			if flagHuman {
+				printDocsHuman(cmd, docs)
+				return nil
+			}
+			return outputJSON(cmd, docs)
+		},
+	}
+	cmd.Flags().IntVarP(&maxResults, "max", "n", 50, "max results (-1 = unlimited)")
+	return cmd
+}
+
+func printDocsHuman(cmd *cobra.Command, docs []recon.ContextDocInfo) {
+	w := cmd.OutOrStdout()
+	if len(docs) == 0 {
+		fmt.Fprintln(w, "No context docs found.")
+		return
+	}
+	fmt.Fprintf(w, "Context docs (%d):\n", len(docs))
+	for _, d := range docs {
+		target := d.File
+		if d.Symbol != "" {
+			target = fmt.Sprintf("%s · %s", d.File, d.Symbol)
+		}
+		loc := d.Source
+		if d.Source == "comment" {
+			loc = fmt.Sprintf("comment @ %s:%d", d.Origin, d.Line)
+		} else if d.Origin != "" {
+			loc = fmt.Sprintf("sidecar %s", d.Origin)
+		}
+		fmt.Fprintf(w, "\n  %s  [%s]\n", target, loc)
+		for _, line := range strings.Split(d.Body, "\n") {
+			fmt.Fprintf(w, "    %s\n", line)
 		}
 	}
 }

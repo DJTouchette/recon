@@ -24,6 +24,7 @@ type Recon struct {
 	tests      *index.TestMap
 	symbols    *index.SymbolIndex
 	references *index.ReferenceIndex
+	contextDocs *index.ContextDocIndex
 	extras     map[string]*index.FileExtra
 	metrics   *index.MetricsIndex
 	nearby    *index.NearbyIndex
@@ -206,7 +207,62 @@ func (r *Recon) Context(path string) (*FileContext, error) {
 		}
 	}
 
+	ctx.Docs = toContextDocInfos(r.contextDocs.ForFile(path))
+
 	return ctx, nil
+}
+
+// Docs returns context docs extracted from rivet:context code comments and
+// .context/ sidecar markdown files. Query forms: "" returns all docs,
+// "file:<path>" returns docs attached to a file, "symbol:<name>" returns docs
+// attached to that exact symbol, and a bare query matches symbol names and
+// file paths case-insensitively. maxResults caps output (0 = default 50,
+// -1 = unlimited).
+func (r *Recon) Docs(query string, maxResults int) ([]ContextDocInfo, error) {
+	if maxResults == 0 {
+		maxResults = 50
+	}
+
+	var docs []index.ContextDoc
+	switch {
+	case query == "":
+		docs = r.contextDocs.All()
+	case strings.HasPrefix(query, "file:"):
+		docs = r.contextDocs.ForFile(filepath.Clean(strings.TrimPrefix(query, "file:")))
+	case strings.HasPrefix(query, "symbol:"):
+		docs = r.contextDocs.ForSymbol(strings.TrimPrefix(query, "symbol:"))
+	default:
+		q := strings.ToLower(query)
+		for _, d := range r.contextDocs.All() {
+			if strings.Contains(strings.ToLower(d.Symbol), q) ||
+				strings.Contains(strings.ToLower(d.File), q) {
+				docs = append(docs, d)
+			}
+		}
+	}
+
+	if maxResults > 0 && len(docs) > maxResults {
+		docs = docs[:maxResults]
+	}
+	return toContextDocInfos(docs), nil
+}
+
+func toContextDocInfos(docs []index.ContextDoc) []ContextDocInfo {
+	if len(docs) == 0 {
+		return nil
+	}
+	out := make([]ContextDocInfo, len(docs))
+	for i, d := range docs {
+		out[i] = ContextDocInfo{
+			File:   d.File,
+			Symbol: d.Symbol,
+			Line:   d.Line,
+			Source: d.Source,
+			Origin: d.Origin,
+			Body:   d.Body,
+		}
+	}
+	return out
 }
 
 // Hotspots returns the top N files ranked by hotspot score (fan-in * churn).
@@ -599,6 +655,7 @@ func (r *Recon) Rebuild() error {
 	r.deps = index.NewDepGraph(r.root, r.idx)
 	r.symbols = index.NewSymbolIndex(r.root, r.idx)
 	r.references = index.NewReferenceIndex(r.root, r.idx)
+	r.contextDocs = index.NewContextDocIndex(r.root, r.idx, r.symbols)
 	r.buildExtrasMap(index.ExtractFileExtras(r.root, r.idx))
 	r.nearby = index.NewNearbyIndex(index.FindNearbyConfigs(r.root, r.idx))
 	r.ownership = index.ParseCodeowners(r.root)
@@ -708,8 +765,9 @@ func (r *Recon) Refresh() error {
 	r.store.SaveTests(r.tests.AllMappings(), r.tests.TestToSourceMap(), testKinds)
 
 	// Re-extract symbols and extras for changed/added source files
+	var newSymbols []index.Symbol
 	if len(changedSourceFiles) > 0 {
-		newSymbols := index.ScanFileSymbols(r.root, changedSourceFiles)
+		newSymbols = index.ScanFileSymbols(r.root, changedSourceFiles)
 		r.store.UpdateSymbols(newSymbols, changedPaths)
 		newExtras := index.ExtractFileExtrasForPaths(r.root, changedSourceFiles)
 		r.store.UpdateFileExtras(newExtras, changedPaths)
@@ -729,6 +787,22 @@ func (r *Recon) Refresh() error {
 		r.store.UpdateReferences(newRefs, refChangedPaths)
 	} else if len(remove) > 0 {
 		r.store.UpdateReferences(nil, remove)
+	}
+
+	// Re-extract context docs for any changed file: comment docs from code
+	// files, sidecar docs from .context/*.md. ScanFileContextDocs filters out
+	// non-candidates itself; positional symbol attachment only needs symbols
+	// from the changed files, which is exactly what newSymbols holds.
+	if len(upsert) > 0 || len(remove) > 0 {
+		ctxFiles := make([]*scan.FileEntry, len(upsert))
+		ctxOrigins := make([]string, 0, len(upsert)+len(remove))
+		for i := range upsert {
+			ctxFiles[i] = &upsert[i]
+			ctxOrigins = append(ctxOrigins, upsert[i].RelPath)
+		}
+		ctxOrigins = append(ctxOrigins, remove...)
+		newDocs := index.ScanFileContextDocs(r.root, ctxFiles, index.NewSymbolIndexFromData(newSymbols), r.idx)
+		r.store.UpdateContextDocs(newDocs, ctxOrigins)
 	}
 
 	// Re-parse git if HEAD changed
@@ -751,6 +825,7 @@ func (r *Recon) Refresh() error {
 	r.deps = index.NewDepGraphFromData(snap.Imports)
 	r.symbols = index.NewSymbolIndexFromData(snap.Symbols)
 	r.references = index.NewReferenceIndexFromData(snap.References)
+	r.contextDocs = index.NewContextDocIndexFromData(snap.ContextDocs)
 	r.buildExtrasMap(snap.FileExtras)
 	r.metrics = index.NewMetricsIndex(snap.Metrics)
 	r.nearby = index.NewNearbyIndex(snap.NearbyConfigs)
@@ -780,6 +855,7 @@ func (r *Recon) loadFromCache() error {
 	r.cochange = gitpkg.NewCoChangeFromData(snap.CoChangePairs, snap.Churn)
 	r.symbols = index.NewSymbolIndexFromData(snap.Symbols)
 	r.references = index.NewReferenceIndexFromData(snap.References)
+	r.contextDocs = index.NewContextDocIndexFromData(snap.ContextDocs)
 	r.buildExtrasMap(snap.FileExtras)
 	r.metrics = index.NewMetricsIndex(snap.Metrics)
 	r.nearby = index.NewNearbyIndex(snap.NearbyConfigs)
@@ -800,6 +876,7 @@ func (r *Recon) rebuildNoPersist() error {
 	r.deps = index.NewDepGraph(r.root, r.idx)
 	r.symbols = index.NewSymbolIndex(r.root, r.idx)
 	r.references = index.NewReferenceIndex(r.root, r.idx)
+	r.contextDocs = index.NewContextDocIndex(r.root, r.idx, r.symbols)
 	r.buildExtrasMap(index.ExtractFileExtras(r.root, r.idx))
 	r.nearby = index.NewNearbyIndex(index.FindNearbyConfigs(r.root, r.idx))
 	r.ownership = index.ParseCodeowners(r.root)
@@ -826,6 +903,7 @@ func (r *Recon) toSnapshot(files []scan.FileEntry) *cache.Snapshot {
 		Churn:         nil,
 		Symbols:       r.symbols.All(),
 		References:    r.references.All(),
+		ContextDocs:   r.contextDocs.All(),
 		Metrics:       r.metrics.All(),
 		NearbyConfigs: r.nearby.All(),
 		OwnerRules:    r.ownership.Rules(),
