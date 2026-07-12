@@ -470,6 +470,9 @@ type GrepOptions struct {
 }
 
 // Grep searches file content for a pattern and returns results grouped by file.
+// The pattern is a Go regular expression (case-insensitive by default; prefix
+// with (?-i) for case-sensitive matching); patterns without regex
+// metacharacters use a faster literal scan.
 // Each match is classified as definition, reference, comment, or test.
 // Duplicate text within a file is collapsed with a Similar count.
 func (r *Recon) Grep(pattern string, opts GrepOptions) (*GrepResult, error) {
@@ -480,7 +483,10 @@ func (r *Recon) Grep(pattern string, opts GrepOptions) (*GrepResult, error) {
 		opts.MaxFiles = 20
 	}
 
-	raw := index.Grep(pattern, r.root, r.idx, r.symbols, r.metrics)
+	raw, err := index.Grep(pattern, r.root, r.idx, r.symbols, r.metrics)
+	if err != nil {
+		return nil, err
+	}
 
 	// Filter by type if requested.
 	if opts.TypeFilter != "" {

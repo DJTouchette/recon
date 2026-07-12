@@ -2,8 +2,10 @@ package index
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -26,11 +28,44 @@ type GrepMatch struct {
 // maxFileSize is the largest file we'll grep (1MB). Skip likely binaries/generated.
 const maxFileSize = 1 << 20
 
+// matcher matches lines against either a literal pattern (fast byte scan) or
+// a compiled regular expression. Matching is case-insensitive in both modes;
+// prefix the pattern with (?-i) to opt into case-sensitive regex matching.
+type matcher struct {
+	literal []byte         // lowered pattern when it has no regex metacharacters
+	re      *regexp.Regexp // compiled pattern otherwise
+}
+
+func newMatcher(pattern string) (*matcher, error) {
+	// Literal fast path: a pattern with no regex metacharacters is matched
+	// with byte-level substring scanning, which is equivalent and faster.
+	if regexp.QuoteMeta(pattern) == pattern {
+		return &matcher{literal: bytes.ToLower([]byte(pattern))}, nil
+	}
+	re, err := regexp.Compile("(?i)" + pattern)
+	if err != nil {
+		return nil, fmt.Errorf("invalid regex %q: %w", pattern, err)
+	}
+	return &matcher{re: re}, nil
+}
+
+func (m *matcher) matchLine(line []byte) bool {
+	if m.re != nil {
+		return m.re.Match(line)
+	}
+	return bytesContainsLower(line, m.literal)
+}
+
 // Grep searches all source/test/config files for a pattern and enriches
-// matches with symbol classification and file metrics.
+// matches with symbol classification and file metrics. The pattern is a Go
+// regular expression; patterns without metacharacters use a faster literal
+// scan. Returns an error if the pattern is not a valid regex.
 // Uses parallel file processing and bytes-level matching for speed.
-func Grep(pattern string, root string, idx *FileIndex, symbols *SymbolIndex, metrics *MetricsIndex) []GrepMatch {
-	patternLower := bytes.ToLower([]byte(pattern))
+func Grep(pattern string, root string, idx *FileIndex, symbols *SymbolIndex, metrics *MetricsIndex) ([]GrepMatch, error) {
+	m, err := newMatcher(pattern)
+	if err != nil {
+		return nil, err
+	}
 
 	// Build definition location set: "path:line" → kind.
 	defs := buildDefSet(symbols)
@@ -75,7 +110,7 @@ func Grep(pattern string, root string, idx *FileIndex, symbols *SymbolIndex, met
 				fileMatches := grepFileBytes(
 					filepath.Join(root, f.RelPath),
 					f.RelPath,
-					patternLower,
+					m,
 					f.Class,
 					defs,
 				)
@@ -119,12 +154,12 @@ func Grep(pattern string, root string, idx *FileIndex, symbols *SymbolIndex, met
 		return allMatches[i].Line < allMatches[j].Line
 	})
 
-	return allMatches
+	return allMatches, nil
 }
 
-// grepFileBytes reads the entire file into memory and scans with bytes.Contains
-// for zero-allocation matching. Skips files larger than maxFileSize.
-func grepFileBytes(fullPath, relPath string, patternLower []byte, class scan.FileClass, defs map[string]string) []GrepMatch {
+// grepFileBytes reads the entire file into memory and scans it line by line
+// with the matcher. Skips files larger than maxFileSize.
+func grepFileBytes(fullPath, relPath string, m *matcher, class scan.FileClass, defs map[string]string) []GrepMatch {
 	// Stat first to skip large/binary files without reading.
 	info, err := os.Stat(fullPath)
 	if err != nil || info.Size() > maxFileSize || info.Size() == 0 {
@@ -136,8 +171,10 @@ func grepFileBytes(fullPath, relPath string, patternLower []byte, class scan.Fil
 		return nil
 	}
 
-	// Quick check: if the whole file doesn't contain the pattern, skip line scanning.
-	if !bytes.Contains(bytes.ToLower(data), patternLower) {
+	// Quick check for literal patterns: if the whole file doesn't contain the
+	// pattern, skip line scanning. Regex patterns go straight to the line scan
+	// because anchors (^, $, \z) are relative to each line, not the file.
+	if m.re == nil && !bytesContainsLower(data, m.literal) {
 		return nil
 	}
 
@@ -169,8 +206,7 @@ func grepFileBytes(fullPath, relPath string, patternLower []byte, class scan.Fil
 			offset += end + 1
 		}
 
-		// Case-insensitive match on raw bytes — no allocation.
-		if !bytesContainsLower(line, patternLower) {
+		if !m.matchLine(line) {
 			continue
 		}
 

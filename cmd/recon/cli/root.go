@@ -575,8 +575,19 @@ func grepCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "grep <pattern>",
-		Short: "Enriched grep — matches grouped by file with definitions, metrics, and classification",
-		Args:  cobra.ExactArgs(1),
+		Short: "Enriched grep — regex matches grouped by file with definitions, metrics, and classification",
+		Long: `Enriched grep — matches grouped by file with definitions, metrics, and classification.
+
+The pattern is a regular expression (Go RE2 syntax), matched case-insensitively;
+prefix with (?-i) for case-sensitive matching. Patterns without regex
+metacharacters are matched as fast literal substrings.
+
+Examples:
+  recon grep 'ProcessPayment'        # literal substring
+  recon grep 'func \w+Payment'       # functions ending in Payment
+  recon grep '\bGet\b'               # Get as a whole word only
+  recon grep 'TODO|FIXME|HACK'       # alternation`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			r, err := newRecon()
 			if err != nil {

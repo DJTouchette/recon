@@ -13,7 +13,7 @@ Recon is the codebase-intelligence layer of the [Rivet](https://github.com/djtou
 - **Call graph** — `callers` finds every site that references a symbol, resolved against its definitions via the import graph (tree-sitter, for Go, JS/TS, Python, C#, Java, Rust, Ruby, PHP, Lua, Shell, Julia, Zig)
 - **Co-change history** — files that always change together, mined from git log
 - **Hotspot detection** — high fan-in × high churn = the code that's risky to touch
-- **Enriched grep** — classifies every match as a definition, reference, test, or comment
+- **Enriched grep** — full regex matching (RE2), with every match classified as a definition, reference, test, or comment
 - **File context** — preview, fan-in/fan-out, churn, ownership (CODEOWNERS), nearby configs
 - **Test mapping** — which tests cover which source files
 - **Project overview** — languages, frameworks, entrypoints, structure
@@ -41,7 +41,7 @@ All commands emit JSON by default (built to be consumed by tools). Add `--human`
 |---------|-------------|
 | `recon overview` | Project structure, languages, frameworks, entrypoints |
 | `recon search <query>` | Unified search across symbols, paths, and content. Start here. |
-| `recon grep <pattern>` | Enriched grep with definition/reference/test/comment classification (`--type`) |
+| `recon grep <pattern>` | Enriched regex grep with definition/reference/test/comment classification (`--type`) |
 | `recon related <path>` | Files related to a path (imports, co-change, naming, test pairs) |
 | `recon symbols [query]` | Search or list functions, types, classes. `file:<path>` lists a file's symbols |
 | `recon callers <name>` | Where a symbol is defined and every call site that references it |
