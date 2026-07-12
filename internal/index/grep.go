@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/djtouchette/recon/internal/scan"
 )
@@ -28,30 +29,74 @@ type GrepMatch struct {
 // maxFileSize is the largest file we'll grep (1MB). Skip likely binaries/generated.
 const maxFileSize = 1 << 20
 
+// CaseMode controls how grep handles letter case.
+type CaseMode int
+
+const (
+	// CaseSmart matches case-sensitively iff the pattern contains an
+	// uppercase letter (like ripgrep's --smart-case). The default.
+	CaseSmart CaseMode = iota
+	// CaseInsensitive always ignores case.
+	CaseInsensitive
+	// CaseSensitive always respects case.
+	CaseSensitive
+)
+
 // matcher matches lines against either a literal pattern (fast byte scan) or
-// a compiled regular expression. Matching is case-insensitive in both modes;
-// prefix the pattern with (?-i) to opt into case-sensitive regex matching.
+// a compiled regular expression.
 type matcher struct {
-	literal []byte         // lowered pattern when it has no regex metacharacters
-	re      *regexp.Regexp // compiled pattern otherwise
+	literal       []byte         // pattern when it has no regex metacharacters
+	caseSensitive bool           // whether literal matching respects case
+	re            *regexp.Regexp // compiled pattern otherwise
 }
 
-func newMatcher(pattern string) (*matcher, error) {
+func newMatcher(pattern string, mode CaseMode) (*matcher, error) {
+	sensitive := mode == CaseSensitive || (mode == CaseSmart && hasUpper(pattern))
+
 	// Literal fast path: a pattern with no regex metacharacters is matched
 	// with byte-level substring scanning, which is equivalent and faster.
 	if regexp.QuoteMeta(pattern) == pattern {
-		return &matcher{literal: bytes.ToLower([]byte(pattern))}, nil
+		lit := []byte(pattern)
+		if !sensitive {
+			lit = bytes.ToLower(lit)
+		}
+		return &matcher{literal: lit, caseSensitive: sensitive}, nil
 	}
-	re, err := regexp.Compile("(?i)" + pattern)
+	expr := pattern
+	if !sensitive {
+		expr = "(?i)" + pattern
+	}
+	re, err := regexp.Compile(expr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid regex %q: %w", pattern, err)
 	}
 	return &matcher{re: re}, nil
 }
 
+// hasUpper reports whether pattern contains an uppercase letter, skipping
+// backslash-escaped characters so classes like \W or \S don't force
+// case-sensitive matching under CaseSmart.
+func hasUpper(pattern string) bool {
+	escaped := false
+	for _, r := range pattern {
+		switch {
+		case escaped:
+			escaped = false
+		case r == '\\':
+			escaped = true
+		case unicode.IsUpper(r):
+			return true
+		}
+	}
+	return false
+}
+
 func (m *matcher) matchLine(line []byte) bool {
 	if m.re != nil {
 		return m.re.Match(line)
+	}
+	if m.caseSensitive {
+		return bytes.Contains(line, m.literal)
 	}
 	return bytesContainsLower(line, m.literal)
 }
@@ -61,8 +106,8 @@ func (m *matcher) matchLine(line []byte) bool {
 // regular expression; patterns without metacharacters use a faster literal
 // scan. Returns an error if the pattern is not a valid regex.
 // Uses parallel file processing and bytes-level matching for speed.
-func Grep(pattern string, root string, idx *FileIndex, symbols *SymbolIndex, metrics *MetricsIndex) ([]GrepMatch, error) {
-	m, err := newMatcher(pattern)
+func Grep(pattern string, root string, idx *FileIndex, symbols *SymbolIndex, metrics *MetricsIndex, mode CaseMode) ([]GrepMatch, error) {
+	m, err := newMatcher(pattern, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +219,7 @@ func grepFileBytes(fullPath, relPath string, m *matcher, class scan.FileClass, d
 	// Quick check for literal patterns: if the whole file doesn't contain the
 	// pattern, skip line scanning. Regex patterns go straight to the line scan
 	// because anchors (^, $, \z) are relative to each line, not the file.
-	if m.re == nil && !bytesContainsLower(data, m.literal) {
+	if m.re == nil && !m.matchLine(data) {
 		return nil
 	}
 

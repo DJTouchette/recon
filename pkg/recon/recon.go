@@ -463,16 +463,31 @@ func (r *Recon) Tests(path string, maxResults int) ([]TestFile, error) {
 	return out, nil
 }
 
+// CaseMode controls how grep handles letter case. See the Case* constants.
+type CaseMode = index.CaseMode
+
+const (
+	// CaseSmart matches case-sensitively iff the pattern contains an
+	// uppercase letter (like ripgrep's --smart-case). The default.
+	CaseSmart = index.CaseSmart
+	// CaseInsensitive always ignores case.
+	CaseInsensitive = index.CaseInsensitive
+	// CaseSensitive always respects case.
+	CaseSensitive = index.CaseSensitive
+)
+
 // GrepOptions configures grep behavior.
 type GrepOptions struct {
 	MaxFiles  int    // max files to return (default 20)
 	TypeFilter string // filter by match type: "definition", "reference", "test", "comment", or ""
+	CaseMode  CaseMode // case handling (default CaseSmart)
 }
 
 // Grep searches file content for a pattern and returns results grouped by file.
-// The pattern is a Go regular expression (case-insensitive by default; prefix
-// with (?-i) for case-sensitive matching); patterns without regex
-// metacharacters use a faster literal scan.
+// The pattern is a Go regular expression; patterns without regex
+// metacharacters use a faster literal scan. Matching is smart-case by default
+// (case-sensitive iff the pattern has an uppercase letter); override with
+// GrepOptions.CaseMode.
 // Each match is classified as definition, reference, comment, or test.
 // Duplicate text within a file is collapsed with a Similar count.
 func (r *Recon) Grep(pattern string, opts GrepOptions) (*GrepResult, error) {
@@ -483,7 +498,7 @@ func (r *Recon) Grep(pattern string, opts GrepOptions) (*GrepResult, error) {
 		opts.MaxFiles = 20
 	}
 
-	raw, err := index.Grep(pattern, r.root, r.idx, r.symbols, r.metrics)
+	raw, err := index.Grep(pattern, r.root, r.idx, r.symbols, r.metrics, opts.CaseMode)
 	if err != nil {
 		return nil, err
 	}

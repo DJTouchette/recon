@@ -570,17 +570,22 @@ func printTestsHuman(cmd *cobra.Command, tests []recon.TestFile) {
 
 func grepCmd() *cobra.Command {
 	var (
-		maxFiles   int
-		typeFilter string
+		maxFiles      int
+		typeFilter    string
+		ignoreCase    bool
+		caseSensitive bool
 	)
 	cmd := &cobra.Command{
 		Use:   "grep <pattern>",
 		Short: "Enriched grep — regex matches grouped by file with definitions, metrics, and classification",
 		Long: `Enriched grep — matches grouped by file with definitions, metrics, and classification.
 
-The pattern is a regular expression (Go RE2 syntax), matched case-insensitively;
-prefix with (?-i) for case-sensitive matching. Patterns without regex
+The pattern is a regular expression (Go RE2 syntax). Patterns without regex
 metacharacters are matched as fast literal substrings.
+
+Matching is smart-case: case-sensitive if the pattern contains an uppercase
+letter, case-insensitive otherwise. Override with -i (always insensitive) or
+-s (always sensitive).
 
 Examples:
   recon grep 'ProcessPayment'        # literal substring
@@ -589,6 +594,17 @@ Examples:
   recon grep 'TODO|FIXME|HACK'       # alternation`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if ignoreCase && caseSensitive {
+				return fmt.Errorf("--ignore-case and --case-sensitive are mutually exclusive")
+			}
+			caseMode := recon.CaseSmart
+			if ignoreCase {
+				caseMode = recon.CaseInsensitive
+			}
+			if caseSensitive {
+				caseMode = recon.CaseSensitive
+			}
+
 			r, err := newRecon()
 			if err != nil {
 				return err
@@ -598,6 +614,7 @@ Examples:
 			result, err := r.Grep(args[0], recon.GrepOptions{
 				MaxFiles:   maxFiles,
 				TypeFilter: typeFilter,
+				CaseMode:   caseMode,
 			})
 			if err != nil {
 				return err
@@ -612,6 +629,8 @@ Examples:
 	}
 	cmd.Flags().IntVarP(&maxFiles, "max", "n", 20, "max files to show")
 	cmd.Flags().StringVarP(&typeFilter, "type", "t", "", "filter by match type: definition, reference, test, comment")
+	cmd.Flags().BoolVarP(&ignoreCase, "ignore-case", "i", false, "case-insensitive matching")
+	cmd.Flags().BoolVarP(&caseSensitive, "case-sensitive", "s", false, "case-sensitive matching")
 	return cmd
 }
 
