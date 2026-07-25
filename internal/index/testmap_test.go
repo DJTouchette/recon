@@ -85,6 +85,138 @@ func TestTestsForDirectoryRootIsNotEmpty(t *testing.T) {
 	}
 }
 
+// --- The .NET solution layout ---
+
+// The reported defect: a 656-file C# project where the only test files for
+// AprysePdfGenerationService.cs are three AprysePdf*Tests.cs in a sibling test
+// project, and recon answered "No test files found."
+//
+// Two rules have to hold at once. The test project pairs with the whole source
+// *project* (src/Leroy.Platform), so a source in a subdirectory the test tree
+// does not mirror (Pdf/) is still in scope. And the test names share only a
+// prefix with the source name, which shortening the test stem can never reach.
+func TestDotNetTestProjectFindsSourceInUnmirroredSubdirectory(t *testing.T) {
+	tm := buildTestMap(t, map[string]string{
+		"backend/src/Leroy.Platform/Pdf/AprysePdfGenerationService.cs": "class AprysePdfGenerationService {}\n",
+		"backend/src/Leroy.Platform/Pdf/IPdfGenerationService.cs":      "interface IPdfGenerationService {}\n",
+		"backend/src/Leroy.Platform/Auth/TenantContext.cs":             "class TenantContext {}\n",
+		"backend/tests/Leroy.Platform.Tests/AprysePdfGoldenTests.cs":   "class AprysePdfGoldenTests {}\n",
+		"backend/tests/Leroy.Platform.Tests/AprysePdfRenderTests.cs":   "class AprysePdfRenderTests {}\n",
+		"backend/tests/Leroy.Platform.Tests/AprysePdfVisualTests.cs":   "class AprysePdfVisualTests {}\n",
+	})
+
+	const src = "backend/src/Leroy.Platform/Pdf/AprysePdfGenerationService.cs"
+	want := []string{
+		"backend/tests/Leroy.Platform.Tests/AprysePdfGoldenTests.cs",
+		"backend/tests/Leroy.Platform.Tests/AprysePdfRenderTests.cs",
+		"backend/tests/Leroy.Platform.Tests/AprysePdfVisualTests.cs",
+	}
+	for _, tp := range want {
+		assertMapped(t, tm, tp, src)
+	}
+	if got, _ := tm.LookupTests(src); !reflect.DeepEqual(got, want) {
+		t.Errorf("LookupTests(%s) = %v, want all three", src, got)
+	}
+}
+
+func TestDotNetTestProjectSuffixesAndNesting(t *testing.T) {
+	tm := buildTestMap(t, map[string]string{
+		// The production project is nested one level deeper than the test
+		// project, so no rewriting of the test path's segments can produce it.
+		"backend/src/Domains/Leroy.Certificates/Repositories/LabTestRepository.cs": "class LabTestRepository {}\n",
+		"backend/src/Leroy.Api/PublicApi/PatientPhotosController.cs":               "class PatientPhotosController {}\n",
+		"backend/src/Leroy.Worker/Jobs/ReminderJob.cs":                             "class ReminderJob {}\n",
+		// A same-named decoy outside the project under test: without project
+		// scoping the stem would be ambiguous and nothing would map.
+		"backend/src/Leroy.Api/Jobs/ReminderJob.cs": "class ReminderJob {}\n",
+
+		"backend/tests/Leroy.Certificates.Tests/LabTestRepositoryFamilyBlendTests.cs": "class LabTestRepositoryFamilyBlendTests {}\n",
+		"backend/tests/Leroy.Api.IntegrationTests/PatientPhotosApiTests.cs":           "class PatientPhotosApiTests {}\n",
+		"backend/tests/Leroy.Worker.UnitTests/ReminderJobTests.cs":                    "class ReminderJobTests {}\n",
+	})
+
+	assertMapped(t, tm,
+		"backend/tests/Leroy.Certificates.Tests/LabTestRepositoryFamilyBlendTests.cs",
+		"backend/src/Domains/Leroy.Certificates/Repositories/LabTestRepository.cs")
+	assertMapped(t, tm,
+		"backend/tests/Leroy.Api.IntegrationTests/PatientPhotosApiTests.cs",
+		"backend/src/Leroy.Api/PublicApi/PatientPhotosController.cs")
+	assertMapped(t, tm,
+		"backend/tests/Leroy.Worker.UnitTests/ReminderJobTests.cs",
+		"backend/src/Leroy.Worker/Jobs/ReminderJob.cs")
+}
+
+// --- Where the prefix rule stops ---
+
+func TestPrefixMatchDoesNotCrossProjects(t *testing.T) {
+	tm := buildTestMap(t, map[string]string{
+		"backend/src/Leroy.Platform/Pdf/AprysePdfGenerationService.cs": "class AprysePdfGenerationService {}\n",
+		"backend/src/Leroy.Accounts/Users/UserService.cs":              "class UserService {}\n",
+		"backend/tests/Leroy.Platform.Tests/AprysePdfGoldenTests.cs":   "class AprysePdfGoldenTests {}\n",
+		// Same prefix, different project. Nothing in Leroy.Accounts is named
+		// AprysePdf*, and reaching into Leroy.Platform for it would be a lie.
+		"backend/tests/Leroy.Accounts.Tests/AprysePdfRogueTests.cs": "class AprysePdfRogueTests {}\n",
+	})
+
+	assertMapped(t, tm,
+		"backend/tests/Leroy.Platform.Tests/AprysePdfGoldenTests.cs",
+		"backend/src/Leroy.Platform/Pdf/AprysePdfGenerationService.cs")
+
+	const rogue = "backend/tests/Leroy.Accounts.Tests/AprysePdfRogueTests.cs"
+	src, status := tm.LookupSource(rogue)
+	if src != "" {
+		t.Errorf("cross-project prefix mapped %s to %q", rogue, src)
+	}
+	if status != TestMapNoMatch {
+		t.Errorf("status for %s = %s, want no_match", rogue, status)
+	}
+}
+
+func TestAmbiguousPrefixIsNotMapped(t *testing.T) {
+	// Three sources in the project under test wear the prefix. Picking the
+	// shortest or the alphabetically first would be a coin toss.
+	tm := buildTestMap(t, map[string]string{
+		"backend/src/Leroy.Documents/DocumentFieldTypes.cs":                     "class DocumentFieldTypes {}\n",
+		"backend/src/Leroy.Documents/DocumentFieldSources.cs":                   "class DocumentFieldSources {}\n",
+		"backend/src/Leroy.Documents/DocumentFieldValidator.cs":                 "class DocumentFieldValidator {}\n",
+		"backend/tests/Leroy.Documents.Tests/DocumentFieldRepositoryDbTests.cs": "class DocumentFieldRepositoryDbTests {}\n",
+	})
+	const tp = "backend/tests/Leroy.Documents.Tests/DocumentFieldRepositoryDbTests.cs"
+	src, status := tm.LookupSource(tp)
+	if src != "" {
+		t.Errorf("ambiguous prefix mapped %s to %q", tp, src)
+	}
+	if status != TestMapNoMatch {
+		t.Errorf("status for %s = %s, want no_match", tp, status)
+	}
+}
+
+func TestSingleWordPrefixIsNotEnough(t *testing.T) {
+	// "Invoice" alone would tie every Invoice* source to every Invoice* test.
+	tm := buildTestMap(t, map[string]string{
+		"backend/src/Leroy.Billing/InvoiceGenerator.cs":           "class InvoiceGenerator {}\n",
+		"backend/tests/Leroy.Billing.Tests/InvoiceGoldenTests.cs": "class InvoiceGoldenTests {}\n",
+	})
+	const tp = "backend/tests/Leroy.Billing.Tests/InvoiceGoldenTests.cs"
+	if src := tm.SourceFor(tp); src != "" {
+		t.Errorf("one-word prefix mapped %s to %q", tp, src)
+	}
+}
+
+func TestSourceNamedLikeATestDoesNotClaimItsNeighbour(t *testing.T) {
+	// LabTest.cs is a domain model, but its name ends in "Test" so it is
+	// classified as a test file. It must not go on to claim the
+	// longer-named file next to it as its subject — a file's own untouched
+	// stem is not evidence of anything.
+	tm := buildTestMap(t, map[string]string{
+		"backend/src/Leroy.Certificates/Models/LabTest.cs":     "class LabTest {}\n",
+		"backend/src/Leroy.Certificates/Models/LabTestData.cs": "class LabTestData {}\n",
+	})
+	if src := tm.SourceFor("backend/src/Leroy.Certificates/Models/LabTest.cs"); src != "" {
+		t.Errorf("LabTest.cs mapped to %q, want no mapping", src)
+	}
+}
+
 // --- Languages that had no rules at all ---
 
 // These go through a real walk, so they cover both halves of the gap: the
@@ -395,6 +527,41 @@ func TestCandidateStemsCamelCase(t *testing.T) {
 	}
 	if !containsStr(fuzzy, "Checkout") {
 		t.Errorf("fuzzy = %v", fuzzy)
+	}
+}
+
+func TestDotNetTestDirBase(t *testing.T) {
+	cases := map[string]string{
+		"MyApp.Tests":                "MyApp",
+		"Leroy.Platform.Tests":       "Leroy.Platform",
+		"Leroy.Api.IntegrationTests": "Leroy.Api",
+		"Leroy.Worker.UnitTests":     "Leroy.Worker",
+		"Payments.AcceptanceSpecs":   "Payments",
+		"Leroy.Api.Contracts":        "", // a production project, not a test one
+		"Leroy.Platform":             "",
+		"MyApp":                      "",
+		".Tests":                     "",
+	}
+	for seg, want := range cases {
+		if got := dotNetTestDir(seg); got != want {
+			t.Errorf("dotNetTestDir(%q) = %q, want %q", seg, got, want)
+		}
+	}
+}
+
+func TestNameComponentCount(t *testing.T) {
+	cases := map[string]int{
+		"AprysePdf":                  2,
+		"Pdf":                        1,
+		"AprysePdfGenerationService": 4,
+		"checkout_flow":              2,
+		"checkout":                   1,
+		"UserDetail.cshtml":          3,
+	}
+	for stem, want := range cases {
+		if got := nameComponentCount(stem); got != want {
+			t.Errorf("nameComponentCount(%q) = %d, want %d", stem, got, want)
+		}
 	}
 }
 

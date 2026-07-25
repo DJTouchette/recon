@@ -250,33 +250,91 @@ func conventionFor(path string) (testConvention, bool) {
 
 // --- Matching ---
 
+// stemIndex looks source files up by a name key, case-sensitively first and
+// case-insensitively as a fallback.
+type stemIndex struct {
+	exact   map[string][]*scan.FileEntry
+	lowered map[string][]*scan.FileEntry
+}
+
+func newStemIndex() *stemIndex {
+	return &stemIndex{
+		exact:   make(map[string][]*scan.FileEntry),
+		lowered: make(map[string][]*scan.FileEntry),
+	}
+}
+
+func (si *stemIndex) add(key string, e *scan.FileEntry) {
+	si.exact[key] = append(si.exact[key], e)
+	l := strings.ToLower(key)
+	if l != key {
+		si.lowered[l] = append(si.lowered[l], e)
+	}
+}
+
+func (si *stemIndex) get(key string) []*scan.FileEntry {
+	if hits := si.exact[key]; len(hits) > 0 {
+		return hits
+	}
+	l := strings.ToLower(key)
+	if hits := si.exact[l]; len(hits) > 0 {
+		return hits
+	}
+	return si.lowered[l]
+}
+
 // testMatcher resolves a test file to its source by looking source files up by
 // stem, then scoring candidates on directory affinity. The old implementation
 // built a fixed list of literal paths per language, so anything that did not
 // live in the test's own directory or its immediate parent was invisible.
 type testMatcher struct {
-	idx     *FileIndex
-	byStem  map[string][]*scan.FileEntry
-	lowered map[string][]*scan.FileEntry
+	idx *FileIndex
+	// stems keys whole source stems ("AprysePdfGenerationService").
+	stems *stemIndex
+	// prefixes keys every proper leading run of a source stem's name parts
+	// ("Apryse", "AprysePdf", "AprysePdfGeneration"). Used only by the
+	// prefix tier, which is heavily fenced — see best().
+	prefixes *stemIndex
+	// dirsByName maps a directory's base name to every directory with that
+	// name that holds source files, itself or below. This is what lets
+	// tests/Leroy.Platform.Tests find src/Domains/Leroy.Platform, which no
+	// amount of segment rewriting on the test path would ever produce.
+	dirsByName map[string][]string
 }
 
 func newTestMatcher(idx *FileIndex) *testMatcher {
 	m := &testMatcher{
-		idx:     idx,
-		byStem:  make(map[string][]*scan.FileEntry),
-		lowered: make(map[string][]*scan.FileEntry),
+		idx:        idx,
+		stems:      newStemIndex(),
+		prefixes:   newStemIndex(),
+		dirsByName: make(map[string][]string),
 	}
 	// Scripts count as sources here: a shell test's subject is a shell script,
 	// which the scanner classifies as ClassScript, not ClassSource.
 	sources := append(append([]*scan.FileEntry{}, idx.ByClass(scan.ClassSource)...), idx.ByClass(scan.ClassScript)...)
+	seenDir := map[string]bool{}
 	for _, s := range sources {
 		stem := stemOf(s.RelPath)
-		m.byStem[stem] = append(m.byStem[stem], s)
-		if l := strings.ToLower(stem); l != stem {
-			m.lowered[l] = append(m.lowered[l], s)
-		} else {
-			m.lowered[l] = m.byStem[stem]
+		m.stems.add(stem, s)
+		if parts := splitNameParts(stem); len(parts) > 1 {
+			for n := 1; n < len(parts); n++ {
+				m.prefixes.add(joinNameParts(parts[:n], stem), s)
+			}
 		}
+		for d := dirOf(s.RelPath); d != ""; d = dirOf(d) {
+			if seenDir[d] {
+				break // ancestors were recorded the first time we saw this dir
+			}
+			seenDir[d] = true
+			name := d
+			if i := strings.LastIndex(d, "/"); i >= 0 {
+				name = d[i+1:]
+			}
+			m.dirsByName[name] = append(m.dirsByName[name], d)
+		}
+	}
+	for name := range m.dirsByName {
+		sort.Strings(m.dirsByName[name])
 	}
 	return m
 }
@@ -286,6 +344,47 @@ func stemOf(relPath string) string {
 	return strings.TrimSuffix(base, filepath.Ext(base))
 }
 
+// scope is everywhere a given test file's subject could plausibly live.
+type scope struct {
+	dir     string          // the test's own directory
+	mirrors map[string]bool // directories the test directory could be mirroring
+	roots   []string        // source project roots, matched as whole subtrees
+}
+
+// Directory-affinity scores. Anything below scoreProject is "not nearby", and
+// only an exact, repo-unique stem is allowed to map from there.
+const (
+	scoreSameDir = 4
+	scoreMirror  = 3
+	scoreProject = 2
+	scoreNone    = 0
+)
+
+func (s scope) score(dir string) int {
+	switch {
+	case dir == s.dir:
+		return scoreSameDir
+	case s.mirrors[dir]:
+		return scoreMirror
+	}
+	for _, r := range s.roots {
+		if dir == r || strings.HasPrefix(dir, r+"/") {
+			return scoreProject
+		}
+	}
+	return scoreNone
+}
+
+// matchMode records how much of the test's name the candidate stem actually
+// accounts for; each step down buys a stricter acceptance rule.
+type matchMode int
+
+const (
+	modeExact  matchMode = iota // stem minus the language's test affixes
+	modeFuzzy                   // stem with trailing name parts dropped
+	modePrefix                  // stem is a leading run of the source's name
+)
+
 // find resolves one test file.
 func (m *testMatcher) find(test *scan.FileEntry) (string, TestMapStatus) {
 	conv, ok := conventionFor(test.RelPath)
@@ -294,13 +393,17 @@ func (m *testMatcher) find(test *scan.FileEntry) (string, TestMapStatus) {
 	}
 
 	testDir := dirOf(test.RelPath)
-	mirrors := mirrorDirs(testDir)
+	sc := scope{
+		dir:     testDir,
+		mirrors: mirrorDirs(testDir),
+		roots:   m.projectRoots(testDir),
+	}
 	testExt := strings.ToLower(filepath.Ext(test.RelPath))
 
 	exact, fuzzy := candidateStems(stemOf(test.RelPath), conv)
 
 	for _, stem := range exact {
-		if hit := m.best(stem, conv, testExt, testDir, mirrors, true); hit != "" {
+		if hit := m.best(m.stems.get(stem), conv, testExt, sc, modeExact); hit != "" {
 			return hit, TestMapMapped
 		}
 	}
@@ -308,19 +411,42 @@ func (m *testMatcher) find(test *scan.FileEntry) (string, TestMapStatus) {
 	// still be tied to checkout.ts, but only when the shortened name lands
 	// somewhere plausible or is unique in the repo.
 	for _, stem := range fuzzy {
-		if hit := m.best(stem, conv, testExt, testDir, mirrors, false); hit != "" {
+		if hit := m.best(m.stems.get(stem), conv, testExt, sc, modeFuzzy); hit != "" {
+			return hit, TestMapMapped
+		}
+	}
+	// Last resort: the test's name is a *prefix* of the source's rather than a
+	// truncation of it — AprysePdfGoldenTests.cs against
+	// AprysePdfGenerationService.cs. Shortening the test stem can never reach
+	// that name, so the lookup has to run the other way.
+	raw := stemOf(test.RelPath)
+	for _, stem := range append(append([]string{}, exact...), fuzzy...) {
+		if !usableAsPrefix(stem, raw) {
+			continue
+		}
+		if hit := m.best(m.prefixes.get(stem), conv, testExt, sc, modePrefix); hit != "" {
 			return hit, TestMapMapped
 		}
 	}
 	return "", TestMapNoMatch
 }
 
-// best picks the strongest source candidate for a stem, or "" for none.
-func (m *testMatcher) best(stem string, conv testConvention, testExt, testDir string, mirrors map[string]bool, exactStem bool) string {
-	cands := m.byStem[stem]
-	if len(cands) == 0 {
-		cands = m.lowered[strings.ToLower(stem)]
-	}
+// usableAsPrefix is half the precision line on prefix matching.
+//
+// The stem must be at least two name components: "AprysePdf" names a subject,
+// "Pdf" or "Certificate" would hand a whole source project to a whole test
+// project. And it must not be the test file's own untouched stem — that stem
+// carries no evidence the file is about anything but itself, so "X.cs is a
+// prefix of XData.cs" would map any file onto its longer-named neighbour. Only
+// a stem the affix-stripping or shortening rules produced counts.
+func usableAsPrefix(stem, rawTestStem string) bool {
+	return stem != rawTestStem && nameComponentCount(stem) >= minPrefixComponents
+}
+
+const minPrefixComponents = 2
+
+// best picks the strongest source candidate from cands, or "" for none.
+func (m *testMatcher) best(cands []*scan.FileEntry, conv testConvention, testExt string, sc scope, mode matchMode) string {
 	if len(cands) == 0 {
 		return ""
 	}
@@ -340,14 +466,11 @@ func (m *testMatcher) best(stem string, conv testConvention, testExt, testDir st
 		if ext == testExt {
 			rank = -1 // same extension as the test wins ties
 		}
-		score := 0
-		switch {
-		case dirOf(c.RelPath) == testDir:
-			score = 3
-		case mirrors[dirOf(c.RelPath)]:
-			score = 2
-		}
-		pool = append(pool, scored{path: c.RelPath, score: score, ext: rank})
+		pool = append(pool, scored{
+			path:  c.RelPath,
+			score: sc.score(dirOf(c.RelPath)),
+			ext:   rank,
+		})
 	}
 	if len(pool) == 0 {
 		return ""
@@ -364,12 +487,27 @@ func (m *testMatcher) best(stem string, conv testConvention, testExt, testDir st
 	})
 
 	top := pool[0]
-	if top.score >= 2 {
+	if mode == modePrefix {
+		// The other half of the precision line. A prefix match is the weakest
+		// evidence recon has, so the prefix must single one source out: nearby,
+		// and with nothing else equally close wearing the same prefix. Picking
+		// the shortest or the alphabetically first of
+		// DocumentFieldSources/Types/Validator would be a coin toss dressed up
+		// as an answer, so recon declines and says no_match.
+		if top.score < scoreProject {
+			return ""
+		}
+		if len(pool) > 1 && pool[1].score == top.score && pool[1].ext == top.ext {
+			return ""
+		}
+		return top.path
+	}
+	if top.score >= scoreProject {
 		return top.path
 	}
 	// Nothing nearby. A stem that occurs exactly once in the whole repo is
 	// still an unambiguous answer; anything else is a guess, so decline.
-	if len(pool) == 1 && exactStem {
+	if len(pool) == 1 && mode == modeExact {
 		return top.path
 	}
 	return ""
@@ -493,11 +631,19 @@ func segmentAlternatives(seg string) []string {
 	return alts
 }
 
-// dotNetTestDir maps "MyApp.Tests" → "MyApp".
+// dotNetTestDir maps a .NET test project directory to its production project:
+// "MyApp.Tests" → "MyApp", "MyApp.IntegrationTests" → "MyApp". Any final
+// dotted component ending in Test/Tests/Spec/Specs counts, which covers the
+// suffixes teams invent (.UnitTests, .FunctionalTests, .ApiTests) without
+// keeping a list of them.
 func dotNetTestDir(seg string) string {
-	for _, suffix := range []string{".IntegrationTests", ".UnitTests", ".Tests", ".Test", ".Specs"} {
-		if strings.HasSuffix(seg, suffix) {
-			return strings.TrimSuffix(seg, suffix)
+	i := strings.LastIndex(seg, ".")
+	if i <= 0 {
+		return ""
+	}
+	for _, suffix := range []string{"Tests", "Test", "Specs", "Spec"} {
+		if strings.HasSuffix(seg[i+1:], suffix) {
+			return seg[:i]
 		}
 	}
 	return ""
@@ -511,6 +657,72 @@ func swiftTestDir(seg string) string {
 		}
 	}
 	return ""
+}
+
+// projectTestDir returns the production-project name a test-project directory
+// segment pairs with, or "".
+func projectTestDir(seg string) string {
+	if base := dotNetTestDir(seg); base != "" {
+		return base
+	}
+	return swiftTestDir(seg)
+}
+
+// maxProjectRoots caps how many same-named directories a test project is
+// allowed to claim. A name shared by more than a couple of directories is a
+// generic word, not a project.
+const maxProjectRoots = 3
+
+// projectRoots returns the source project directories a test directory pairs
+// with, as whole subtrees.
+//
+// This is the rule the .NET solution layout needs and plain directory
+// mirroring cannot express: tests/Leroy.Platform.Tests pairs with the
+// *project* src/Leroy.Platform, not with a directory at the same relative
+// depth, so a source at src/Leroy.Platform/Pdf/X.cs is in scope even though
+// the test tree has no Pdf/ directory. Rewriting path segments cannot find it
+// either when the projects are nested unevenly (src/Domains/Leroy.Certificates
+// against tests/Leroy.Certificates.Tests), so the project is looked up by name
+// among directories that actually contain sources.
+//
+// The subtree is a *scope*, not a match: being in it never maps a test on its
+// own, it only makes a name match count as nearby.
+func (m *testMatcher) projectRoots(testDir string) []string {
+	if testDir == "" {
+		return nil
+	}
+	segs := strings.Split(testDir, "/")
+	for i := len(segs) - 1; i >= 0; i-- {
+		base := projectTestDir(segs[i])
+		if base == "" {
+			continue
+		}
+		cands := m.dirsByName[base]
+		if len(cands) == 0 || len(cands) > maxProjectRoots {
+			continue
+		}
+		var out []string
+		for _, c := range cands {
+			if c != testDir && !underTestTree(c) {
+				out = append(out, c)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return nil
+}
+
+// underTestTree reports whether a directory is itself part of a test tree, so
+// it can never be the source side of a pairing.
+func underTestTree(dir string) bool {
+	for _, seg := range strings.Split(dir, "/") {
+		if testDirSegments[strings.ToLower(seg)] || projectTestDir(seg) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Stem derivation ---
@@ -598,16 +810,34 @@ func splitNameParts(stem string) []string {
 			return r == '_' || r == '-' || r == '.'
 		})
 	}
+	return splitCamel(stem)
+}
+
+// nameComponentCount counts the words in a stem, splitting on separators *and*
+// camel-case humps. splitNameParts deliberately stops at the first kind it
+// finds (so "Service.Cvi" is two parts, not five); this is the other question
+// — how specific is this name — and both splits count towards it.
+func nameComponentCount(stem string) int {
+	n := 0
+	for _, part := range strings.FieldsFunc(stem, func(r rune) bool {
+		return r == '_' || r == '-' || r == '.'
+	}) {
+		n += len(splitCamel(part))
+	}
+	return n
+}
+
+// splitCamel splits "AprysePdf" into ["Apryse", "Pdf"].
+func splitCamel(s string) []string {
 	var parts []string
 	start := 0
-	for i, r := range stem {
+	for i, r := range s {
 		if i > 0 && r >= 'A' && r <= 'Z' {
-			parts = append(parts, stem[start:i])
+			parts = append(parts, s[start:i])
 			start = i
 		}
 	}
-	parts = append(parts, stem[start:])
-	return parts
+	return append(parts, s[start:])
 }
 
 // joinNameParts rebuilds a shortened stem using the original separator.

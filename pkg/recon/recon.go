@@ -37,7 +37,25 @@ type Recon struct {
 	// did, so the CLI can say "no mapping rules for this file type" instead of
 	// "no test files found" — a false negative dressed as a fact.
 	lastTestStatus string
+
+	// lastTestSubject is set when the most recent Tests() call was asked about a
+	// test file, so the CLI can phrase the answer as "covers" rather than
+	// "tested by".
+	lastTestSubject string
+
+	// lastTestQueryWasTest records that the query named a test file, so an empty
+	// answer can say "this is a test with no single subject" rather than
+	// "no tests found", which is a different claim entirely.
+	lastTestQueryWasTest bool
 }
+
+// LastTestQueryWasTest reports whether the most recent Tests call named a test
+// file rather than a source file.
+func (r *Recon) LastTestQueryWasTest() bool { return r.lastTestQueryWasTest }
+
+// LastTestSubject reports the source file the most recent Tests call resolved a
+// test to, or "" when the query was not about a test file.
+func (r *Recon) LastTestSubject() string { return r.lastTestSubject }
 
 // LastTestStatus reports the outcome of the most recent Tests call:
 // "mapped", "no_match", or "unsupported".
@@ -484,6 +502,32 @@ func (r *Recon) Tests(path string, maxResults int) ([]TestFile, error) {
 	path = filepath.Clean(path)
 
 	testPaths, status := r.tests.LookupTests(path)
+
+	// Asked about a test file, answer with what it covers. LookupSource has
+	// always known this; nothing called it, so pointing at a test returned
+	// "No test files found." — a confident no to a question that was never
+	// asked. Which direction the caller meant is unambiguous from the file's
+	// own class, so there is no reason to make them phrase it differently.
+	if len(testPaths) == 0 {
+		if f := r.idx.Get(path); f != nil && f.Class == scan.ClassTest {
+			r.lastTestQueryWasTest = true
+			if src, st := r.tests.LookupSource(path); src != "" {
+				r.lastTestStatus = string(st)
+				r.lastTestSubject = src
+				return []TestFile{{
+					Path:    src,
+					Kind:    index.ClassifyTestKind(path),
+					ForFile: path,
+				}}, nil
+			} else {
+				// A fixture or an end-to-end test genuinely has no single
+				// subject. Say that, rather than reporting it as untested.
+				r.lastTestStatus = string(st)
+				r.lastTestSubject = ""
+				return nil, nil
+			}
+		}
+	}
 
 	// If path is a directory, find tests for all source files in it. A
 	// directory is not itself a mappable file, so its own status says nothing.

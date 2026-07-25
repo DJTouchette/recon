@@ -227,6 +227,104 @@ func TestCSharpDoesNotFabricateEdgesFromDirectoryNames(t *testing.T) {
 	}
 }
 
+// ─── 3b. C# third-party usings are External, not Unresolved ───────────────────
+//
+// Unresolved is the bucket that tells a caller "recon dropped a real edge".
+// On a real 656-file C# repo, 413 of 3338 specifiers landed there and nearly
+// all of them were vendor SDK and NuGet namespaces — an expected non-edge, no
+// different from System.*. A caveat that fires on most files is one people
+// learn to ignore, so it has to be reserved for the ambiguous cases.
+func TestCSharpThirdPartyUsingsAreExternalNotUnresolved(t *testing.T) {
+	files := map[string]string{
+		"src/Models/User.cs":  "namespace MyApp.Models;\n\npublic class User { }\n",
+		"src/Docs/Dto/Doc.cs": "namespace MyApp.Docs.Dto;\n\npublic class Doc { }\n",
+		"src/Web/Startup.cs": "using System;\n" +
+			"using pdftron;\n" +
+			"using pdftron.Common;\n" +
+			"using pdftron.PDF;\n" +
+			"using pdftron.PDF.Annots;\n" +
+			"using pdftron.SDF;\n" +
+			"using QRCoder;\n" +
+			"using MyApp.Models;\n" +
+			"using MyApp.Docs;\n" +
+			"\nnamespace MyApp.Web;\n\npublic class Startup { public User U; }\n",
+	}
+	dg := buildGraph(t, files)
+
+	// The one real edge survives; nothing was fabricated for the vendor usings.
+	assertEdges(t, dg, "src/Web/Startup.cs", "src/Models/User.cs")
+
+	st, ok := dg.ImportStatsOf("src/Web/Startup.cs")
+	if !ok {
+		t.Fatal("no import stats for src/Web/Startup.cs")
+	}
+	// 9 usings: 1 resolved (MyApp.Models), 1 unresolved (MyApp.Docs — declared
+	// only as a parent of MyApp.Docs.Dto, so a type recon cannot see may live
+	// there), 7 external (System + 5 pdftron + QRCoder).
+	if st.Extracted != 9 || st.Resolved != 1 || st.External != 7 || st.Unresolved != 1 {
+		t.Fatalf("stats = %+v, want 9 extracted / 1 resolved / 7 external / 1 unresolved", st)
+	}
+	for _, spec := range st.UnresolvedSpecs {
+		if spec != "MyApp.Docs" {
+			t.Errorf("third-party using reported as unresolved: %q", spec)
+		}
+	}
+}
+
+// The reclassification moves specifiers between the External and Unresolved
+// counters only. Edges are what the dependency graph is for, so this pins the
+// whole edge set of a repo that mixes resolvable, third-party and ambiguous
+// usings: if a future tweak to the classification adds or drops an edge, this
+// fails rather than silently changing fan-in.
+func TestCSharpClassificationDoesNotChangeEdges(t *testing.T) {
+	dg := buildGraph(t, map[string]string{
+		"src/Models/User.cs":      "namespace MyApp.Models;\n\npublic class User { }\n",
+		"src/Models/Order.cs":     "namespace MyApp.Models;\n\npublic class Order { }\n",
+		"src/Models/Dto/Line.cs":  "namespace MyApp.Models.Dto;\n\npublic class Line { }\n",
+		"src/Helpers/MathHelp.cs": "namespace MyApp.Helpers;\n\npublic static class MathHelp { }\n",
+		"src/Web/Startup.cs": "using System.Linq;\nusing QRCoder;\nusing MyApp.Models;\n" +
+			"using MyApp.Nowhere;\nusing static MyApp.Helpers.MathHelp;\n" +
+			"\nnamespace MyApp.Web;\n\npublic class Startup { }\n",
+	})
+
+	want := map[string][]string{
+		"src/Web/Startup.cs": {
+			"src/Helpers/MathHelp.cs",
+			"src/Models/Order.cs",
+			"src/Models/User.cs",
+		},
+	}
+	got := map[string][]string{}
+	for src, targets := range dg.AllImports() {
+		if len(targets) > 0 {
+			got[src] = sortedStrings(targets)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("edge map = %v, want %v", got, want)
+	}
+	for src, w := range want {
+		g := got[src]
+		if len(g) != len(w) {
+			t.Fatalf("%s imports = %v, want %v", src, g, w)
+		}
+		for i := range w {
+			if g[i] != w[i] {
+				t.Fatalf("%s imports = %v, want %v", src, g, w)
+			}
+		}
+	}
+
+	// MyApp.Nowhere is not declared and nothing nests under it: External.
+	st, _ := dg.ImportStatsOf("src/Web/Startup.cs")
+	if st.Unresolved != 0 {
+		t.Errorf("unresolved = %d (%v), want 0", st.Unresolved, st.UnresolvedSpecs)
+	}
+	if st.Resolved != 2 || st.External != 3 {
+		t.Errorf("stats = %+v, want 2 resolved (MyApp.Models, using static) / 3 external", st)
+	}
+}
+
 // ─── 4. Rust super:: ──────────────────────────────────────────────────────────
 
 func TestRustSuperFromNonModFile(t *testing.T) {

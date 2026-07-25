@@ -149,7 +149,7 @@ func testsCmd() *cobra.Command {
 			}
 
 			if flagHuman {
-				printTestsHuman(cmd, tests, r.LastTestStatus())
+				printTestsHuman(cmd, tests, r.LastTestStatus(), r.LastTestSubject(), r.LastTestQueryWasTest())
 				return nil
 			}
 			return outputJSON(cmd, tests)
@@ -679,10 +679,18 @@ func printHotspotsHuman(cmd *cobra.Command, spots []recon.HotspotInfo) {
 	tw.Flush()
 }
 
-func printTestsHuman(cmd *cobra.Command, tests []recon.TestFile, status string) {
+// printTestsHuman renders either direction of the relationship. Asked about a
+// source it lists the tests; asked about a test it names the subject — the same
+// data read the other way, which is what the caller meant.
+func printTestsHuman(cmd *cobra.Command, tests []recon.TestFile, status, subject string, queryWasTest bool) {
 	w := cmd.OutOrStdout()
+
+	if subject != "" {
+		fmt.Fprintf(w, "This is a test file. It covers:\n  %s\n", subject)
+		return
+	}
 	if len(tests) == 0 {
-		fmt.Fprintln(w, testsEmptyMessage(status))
+		fmt.Fprintln(w, testsEmptyMessage(status, queryWasTest))
 		return
 	}
 	fmt.Fprintln(w, "Test files:")
@@ -906,10 +914,15 @@ func reportParseCoverage(cmd *cobra.Command, coverage []recon.FileParseInfo) {
 // testsEmptyMessage explains an empty test list. "No test files found" was the
 // same answer for "this file has no tests" and "recon has no mapping rules for
 // this file type", and the second is a false negative dressed as a fact.
-func testsEmptyMessage(status string) string {
-	switch status {
-	case "unsupported":
+func testsEmptyMessage(status string, queryWasTest bool) string {
+	switch {
+	case status == "unsupported":
 		return "No mapping rules for this file type — recon cannot tell whether it has tests."
+	case queryWasTest:
+		// Fixtures, helpers and end-to-end suites genuinely have no single
+		// subject. Reporting that as "no tests found" answers a question about
+		// the wrong file.
+		return "This is a test file, and recon could not tie it to one source file — common for fixtures, helpers and end-to-end suites."
 	default:
 		return "No test files found."
 	}

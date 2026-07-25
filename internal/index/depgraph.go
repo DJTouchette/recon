@@ -324,8 +324,9 @@ type resolveCtx struct {
 	jsOnce    sync.Once
 	jsAliases []jsAlias
 
-	csOnce sync.Once
-	csNS   map[string][]string
+	csOnce   sync.Once
+	csNS     map[string][]string
+	csNSTree map[string]bool
 
 	jvmOnce sync.Once
 	jvmPkg  map[string][]string
@@ -1886,8 +1887,33 @@ func csharpRegexSpecs(lines []string) []string {
 
 // csharpNamespaces maps each declared namespace to the files declaring it.
 func (rc *resolveCtx) csharpNamespaces() map[string][]string {
+	rc.buildCSharpNamespaces()
+	return rc.csNS
+}
+
+// csharpNamespaceInRepo reports whether ns is a node of the repo's declared
+// namespace tree: either a file declares exactly ns, or a file declares a
+// namespace nested under it (`MyApp.Models` when only `MyApp.Models.Dto` is
+// declared).
+//
+// It is the External/Unresolved discriminator. A `using` naming a namespace
+// outside that tree cannot refer to repo code by construction — no file puts a
+// type there — so it is an expected non-edge (a NuGet package or an SDK
+// assembly), not an edge recon dropped.
+func (rc *resolveCtx) csharpNamespaceInRepo(ns string) bool {
+	if ns == "" {
+		return false
+	}
+	rc.buildCSharpNamespaces()
+	return rc.csNSTree[ns]
+}
+
+// buildCSharpNamespaces populates the declared-namespace map and the set of
+// tree nodes (every declared namespace plus all its ancestors), once.
+func (rc *resolveCtx) buildCSharpNamespaces() {
 	rc.csOnce.Do(func() {
 		rc.csNS = make(map[string][]string)
+		rc.csNSTree = make(map[string]bool)
 		scanned := scanLangFilesParallel(rc, []string{"csharp"}, func(_ *scan.FileEntry, data []byte) []string {
 			var namespaces []string
 			for _, spec := range csharpSpecsFromData(data) {
@@ -1903,10 +1929,17 @@ func (rc *resolveCtx) csharpNamespaces() map[string][]string {
 			}
 			for _, ns := range s.val {
 				rc.csNS[ns] = append(rc.csNS[ns], s.file.RelPath)
+				for node := ns; node != ""; {
+					rc.csNSTree[node] = true
+					i := strings.LastIndexByte(node, '.')
+					if i <= 0 {
+						break
+					}
+					node = node[:i]
+				}
 			}
 		}
 	})
-	return rc.csNS
 }
 
 // resolveCSharpSpecs resolves C# using directives against the namespaces the
@@ -1917,7 +1950,27 @@ func (rc *resolveCtx) csharpNamespaces() map[string][]string {
 // `using MyApp.Models;` linked every file in any directory ending in "models".
 // A fabricated edge is worse than a missing one — it inflates fan-in and
 // corrupts hotspot ranking — so anything we cannot pin to a declared namespace
-// is now reported unresolved instead of guessed.
+// produces no edge.
+//
+// A using that produced no edge is then split between External and Unresolved
+// by the same namespace map, because those two mean very different things to a
+// caller and only one of them is actionable:
+//
+//	External   — the namespace is not a node of the repo's declared namespace
+//	             tree, so no repo file can possibly define a type in it. A NuGet
+//	             package or an SDK assembly (pdftron.PDF, QRCoder), exactly like
+//	             System.*. An expected non-edge.
+//	Unresolved — the repo *does* declare that namespace (or one nested under
+//	             it, or the parent a `using static` type would live in) but the
+//	             specific file could not be pinned down. This is the bucket that
+//	             means recon dropped a real edge.
+//
+// Reporting every third-party using as Unresolved — 12% of all C# specifiers on
+// a real 656-file repo, and a majority of the specifiers in individual files —
+// trained readers to ignore the one signal that is supposed to be actionable.
+// A hardcoded list of well-known third-party namespaces would be the same class
+// of drifting heuristic as the directory-name match, so the rule is derived
+// entirely from what the repo declares.
 func resolveCSharpSpecs(specs []string, filePath string, rc *resolveCtx, t *importTally) []string {
 	nsMap := rc.csharpNamespaces()
 	seen := make(map[string]bool)
@@ -1942,15 +1995,19 @@ func resolveCSharpSpecs(specs []string, filePath string, rc *resolveCtx, t *impo
 		}
 		usings++
 
-		// Skip system/framework namespaces
+		// Framework namespaces stay external even when a repo file declares
+		// one: `namespace Microsoft.Extensions.DependencyInjection` on a
+		// service-collection extension class is a convention for surfacing an
+		// extension method, not a dependency the using expresses.
 		if strings.HasPrefix(ns, "System") || strings.HasPrefix(ns, "Microsoft") ||
 			strings.HasPrefix(ns, "NuGet") {
 			t.skip()
 			continue
 		}
 
+		declaring := nsMap[ns]
 		found := false
-		for _, p := range nsMap[ns] {
+		for _, p := range declaring {
 			found = add(p) || found
 		}
 		if found {
@@ -1961,9 +2018,11 @@ func resolveCSharpSpecs(specs []string, filePath string, rc *resolveCtx, t *impo
 		// `using static Some.Namespace.Type;` names a type, not a namespace.
 		// Accept it only on an exact file-name match inside the parent
 		// namespace — never on a fuzzy directory suffix.
+		var parentFiles []string
 		if i := strings.LastIndexByte(ns, '.'); i > 0 {
 			parent, typeName := ns[:i], ns[i+1:]
-			for _, p := range nsMap[parent] {
+			parentFiles = nsMap[parent]
+			for _, p := range parentFiles {
 				if strings.TrimSuffix(filepath.Base(p), ".cs") == typeName {
 					found = add(p) || found
 				}
@@ -1971,8 +2030,24 @@ func resolveCSharpSpecs(specs []string, filePath string, rc *resolveCtx, t *impo
 		}
 		if found {
 			t.hit()
-		} else {
+			continue
+		}
+
+		switch {
+		case len(declaring) > 0:
+			// Declared, but only by this same file: a file naming its own
+			// namespace is a no-op, not an edge recon lost.
+			t.skip()
+		case rc.csharpNamespaceInRepo(ns) || len(parentFiles) > 0:
+			// The repo owns this corner of the namespace tree — either a file
+			// declares something nested under ns, or the parent namespace a
+			// `using static` type would live in is declared — but no file
+			// matched. A genuinely dropped edge.
 			t.miss(ns)
+		default:
+			// Nothing in the repo declares ns or anything under it, so no repo
+			// file can define a type there. Third-party.
+			t.skip()
 		}
 	}
 	t.extract(usings)

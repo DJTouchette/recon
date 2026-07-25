@@ -518,22 +518,107 @@ func TestResolveCSharpImports_DoesNotMatchDirectoryNames(t *testing.T) {
 	}
 }
 
-func TestResolveCSharpImports_UnresolvedIsReported(t *testing.T) {
+// Unresolved must mean "recon dropped a real in-repo edge". These two tests
+// pin the two halves of that rule; the negative assertions (Unresolved == 0,
+// External == 0) are the point.
+
+func TestResolveCSharpImports_UndeclaredNamespaceIsExternal(t *testing.T) {
+	// pdftron.* and QRCoder are a vendor SDK and a NuGet package. No file in
+	// the repo declares those namespaces, so no repo file can define a type in
+	// them and there is no edge to drop — they are External, exactly like
+	// System.*, not Unresolved. Reporting them as unresolved (6 of 9 usings in
+	// one real file) made the caveat noise.
 	_, _, rc := newRepoFixture(t, map[string]string{
-		"src/Web/Startup.cs": "using MyApp.Nowhere;\n",
+		"src/Web/Startup.cs": "namespace MyApp.Web;\n",
+		"src/Models/User.cs": "namespace MyApp.Models;\npublic class User {}\n",
 	})
 
+	lines := []string{
+		"using pdftron;",
+		"using pdftron.Common;",
+		"using pdftron.PDF;",
+		"using pdftron.PDF.Annots;",
+		"using pdftron.SDF;",
+		"using QRCoder;",
+	}
 	tally := &importTally{lang: "csharp"}
-	got := resolveCSharpSpecs(csharpRegexSpecs([]string{"using MyApp.Nowhere;"}), "src/Web/Startup.cs", rc, tally)
+	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "src/Web/Startup.cs", rc, tally)
+	if len(got) != 0 {
+		t.Fatalf("third-party usings must not fabricate edges, got %v", got)
+	}
+	st := tally.stats()
+	if st.Extracted != 6 || st.External != 6 {
+		t.Fatalf("stats = %+v, want 6 extracted / 6 external", st)
+	}
+	if st.Unresolved != 0 || len(st.UnresolvedSpecs) != 0 {
+		t.Fatalf("undeclared namespaces reported as unresolved: %+v", st)
+	}
+}
+
+func TestResolveCSharpImports_UnresolvedIsReported(t *testing.T) {
+	// The genuinely ambiguous cases: the repo *does* own this corner of the
+	// namespace tree, but no file could be pinned down.
+	//
+	//   MyApp.Models        — only the nested MyApp.Models.Dto is declared, so
+	//                         a type recon cannot see may live in it.
+	//   MyApp.Dtos.Missing  — `using static`-shaped; MyApp.Dtos is declared but
+	//                         no Missing.cs sits in it.
+	_, _, rc := newRepoFixture(t, map[string]string{
+		"src/Models/Dto/Order.cs": "namespace MyApp.Models.Dto;\npublic class Order {}\n",
+		"src/Dtos/Customer.cs":    "namespace MyApp.Dtos;\npublic class Customer {}\n",
+		"src/Web/Startup.cs":      "namespace MyApp.Web;\n",
+	})
+
+	lines := []string{"using MyApp.Models;", "using static MyApp.Dtos.Missing;"}
+	tally := &importTally{lang: "csharp"}
+	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "src/Web/Startup.cs", rc, tally)
 	if len(got) != 0 {
 		t.Fatalf("expected no edges, got %v", got)
 	}
 	st := tally.stats()
-	if st.Extracted != 1 || st.Unresolved != 1 || st.Resolved != 0 {
-		t.Fatalf("stats = %+v, want 1 extracted / 1 unresolved", st)
+	if st.Extracted != 2 || st.Unresolved != 2 || st.Resolved != 0 || st.External != 0 {
+		t.Fatalf("stats = %+v, want 2 extracted / 2 unresolved", st)
 	}
-	if len(st.UnresolvedSpecs) != 1 || st.UnresolvedSpecs[0] != "MyApp.Nowhere" {
-		t.Errorf("unresolved specs = %v, want [MyApp.Nowhere]", st.UnresolvedSpecs)
+	want := []string{"MyApp.Dtos.Missing", "MyApp.Models"}
+	if got := sortedStrings(st.UnresolvedSpecs); len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("unresolved specs = %v, want %v", got, want)
+	}
+}
+
+func TestResolveCSharpImports_SelfNamespaceIsNotUnresolved(t *testing.T) {
+	// The only declarer of the namespace is the importing file itself: no edge
+	// exists to drop, so this is an expected non-edge, not a caveat.
+	_, _, rc := newRepoFixture(t, map[string]string{
+		"src/Models/User.cs": "namespace MyApp.Models;\nusing MyApp.Models;\npublic class User {}\n",
+	})
+
+	tally := &importTally{lang: "csharp"}
+	got := resolveCSharpSpecs(csharpRegexSpecs([]string{"using MyApp.Models;"}), "src/Models/User.cs", rc, tally)
+	if len(got) != 0 {
+		t.Fatalf("expected no edges, got %v", got)
+	}
+	if st := tally.stats(); st.Unresolved != 0 || st.External != 1 {
+		t.Fatalf("stats = %+v, want 1 external / 0 unresolved", st)
+	}
+}
+
+func TestResolveCSharpImports_DeclaredNamespaceStillResolves(t *testing.T) {
+	// Guard against the reclassification suppressing real edges: the same file
+	// mixes a resolvable using with third-party ones.
+	_, _, rc := newRepoFixture(t, map[string]string{
+		"src/Models/User.cs": "namespace MyApp.Models;\npublic class User {}\n",
+		"src/Web/Startup.cs": "namespace MyApp.Web;\n",
+	})
+
+	lines := []string{"using MyApp.Models;", "using QRCoder;", "using System.Text;"}
+	tally := &importTally{lang: "csharp"}
+	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "src/Web/Startup.cs", rc, tally)
+	if len(got) != 1 || got[0] != "src/Models/User.cs" {
+		t.Fatalf("got %v, want [src/Models/User.cs]", got)
+	}
+	st := tally.stats()
+	if st.Extracted != 3 || st.Resolved != 1 || st.External != 2 || st.Unresolved != 0 {
+		t.Fatalf("stats = %+v, want 3 extracted / 1 resolved / 2 external / 0 unresolved", st)
 	}
 }
 
