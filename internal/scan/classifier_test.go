@@ -27,7 +27,8 @@ func TestClassify(t *testing.T) {
 		{"data.csv", "data.csv", ClassData},
 		{"__tests__/foo.tsx", "foo.tsx", ClassTest},
 		{"backend/Foo.Tests/BarTest.cs", "BarTest.cs", ClassTest},
-		{"src/FooTests.cs", "FooTests.cs", ClassTest},
+		// A C# name suffix alone is not enough; see TestCSharpTestNameNeedsProjectEvidence.
+		{"src/FooTests.cs", "FooTests.cs", ClassSource},
 		{"src/app.ts", "app.ts", ClassSource},
 	}
 
@@ -74,6 +75,92 @@ func TestDirectoryTestClassificationIsBroad(t *testing.T) {
 	// A directory whose name merely contains "test" is not a test directory.
 	if got := Classify("src/testing/util.go", "util.go"); got != ClassSource {
 		t.Errorf("Classify(src/testing/util.go) = %v, want ClassSource", got)
+	}
+}
+
+// TestCSharpTestNameNeedsProjectEvidence pins that "Test"/"Tests" in a C# file
+// name is not on its own enough to call the file a test.
+//
+// C# has no _test.go equivalent: nothing about the file name makes the compiler
+// or the test runner treat a type as a test, so "Test" is free to be an
+// ordinary domain noun. The false positives below are real files from a
+// veterinary-certificate codebase where they are plain entity models sitting in
+// a production project; counting them as tests inflated the tests-command
+// denominator and made production code read as test code in grep output.
+//
+// The true positives are the same codebase's actual tests. They stay tests
+// because of where they live, not what they are called — a test project
+// (Foo.Tests, Foo.IntegrationTests, FooDocTests) or a tests/ tree.
+func TestCSharpTestNameNeedsProjectEvidence(t *testing.T) {
+	falsePositives := []struct{ relPath, name string }{
+		// Domain models whose type name happens to end in "Test".
+		{"backend/src/Domains/Leroy.Certificates/Models/LabTest.cs", "LabTest.cs"},
+		{"backend/src/Domains/Leroy.Certificates/Models/CertificateAnimalTest.cs", "CertificateAnimalTest.cs"},
+		// Same shape, other plausible spellings.
+		{"backend/src/Domains/Leroy.Patients/Models/SkinTest.cs", "SkinTest.cs"},
+		{"src/App/Models/StressTest.cs", "StressTest.cs"},
+		{"src/App/Models/LabTests.cs", "LabTests.cs"},
+		// "Latest" ends in "test": neither the file name nor a directory named
+		// "Latest" may trip the C# rule.
+		{"src/App/Models/Latest.cs", "Latest.cs"},
+		{"src/App/Latest/Snapshot.cs", "Snapshot.cs"},
+	}
+	for _, f := range falsePositives {
+		if got := Classify(f.relPath, f.name); got != ClassSource {
+			t.Errorf("Classify(%q) = %v, want ClassSource", f.relPath, got)
+		}
+	}
+
+	truePositives := []struct{ relPath, name string }{
+		// Under a tests/ tree.
+		{"backend/tests/Leroy.Patients.Tests/PatientRepositoryTests.cs", "PatientRepositoryTests.cs"},
+		{"backend/tests/Leroy.Api.IntegrationTests/AuthTests.cs", "AuthTests.cs"},
+		{"backend/tests/Leroy.DocTests/CreateAContactDocTest.cs", "CreateAContactDocTest.cs"},
+		{"backend/tests/Leroy.E2E/AuthSmokeTests.cs", "AuthSmokeTests.cs"},
+		// Test project outside a tests/ tree, dotted and dotless spellings.
+		{"infrastructure.tests/LeroyStackTests.cs", "LeroyStackTests.cs"},
+		{"clients/mobile/tests/Leroy.Mobile.Core.Tests/SessionTests.cs", "SessionTests.cs"},
+		{"src/Foo.UnitTests/BarTests.cs", "BarTests.cs"},
+		{"src/FooTests/Bar.cs", "Bar.cs"},
+		{"src/Foo.Specs/BarSpec.cs", "BarSpec.cs"},
+		// Fixtures and helpers inside a test project stay test-class, matching
+		// TestDirectoryTestClassificationIsBroad.
+		{"backend/tests/Leroy.Platform.Tests/Fixtures/DbFixture.cs", "DbFixture.cs"},
+		{"infrastructure.tests/Helpers.cs", "Helpers.cs"},
+	}
+	for _, f := range truePositives {
+		if got := Classify(f.relPath, f.name); got != ClassTest {
+			t.Errorf("Classify(%q) = %v, want ClassTest", f.relPath, got)
+		}
+	}
+}
+
+// TestNonCSharpTestNamingUnaffected pins that the C# narrowing above is scoped
+// to .cs. Every other language keeps the signal it had, including the ones
+// where a name suffix really is the convention.
+func TestNonCSharpTestNamingUnaffected(t *testing.T) {
+	tests := []struct {
+		relPath, name string
+		want          FileClass
+	}{
+		{"src/parser_test.go", "parser_test.go", ClassTest},
+		{"lib/app_test.exs", "app_test.exs", ClassTest},
+		{"src/app.spec.ts", "app.spec.ts", ClassTest},
+		{"src/test_parser.py", "test_parser.py", ClassTest},
+		{"src/parser_test.rs", "parser_test.rs", ClassTest},
+		{"src/UserTest.java", "UserTest.java", ClassTest},
+		{"src/UserTest.kt", "UserTest.kt", ClassTest},
+		{"src/UserTest.php", "UserTest.php", ClassTest},
+		{"src/UserSpec.scala", "UserSpec.scala", ClassTest},
+		{"src/UserTests.swift", "UserTests.swift", ClassTest},
+		// A Rust module with #[cfg(test)] inside an ordinary file is content,
+		// not name, and was never classified here.
+		{"src/parser.rs", "parser.rs", ClassSource},
+	}
+	for _, tt := range tests {
+		if got := Classify(tt.relPath, tt.name); got != tt.want {
+			t.Errorf("Classify(%q) = %v, want %v", tt.relPath, got, tt.want)
+		}
 	}
 }
 

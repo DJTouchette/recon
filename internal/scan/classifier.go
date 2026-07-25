@@ -218,7 +218,22 @@ func isTestFile(nameNoExt, ext, dir string) bool {
 			return true
 		}
 	case ".cs":
-		if strings.HasSuffix(nameNoExt, "Tests") || strings.HasSuffix(nameNoExt, "Test") {
+		// A C# *name* ending in "Test"/"Tests" is weak evidence and must not
+		// stand on its own. Unlike Go's compiler-enforced _test.go, C# has no
+		// naming convention that makes a file a test; what makes it a test is
+		// living in a test *project* (a .csproj that pulls in xunit/nunit/
+		// mstest). "Test" is also an ordinary domain noun: real examples from a
+		// veterinary-certificate codebase are LabTest.cs (a lab test record
+		// linked to a certificate) and CertificateAnimalTest.cs, both plain
+		// entity models under src/. Classifying those as tests inflated the
+		// denominator of the tests command and made production code read as
+		// test code in grep output.
+		//
+		// So require structural corroboration from the path. The generic
+		// directory sweep below already covers test/, tests/ and Foo.Tests/;
+		// this adds the dotless .NET test-project spellings (FooTests/,
+		// Leroy.DocTests/) that a solution can use outside a tests/ tree.
+		if isDotNetTestProjectDir(dir) {
 			return true
 		}
 	case ".java":
@@ -298,6 +313,34 @@ func isTestFile(nameNoExt, ext, dir string) bool {
 				strings.HasSuffix(lp, ".integrationtests") || strings.HasSuffix(lp, ".unittests") {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// isDotNetTestProjectDir reports whether any component of dir names a .NET test
+// project or a conventional test tree: Foo.Tests, Foo.IntegrationTests,
+// FooTests, Foo.Specs, tests/, spec/ and friends.
+//
+// Only the plural bare suffix ("...Tests") is accepted without a separating
+// dot. "Latest", "Manifest" and "Contest" all end in "test", so accepting a
+// bare singular suffix would sweep in unrelated directories; a singular suffix
+// is only honoured in the dotted project form ("Foo.Test").
+//
+// This is C#-only on purpose. Every other language keeps whatever signal it
+// already had.
+func isDotNetTestProjectDir(dir string) bool {
+	for _, p := range strings.Split(dir, "/") {
+		lp := strings.ToLower(p)
+		switch lp {
+		case "test", "tests", "spec", "specs", "__tests__":
+			return true
+		}
+		if strings.HasSuffix(lp, "tests") || strings.HasSuffix(lp, "specs") {
+			return true
+		}
+		if strings.HasSuffix(lp, ".test") || strings.HasSuffix(lp, ".spec") {
+			return true
 		}
 	}
 	return false
