@@ -146,6 +146,116 @@ func TestDotNetTestProjectSuffixesAndNesting(t *testing.T) {
 		"backend/src/Leroy.Worker/Jobs/ReminderJob.cs")
 }
 
+// --- Crossing a project boundary on an import edge ---
+
+// buildTestMapWithImports writes a tree and returns its test map, with the
+// import graph resolved from the files actually written — so these cases go
+// through the same C# using→namespace resolution the real repo does, not a
+// hand-written edge list.
+func buildTestMapWithImports(t *testing.T, files map[string]string) *TestMap {
+	t.Helper()
+	root, idx := writeTree(t, files)
+	return NewTestMapWithImports(idx, NewDepGraph(root, idx).AllImports())
+}
+
+// razorSolution is the shape the mapping used to be blind to: the Razor page
+// models live in the web project, and the tests for them live in a test project
+// that pairs with a *different* production project (Leroy.Platform). The
+// project-mirror scoping confines name matching to Leroy.Platform, which is
+// correct — reaching into a neighbouring project on a name alone is exactly what
+// the prefix fences forbid — so the only thing that can bridge the gap is the
+// test file's own `using`.
+//
+// Three separate spellings have to line up: the file is Certificates.cshtml.cs
+// (stem "Certificates.cshtml"), the class is CertificatesModel, and the test is
+// CertificatesPageModelTests.cs.
+func razorSolution() map[string]string {
+	return map[string]string{
+		"backend/src/Leroy.Api/Pages/App/Certificates.cshtml.cs": "namespace Leroy.Api.Pages.App;\npublic class CertificatesModel {}\n",
+		"backend/src/Leroy.Api/Pages/App/Contacts.cshtml.cs":     "namespace Leroy.Api.Pages.App;\npublic class ContactsModel {}\n",
+		"backend/src/Leroy.Api/Pages/Verify.cshtml.cs":           "namespace Leroy.Api.Pages;\npublic class VerifyModel {}\n",
+		"backend/src/Leroy.Platform/Auth/TenantContext.cs":       "namespace Leroy.Platform.Auth;\npublic class TenantContext {}\n",
+
+		"backend/tests/Leroy.Platform.Tests/CertificatesPageModelTests.cs": "using Leroy.Api.Pages.App;\nusing Leroy.Platform.Auth;\nnamespace Leroy.Platform.Tests;\npublic class CertificatesPageModelTests {}\n",
+		"backend/tests/Leroy.Platform.Tests/VerifyModelTests.cs":           "using Leroy.Api.Pages;\nnamespace Leroy.Platform.Tests;\npublic class VerifyModelTests {}\n",
+	}
+}
+
+func TestRazorPageModelIsFoundThroughTheImportGraph(t *testing.T) {
+	tm := buildTestMapWithImports(t, razorSolution())
+
+	// "…PageModelTests" → the page model class of Certificates.cshtml.cs.
+	assertMapped(t, tm,
+		"backend/tests/Leroy.Platform.Tests/CertificatesPageModelTests.cs",
+		"backend/src/Leroy.Api/Pages/App/Certificates.cshtml.cs")
+	// "…ModelTests" → the class name the framework derives from the page.
+	assertMapped(t, tm,
+		"backend/tests/Leroy.Platform.Tests/VerifyModelTests.cs",
+		"backend/src/Leroy.Api/Pages/Verify.cshtml.cs")
+}
+
+// Without the import graph the same tree maps nothing new: the edge is what
+// authorises leaving the mirrored project, so a caller that has no graph gets
+// the old, narrower answer rather than a guess.
+func TestRazorPageModelNeedsTheImportEdge(t *testing.T) {
+	tm := buildTestMap(t, razorSolution())
+	const tp = "backend/tests/Leroy.Platform.Tests/CertificatesPageModelTests.cs"
+	if src := tm.SourceFor(tp); src != "" {
+		t.Errorf("mapped %s to %q without an import graph", tp, src)
+	}
+}
+
+// The one `using Leroy.Api.Pages.App` that reaches Certificates.cshtml.cs
+// reaches every other page model in that namespace too, so an import edge can
+// never be a mapping by itself. A test whose name matches two of them declines.
+func TestAmbiguousImportedNameIsNotMapped(t *testing.T) {
+	tm := buildTestMapWithImports(t, map[string]string{
+		"backend/src/Leroy.Api/Pages/App/Forms.cshtml.cs":           "namespace Leroy.Api.Pages.App;\npublic class FormsModel {}\n",
+		"backend/src/Leroy.Api/Pages/Tenant/Forms.cshtml.cs":        "namespace Leroy.Api.Pages.App;\npublic class FormsModel {}\n",
+		"backend/src/Leroy.Platform/Auth/TenantContext.cs":          "namespace Leroy.Platform.Auth;\npublic class TenantContext {}\n",
+		"backend/tests/Leroy.Platform.Tests/FormsPageModelTests.cs": "using Leroy.Api.Pages.App;\nnamespace Leroy.Platform.Tests;\npublic class FormsPageModelTests {}\n",
+	})
+	const tp = "backend/tests/Leroy.Platform.Tests/FormsPageModelTests.cs"
+	src, status := tm.LookupSource(tp)
+	if src != "" {
+		t.Errorf("rivalled imported name mapped %s to %q", tp, src)
+	}
+	if status != TestMapNoMatch {
+		t.Errorf("status for %s = %s, want no_match", tp, status)
+	}
+}
+
+// The fence this tier needs. A test importing a whole namespace has 150+ files
+// in reach, and a shortened stem will find *something* in a pool that size:
+// PatientVaccinationOrchestrationTests shortens to "PatientVaccination" and
+// lands on the domain model, while its real subject is
+// VaccinationCertificateOrchestrationService. Only the full name counts here.
+func TestShortenedNameDoesNotMatchAcrossTheImportGraph(t *testing.T) {
+	tm := buildTestMapWithImports(t, map[string]string{
+		"backend/src/Domains/Leroy.Patients/Models/PatientVaccination.cs":               "namespace Leroy.Patients.Models;\npublic class PatientVaccination {}\n",
+		"backend/src/Leroy.Orchestration/VaccinationCertificateOrchestrationService.cs": "namespace Leroy.Orchestration;\npublic class VaccinationCertificateOrchestrationService {}\n",
+		"backend/src/Leroy.Platform/Auth/TenantContext.cs":                              "namespace Leroy.Platform.Auth;\npublic class TenantContext {}\n",
+		"backend/tests/Leroy.Platform.Tests/PatientVaccinationOrchestrationTests.cs":    "using Leroy.Patients.Models;\nusing Leroy.Orchestration;\nnamespace Leroy.Platform.Tests;\npublic class PatientVaccinationOrchestrationTests {}\n",
+	})
+	const tp = "backend/tests/Leroy.Platform.Tests/PatientVaccinationOrchestrationTests.cs"
+	if src := tm.SourceFor(tp); src != "" {
+		t.Errorf("shortened stem mapped %s to %q across the import graph", tp, src)
+	}
+}
+
+func TestSubjectNames(t *testing.T) {
+	cases := map[string][]string{
+		"src/App/Pages/Certificates.cshtml.cs": {"Certificates.cshtml", "Certificates", "CertificatesModel", "CertificatesPageModel"},
+		"src/App/Counter.razor.cs":             {"Counter.razor", "Counter", "CounterModel", "CounterPageModel"},
+		"src/App/CviController.cs":             {"CviController"},
+	}
+	for path, want := range cases {
+		if got := subjectNames(path); !reflect.DeepEqual(got, want) {
+			t.Errorf("subjectNames(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
+
 // --- Where the prefix rule stops ---
 
 func TestPrefixMatchDoesNotCrossProjects(t *testing.T) {

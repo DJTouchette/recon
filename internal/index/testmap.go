@@ -10,10 +10,13 @@ import (
 
 // TestMap maps source files to their test files and vice versa.
 //
-// Mapping is a heuristic over names and directory layout — recon does not read
-// what a test imports. That makes "no tests" a claim recon frequently cannot
-// support, so every lookup also returns a TestMapStatus separating "there is
-// no test" from "recon has no rules for this file type".
+// Mapping is a heuristic over names and directory layout, with one exception:
+// when the caller supplies the import graph, a test may also be resolved
+// against the files it demonstrably imports (see bestImported). Even then the
+// name has to single a file out — an edge on its own never maps anything. So
+// "no tests" stays a claim recon frequently cannot support, and every lookup
+// also returns a TestMapStatus separating "there is no test" from "recon has
+// no rules for this file type".
 type TestMap struct {
 	sourceToTest map[string][]string
 	testToSource map[string]string
@@ -34,14 +37,25 @@ const (
 	TestMapUnsupported TestMapStatus = "unsupported"
 )
 
-// NewTestMap builds test mappings from the file index.
+// NewTestMap builds test mappings from the file index alone.
+//
+// Prefer NewTestMapWithImports where the import graph is available: without it
+// no test can be tied to a subject outside the project its own project mirrors,
+// because names alone are not evidence enough to cross that boundary.
 func NewTestMap(idx *FileIndex) *TestMap {
+	return NewTestMapWithImports(idx, nil)
+}
+
+// NewTestMapWithImports builds test mappings with the resolved import graph
+// (test/source file → the local files it imports, i.e. DepGraph.AllImports)
+// available as corroborating evidence. A nil map simply disables that tier.
+func NewTestMapWithImports(idx *FileIndex, imports map[string][]string) *TestMap {
 	tm := &TestMap{
 		sourceToTest: make(map[string][]string),
 		testToSource: make(map[string]string),
 	}
 
-	b := newTestMatcher(idx)
+	b := newTestMatcher(idx, imports)
 	for _, t := range idx.ByClass(scan.ClassTest) {
 		src, status := b.find(t)
 		if status == TestMapMapped {
@@ -300,14 +314,20 @@ type testMatcher struct {
 	// tests/Leroy.Platform.Tests find src/Domains/Leroy.Platform, which no
 	// amount of segment rewriting on the test path would ever produce.
 	dirsByName map[string][]string
+	// imports is the resolved import graph, file → local files it imports. It
+	// is the only signal here that is not a name, and the only one that can
+	// take a test outside the project it mirrors. Empty when the caller had no
+	// graph to give, which just disables that tier.
+	imports map[string][]string
 }
 
-func newTestMatcher(idx *FileIndex) *testMatcher {
+func newTestMatcher(idx *FileIndex, imports map[string][]string) *testMatcher {
 	m := &testMatcher{
 		idx:        idx,
 		stems:      newStemIndex(),
 		prefixes:   newStemIndex(),
 		dirsByName: make(map[string][]string),
+		imports:    imports,
 	}
 	// Scripts count as sources here: a shell test's subject is a shell script,
 	// which the scanner classifies as ClassScript, not ClassSource.
@@ -415,6 +435,12 @@ func (m *testMatcher) find(test *scan.FileEntry) (string, TestMapStatus) {
 			return hit, TestMapMapped
 		}
 	}
+	// Nothing in the project this test mirrors answers to its name. The subject
+	// may still exist in a project the test can see, and the import graph is
+	// what says which those are.
+	if hit := m.bestImported(test, conv, exact); hit != "" {
+		return hit, TestMapMapped
+	}
 	// Last resort: the test's name is a *prefix* of the source's rather than a
 	// truncation of it — AprysePdfGoldenTests.cs against
 	// AprysePdfGenerationService.cs. Shortening the test stem can never reach
@@ -444,6 +470,104 @@ func usableAsPrefix(stem, rawTestStem string) bool {
 }
 
 const minPrefixComponents = 2
+
+// bestImported resolves a test against the source files it actually imports.
+//
+// This is the only tier that can leave the project a test project pairs with.
+// That scoping is right for names — reaching into a neighbouring project on a
+// name alone is how AprysePdfRogueTests would claim AprysePdfGenerationService
+// — but it is also why an ASP.NET Core page model is unreachable: the page
+// models live in the web project, and the tests for them live in a test project
+// that mirrors a different one. No rewriting of names or paths bridges that.
+// The import graph does, and with evidence rather than a guess: recon already
+// resolves a C# `using` to the files that declare that namespace, so the test
+// file itself states which production code it can see.
+//
+// The edge alone is nowhere near a mapping. One `using Leroy.Api.Pages.App`
+// pulls in every page model in the application; the tests here import 30–250
+// local files each. So the graph only supplies the *candidate set* and the name
+// still has to single one file out of it, on a full stem match with the
+// language's test affixes stripped.
+//
+// Shortened (fuzzy) stems are deliberately not accepted here, which is the
+// fence this tier needs and the earlier tiers get from directory proximity.
+// Against a 171-file candidate pool "PatientVaccinationOrchestrationTests"
+// shortens to "PatientVaccination" and lands on the domain model of that name,
+// while the test's real subject is VaccinationCertificateOrchestrationService;
+// "CertificateIntegrityBadgeGateTests" shortens all the way to "Certificate".
+// Both are unrivalled, and both are wrong. Requiring the whole name keeps the
+// rule to tests that say what they test.
+//
+// And as in the prefix tier, a rivalled name declines rather than picks.
+func (m *testMatcher) bestImported(test *scan.FileEntry, conv testConvention, stems []string) string {
+	imported := m.imports[test.RelPath]
+	if len(imported) == 0 {
+		return ""
+	}
+
+	byName := make(map[string]map[string]bool)
+	for _, p := range imported {
+		e := m.idx.Get(p)
+		if e == nil || (e.Class != scan.ClassSource && e.Class != scan.ClassScript) {
+			continue
+		}
+		if extRank(conv.srcExts, strings.ToLower(filepath.Ext(p))) < 0 {
+			continue
+		}
+		for _, n := range subjectNames(p) {
+			if byName[n] == nil {
+				byName[n] = make(map[string]bool)
+			}
+			byName[n][p] = true
+		}
+	}
+
+	// stems are ordered most-specific first, so the first one with any hit
+	// decides — including deciding to give up when it is rivalled.
+	for _, stem := range stems {
+		hits := byName[stem]
+		if len(hits) != 1 {
+			continue
+		}
+		for p := range hits {
+			return p
+		}
+	}
+	return ""
+}
+
+// razorMarkupExts are the markup extensions a .NET code-behind file keeps
+// inside its own name: Index.cshtml.cs (Razor Pages / MVC views),
+// Counter.razor.cs (Blazor).
+var razorMarkupExts = []string{".cshtml", ".razor"}
+
+// subjectNames lists the names a source file answers to. Almost always that is
+// just its stem.
+//
+// A .NET code-behind file is the exception, and it is why no amount of trimming
+// on the test side could ever reach one. The file is
+// Pages/App/Certificates.cshtml.cs, so its stem is "Certificates.cshtml" — a
+// name nothing in the codebase is called. The class it declares is
+// CertificatesModel, because the framework derives the class name from the page
+// rather than from the file; and the test written for it is
+// CertificatesPageModelTests.cs, because that class is "the Certificates page
+// model". None of those spellings is reachable from any other by dropping
+// affixes or name components, so the file has to advertise all of them.
+//
+// These aliases are used only by bestImported, never by the name tiers. A page
+// name is a short, generic word — Forms, Contacts, Verify — and letting it into
+// the repo-wide stem index would put it in reach of every rule recon has. Here
+// it is gated behind an import edge and an unrivalled match.
+func subjectNames(relPath string) []string {
+	stem := stemOf(relPath)
+	for _, markup := range razorMarkupExts {
+		page := strings.TrimSuffix(stem, markup)
+		if page != stem && page != "" {
+			return []string{stem, page, page + "Model", page + "PageModel"}
+		}
+	}
+	return []string{stem}
+}
 
 // best picks the strongest source candidate from cands, or "" for none.
 func (m *testMatcher) best(cands []*scan.FileEntry, conv testConvention, testExt string, sc scope, mode matchMode) string {

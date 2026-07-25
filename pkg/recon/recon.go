@@ -777,8 +777,10 @@ func (r *Recon) Rebuild() error {
 
 	// Build all in-memory indexes
 	r.idx = index.NewFileIndex(walkResult.Files)
-	r.tests = index.NewTestMap(r.idx)
+	// Imports before tests: the test map uses the import graph to tie a test to
+	// a subject in a project its own project does not mirror.
 	r.deps = index.NewDepGraph(r.root, r.idx)
+	r.tests = index.NewTestMapWithImports(r.idx, r.deps.AllImports())
 	r.symbols = index.NewSymbolIndex(r.root, r.idx)
 	r.references = index.NewReferenceIndex(r.root, r.idx)
 	r.contextDocs = index.NewContextDocIndex(r.root, r.idx, r.symbols)
@@ -900,25 +902,6 @@ func (r *Recon) Refresh() error {
 		}
 	}
 
-	// Re-derive test map from current file index (cheap, no I/O)
-	r.tests = index.NewTestMap(r.idx)
-	testKinds := make(map[string]string)
-	for testPath := range r.tests.TestToSourceMap() {
-		testKinds[testPath] = index.ClassifyTestKind(testPath)
-	}
-	// Every store write below is checked, and any failure falls back to a full
-	// rebuild.
-	//
-	// These returns used to be discarded, which is what turned a transient
-	// SQLite lock into permanent corruption: a busy DELETE was swallowed, the
-	// matching INSERTs ran anyway and appended duplicate rows, and then
-	// saveMeta() at the end of this function stamped the new HEAD so the cache
-	// reported itself current forever after. The store now surfaces those
-	// errors; dropping them here would put the bug straight back.
-	if err := r.store.SaveTests(r.tests.AllMappings(), r.tests.TestToSourceMap(), testKinds); err != nil {
-		return r.Rebuild()
-	}
-
 	// Re-extract symbols and extras for changed/added source files
 	var newSymbols []index.Symbol
 	if len(changedSourceFiles) > 0 {
@@ -1015,6 +998,28 @@ func (r *Recon) Refresh() error {
 	r.references = index.NewReferenceIndexFromData(snap.References)
 	r.contextDocs = index.NewContextDocIndexFromData(snap.ContextDocs)
 	r.buildExtrasMap(snap.FileExtras)
+
+	// Re-derive the test map from the current file index. It is still cheap and
+	// still does no I/O of its own, but it now reads the import graph, so it has
+	// to be derived after r.deps — deriving it earlier is what would silently
+	// drop every mapping that needs an import edge to cross a project boundary.
+	r.tests = index.NewTestMapWithImports(r.idx, r.deps.AllImports())
+	testKinds := make(map[string]string)
+	for testPath := range r.tests.TestToSourceMap() {
+		testKinds[testPath] = index.ClassifyTestKind(testPath)
+	}
+	// Every store write here is checked, and any failure falls back to a full
+	// rebuild.
+	//
+	// These returns used to be discarded, which is what turned a transient
+	// SQLite lock into permanent corruption: a busy DELETE was swallowed, the
+	// matching INSERTs ran anyway and appended duplicate rows, and then
+	// saveMeta() at the end of this function stamped the new HEAD so the cache
+	// reported itself current forever after. The store now surfaces those
+	// errors; dropping them here would put the bug straight back.
+	if err := r.store.SaveTests(r.tests.AllMappings(), r.tests.TestToSourceMap(), testKinds); err != nil {
+		return r.Rebuild()
+	}
 	if r.cochange == nil {
 		r.cochange = gitpkg.NewCoChangeFromData(snap.CoChangePairs, snap.Churn)
 	}
@@ -1061,8 +1066,10 @@ func (r *Recon) rebuildNoPersist() error {
 	}
 
 	r.idx = index.NewFileIndex(walkResult.Files)
-	r.tests = index.NewTestMap(r.idx)
+	// Imports before tests: the test map uses the import graph to tie a test to
+	// a subject in a project its own project does not mirror.
 	r.deps = index.NewDepGraph(r.root, r.idx)
+	r.tests = index.NewTestMapWithImports(r.idx, r.deps.AllImports())
 	r.symbols = index.NewSymbolIndex(r.root, r.idx)
 	r.references = index.NewReferenceIndex(r.root, r.idx)
 	r.contextDocs = index.NewContextDocIndex(r.root, r.idx, r.symbols)
