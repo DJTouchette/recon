@@ -22,6 +22,32 @@ const (
 	dbFile    = "recon.db"
 	schemaVer = 7
 
+	// analysisVer identifies the *logic* that produced the cached derived data,
+	// as opposed to schemaVer, which identifies the shape of the tables holding
+	// it. Bump it whenever a change alters what recon would compute for an
+	// unchanged file: import resolution, test mapping, symbol extraction,
+	// classification, metrics.
+	//
+	// Without it, a logic fix never reaches an existing cache. Refresh rescans
+	// changed files only — correct for incremental work, and exactly wrong when
+	// the analysis itself changed, because then every file's stored result is
+	// stale while every file's mtime says otherwise. Observed on a 13k-file
+	// repo: after C# usings began classifying third-party namespaces as
+	// External, a cold build reported 11 unresolved imports and `recon refresh`
+	// went on reporting 413 indefinitely. The caveat that fix existed to
+	// silence stayed on screen, and nothing anywhere said the number was
+	// produced by code that no longer exists.
+	//
+	// A mismatch drops and recreates the cache, same as a schema change. That
+	// is affordable because the cache is fully rebuildable from the repo — 7.9s
+	// cold on that same 13k-file repo — and the alternative is serving answers
+	// from retired logic.
+	//
+	// 1: first tracked version. Covers the C# external-vs-unresolved
+	//    classification, the .NET test-project mapping tiers, and the source
+	//    content-scan issue reporting.
+	analysisVer = 1
+
 	// busyTimeoutMS is how long a writer waits for a competing writer's lock
 	// before giving up with SQLITE_BUSY. Several recon processes routinely run
 	// against the same repo (editor plugin, CLI, agent tooling); without this
@@ -193,15 +219,29 @@ type rowQuerier interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
-// schemaUpToDate reports whether the stored schema version matches this build.
-// A missing meta table (fresh DB) or unreadable version means "no".
+// schemaUpToDate reports whether the cached data was produced by this build —
+// both the table shape (schema_version) and the analysis logic that filled them
+// (analysis_version). A missing meta table (fresh DB) or an unreadable or
+// absent version means "no", which is also how a cache written before
+// analysis_version existed is treated: rebuild rather than trust it.
 func (s *Store) schemaUpToDate(q rowQuerier) bool {
-	var versionStr string
-	if err := q.QueryRow("SELECT value FROM meta WHERE key='schema_version'").Scan(&versionStr); err != nil {
-		return false
+	return storedVersion(q, "schema_version") == schemaVer &&
+		storedVersion(q, "analysis_version") == analysisVer
+}
+
+// storedVersion reads an integer meta value, returning -1 when it is absent or
+// unparseable — a sentinel no valid version equals, so unreadable is never
+// mistaken for current.
+func storedVersion(q rowQuerier, key string) int {
+	var raw string
+	if err := q.QueryRow("SELECT value FROM meta WHERE key=?", key).Scan(&raw); err != nil {
+		return -1
 	}
-	v, err := strconv.Atoi(versionStr)
-	return err == nil && v == schemaVer
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return -1
+	}
+	return v
 }
 
 // ensureSchema migrates the database to the current schema version, destroying
@@ -238,6 +278,9 @@ func (s *Store) ensureSchema() error {
 
 	if _, err := tx.Exec("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", strconv.Itoa(schemaVer)); err != nil {
 		return fmt.Errorf("record schema version: %w", err)
+	}
+	if _, err := tx.Exec("INSERT INTO meta (key, value) VALUES ('analysis_version', ?)", strconv.Itoa(analysisVer)); err != nil {
+		return fmt.Errorf("record analysis version: %w", err)
 	}
 
 	return tx.Commit()

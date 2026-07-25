@@ -229,6 +229,101 @@ func TestSchemaMigrationRecreatesOnVersionMismatch(t *testing.T) {
 	}
 }
 
+// A logic change leaves the table shape alone, so schema_version cannot catch
+// it. Without a separate analysis_version the stored results of retired code
+// are served indefinitely: refresh only rescans changed files, and after a
+// resolver fix every file's stored result is stale while every file's mtime
+// says otherwise.
+func TestAnalysisVersionMismatchDropsDerivedData(t *testing.T) {
+	root := t.TempDir()
+	s, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveSnapshot(&Snapshot{Files: []scan.FileEntry{{RelPath: "a.cs", Lang: "csharp"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.HasData() {
+		t.Fatal("expected data before migration")
+	}
+	// Schema shape is current; only the analysis logic has moved on.
+	if v, _ := s.GetMeta("schema_version"); v != strconv.Itoa(schemaVer) {
+		t.Fatalf("precondition: schema_version = %q, want %d", v, schemaVer)
+	}
+	if err := s.SetMeta("analysis_version", strconv.Itoa(analysisVer-1)); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s2, err := Open(root)
+	if err != nil {
+		t.Fatalf("reopen after analysis-version bump: %v", err)
+	}
+	defer s2.Close()
+
+	if s2.HasData() {
+		t.Error("data computed by superseded analysis logic survived; it must be dropped and recomputed")
+	}
+	if v, _ := s2.GetMeta("analysis_version"); v != strconv.Itoa(analysisVer) {
+		t.Errorf("analysis_version = %q, want %d", v, analysisVer)
+	}
+	if err := s2.SaveSnapshot(&Snapshot{Symbols: []index.Symbol{sym("a.cs", "F", 1)}}); err != nil {
+		t.Errorf("post-migration write failed: %v", err)
+	}
+}
+
+// A cache written before analysis_version existed has no such row. Absent must
+// mean rebuild, not "current" — otherwise every cache predating the mechanism
+// permanently escapes it.
+func TestMissingAnalysisVersionIsTreatedAsStale(t *testing.T) {
+	root := t.TempDir()
+	s, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveSnapshot(&Snapshot{Files: []scan.FileEntry{{RelPath: "a.go", Lang: "go"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("DELETE FROM meta WHERE key='analysis_version'"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s2, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	if s2.HasData() {
+		t.Error("cache with no analysis_version was trusted; absent must mean rebuild")
+	}
+}
+
+// Reopening an unchanged cache must not rebuild it — the whole point of the
+// cache is that the common path is cheap.
+func TestMatchingVersionsKeepData(t *testing.T) {
+	root := t.TempDir()
+	s, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveSnapshot(&Snapshot{Files: []scan.FileEntry{{RelPath: "a.go", Lang: "go"}}}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s2, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	if !s2.HasData() {
+		t.Error("an up-to-date cache was dropped; reopening must be a no-op")
+	}
+}
+
 func TestSchemaMigrationFromGarbageVersion(t *testing.T) {
 	root := t.TempDir()
 	s, err := Open(root)
