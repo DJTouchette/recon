@@ -1,6 +1,7 @@
 package detect
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -642,6 +643,18 @@ func issueFor(r *Result, manifest string) (ManifestIssue, bool) {
 	return ManifestIssue{}, false
 }
 
+// issueMatching finds an issue by predicate, for the ones whose Manifest is
+// composed rather than a literal filename (the truncated-sweep issue names a
+// count, not a path).
+func issueMatching(r *Result, pred func(ManifestIssue) bool) (ManifestIssue, bool) {
+	for _, is := range r.ManifestIssues {
+		if pred(is) {
+			return is, true
+		}
+	}
+	return ManifestIssue{}, false
+}
+
 func affects(is ManifestIssue, f Feature) bool {
 	for _, a := range is.Affects {
 		if a == f {
@@ -878,6 +891,115 @@ func TestIncompleteOutranksUnsupported(t *testing.T) {
 	})
 	if r.FrameworkStatus != StatusIncomplete {
 		t.Errorf("framework status = %q, want incomplete", r.FrameworkStatus)
+	}
+}
+
+// --- The source sweep is held to the same standard as the manifests ---
+//
+// Content markers are the fallback that catches a Flask app with no manifest,
+// so a source file the sweep could not open costs what an unreadable manifest
+// costs: the framework and entrypoint lists stop being complete answers. Both
+// of these used to be a bare continue and a bare return.
+
+func TestUnreadableSourceFileIsReportedNotSkipped(t *testing.T) {
+	r := detectRepoWith(t, map[string]string{
+		"go.mod":  "module x\n\ngo 1.22\n",
+		"main.go": "package main\n\nfunc main() {}\n",
+	}, func(t *testing.T, root string) {
+		makeUnreadable(t, root, "secret.go")
+	})
+
+	is, ok := issueFor(r, "secret.go")
+	if !ok {
+		t.Fatalf("unreadable source file skipped silently; issues = %+v", r.ManifestIssues)
+	}
+	if !strings.Contains(is.Reason, "permission denied") {
+		t.Errorf("reason = %q, want permission denied", is.Reason)
+	}
+	if is.Language != "go" {
+		t.Errorf("issue language = %q, want go", is.Language)
+	}
+	// The absolute temp path must not leak in, for the same reason it must not
+	// leak out of a manifest issue: it would make output machine-specific.
+	if strings.Contains(is.Reason, string(filepath.Separator)) {
+		t.Errorf("reason = %q, want no path in it", is.Reason)
+	}
+	if !affects(is, FeatureFrameworks) || !affects(is, FeatureEntrypoints) {
+		t.Errorf("issue affects = %v, want frameworks and entrypoints", is.Affects)
+	}
+
+	// main.go really is an entrypoint, so the list is non-empty and still short:
+	// secret.go was equally free to declare one.
+	assertHas(t, entrypointPaths(r), "main.go")
+	if r.EntrypointStatus != StatusIncomplete {
+		t.Errorf("entrypoint status = %q, want incomplete", r.EntrypointStatus)
+	}
+	if r.FrameworkStatus != StatusIncomplete {
+		t.Errorf("framework status = %q, want incomplete", r.FrameworkStatus)
+	}
+	// go.mod was read fine, and source files never carried dependencies, so this
+	// answer is untouched. An issue that clouded every list would be no more
+	// useful than one that clouded none.
+	if r.DependencyStatus != StatusNoneMatched {
+		t.Errorf("dependency status = %q, want none_matched", r.DependencyStatus)
+	}
+}
+
+func TestContentScanCapIsReportedWhenTheSweepIsTruncated(t *testing.T) {
+	// One file past the cap is enough: what matters is that the sweep stopped
+	// early, not by how much. Staged with real files rather than a lowered
+	// bound, so the constant the shipped binary uses is the one under test.
+	files := map[string]string{"go.mod": "module x\n\ngo 1.22\n"}
+	for i := 0; i <= maxScanFiles; i++ {
+		files[fmt.Sprintf("pkg/f%d.go", i)] = "package pkg\n"
+	}
+	r := detectRepo(t, files)
+
+	is, ok := issueMatching(r, func(is ManifestIssue) bool {
+		return strings.Contains(is.Reason, "cap")
+	})
+	if !ok {
+		t.Fatalf("truncated sweep reported as a whole answer; issues = %+v", r.ManifestIssues)
+	}
+	// The reader cannot act on "some files were skipped" — the issue has to say
+	// how many, out of how many, in which language.
+	if !strings.Contains(is.Manifest, "go source files") {
+		t.Errorf("manifest = %q, want the count of skipped source files", is.Manifest)
+	}
+	if !strings.Contains(is.Reason, fmt.Sprint(maxScanFiles)) {
+		t.Errorf("reason = %q, want the cap named", is.Reason)
+	}
+	if !affects(is, FeatureFrameworks) || !affects(is, FeatureEntrypoints) {
+		t.Errorf("issue affects = %v, want frameworks and entrypoints", is.Affects)
+	}
+	if r.FrameworkStatus != StatusIncomplete {
+		t.Errorf("framework status = %q, want incomplete", r.FrameworkStatus)
+	}
+	if r.EntrypointStatus != StatusIncomplete {
+		t.Errorf("entrypoint status = %q, want incomplete", r.EntrypointStatus)
+	}
+}
+
+func TestReadableSourceSweepProducesNoIssues(t *testing.T) {
+	// The sweep has to stay silent when it succeeds. An issue raised on a
+	// healthy repo would mark every answer incomplete and make the status mean
+	// nothing — the failure mode that costs more than the one it guards against.
+	r := detectRepo(t, map[string]string{
+		"go.mod":            "module x\n\ngo 1.22\n\nrequire github.com/spf13/cobra v1.8.0\n",
+		"main.go":           "package main\n\nfunc main() {}\n",
+		"cmd/serve/main.go": "package main\n\nfunc main() {}\n",
+		"app.py":            "import flask\n",
+		"src/lib.js":        "export const a = 1;\n",
+		"lib/app.ex":        "defmodule App do\nend\n",
+	})
+	if len(r.ManifestIssues) != 0 {
+		t.Fatalf("fully readable repo produced issues: %+v", r.ManifestIssues)
+	}
+	if r.FrameworkStatus != StatusFound {
+		t.Errorf("framework status = %q, want found", r.FrameworkStatus)
+	}
+	if r.EntrypointStatus != StatusFound {
+		t.Errorf("entrypoint status = %q, want found", r.EntrypointStatus)
 	}
 }
 

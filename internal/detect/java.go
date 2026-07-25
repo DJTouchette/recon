@@ -96,10 +96,10 @@ func (d *JavaDetector) Detect(idx *index.FileIndex, root string) DetectorResult 
 		}
 	}
 
-	fw, eps := d.scanSources(idx, root, lang)
+	fw, eps, scanIssues := d.scanSources(idx, root, lang)
 	res.Frameworks = dropSubsumed(append(res.Frameworks, fw...))
 	res.Entrypoints = eps
-	res.ManifestIssues = mr.issues
+	res.ManifestIssues = append(mr.issues, scanIssues...)
 	return res
 }
 
@@ -225,12 +225,12 @@ var jvmSubsumed = map[string]string{
 // <Name>Application.java, so an Application.java/App.java/Main.java filename
 // list misses OrderServiceApplication.java — the single most common JVM
 // entrypoint there is.
-func (d *JavaDetector) scanSources(idx *index.FileIndex, root, lang string) ([]Framework, []Entrypoint) {
+func (d *JavaDetector) scanSources(idx *index.FileIndex, root, lang string) ([]Framework, []Entrypoint, []ManifestIssue) {
 	var fws []Framework
 	var eps []Entrypoint
 	seen := make(map[string]bool)
 
-	scanSource(idx, root, []string{"java", "kotlin"}, func(f *scan.FileEntry, content string) {
+	issues := scanSource(idx, root, []string{"java", "kotlin"}, func(f *scan.FileEntry, content string) {
 		for _, m := range jvmSourceMarkers {
 			if seen[m.name] {
 				continue
@@ -261,5 +261,5 @@ func (d *JavaDetector) scanSources(idx *index.FileIndex, root, lang string) ([]F
 		}
 	})
 
-	return fws, eps
+	return fws, eps, issues
 }

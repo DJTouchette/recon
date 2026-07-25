@@ -89,8 +89,9 @@ func (d *DotNetDetector) Detect(idx *index.FileIndex, root string) DetectorResul
 		}
 	}
 
-	res.Entrypoints = d.entrypoints(idx, root)
-	res.ManifestIssues = mr.issues
+	eps, epIssues := d.entrypoints(idx, root)
+	res.Entrypoints = eps
+	res.ManifestIssues = append(mr.issues, epIssues...)
 	return res
 }
 
@@ -104,7 +105,7 @@ var sdkNames = map[string]string{
 	"Tizen.NET.Sdk":                       "Tizen .NET",
 }
 
-func (d *DotNetDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoint {
+func (d *DotNetDetector) entrypoints(idx *index.FileIndex, root string) ([]Entrypoint, []ManifestIssue) {
 	var eps []Entrypoint
 
 	for _, f := range idx.ByLang("csharp") {
@@ -131,11 +132,11 @@ func (d *DotNetDetector) entrypoints(idx *index.FileIndex, root string) []Entryp
 	}
 
 	// A static Main can live in any file, not just Program.cs.
-	scanSource(idx, root, []string{"csharp"}, func(f *scan.FileEntry, content string) {
+	issues := scanSource(idx, root, []string{"csharp"}, func(f *scan.FileEntry, content string) {
 		if f.Class == scan.ClassSource && csharpMainRe.MatchString(content) {
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
 		}
 	})
 
-	return eps
+	return eps, issues
 }

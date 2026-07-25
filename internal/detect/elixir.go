@@ -40,12 +40,13 @@ func (d *ElixirDetector) Detect(idx *index.FileIndex, root string) DetectorResul
 		}
 	}
 
-	res.Entrypoints = d.entrypoints(idx, root)
-	res.ManifestIssues = mr.issues
+	eps, epIssues := d.entrypoints(idx, root)
+	res.Entrypoints = eps
+	res.ManifestIssues = append(mr.issues, epIssues...)
 	return res
 }
 
-func (d *ElixirDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoint {
+func (d *ElixirDetector) entrypoints(idx *index.FileIndex, root string) ([]Entrypoint, []ManifestIssue) {
 	var eps []Entrypoint
 
 	for _, f := range idx.ByLang("elixir") {
@@ -59,11 +60,11 @@ func (d *ElixirDetector) entrypoints(idx *index.FileIndex, root string) []Entryp
 	}
 
 	// `use Application` is the real marker; the filename is only a convention.
-	scanSource(idx, root, []string{"elixir"}, func(f *scan.FileEntry, content string) {
+	issues := scanSource(idx, root, []string{"elixir"}, func(f *scan.FileEntry, content string) {
 		if strings.Contains(content, "use Application") {
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
 		}
 	})
 
-	return eps
+	return eps, issues
 }

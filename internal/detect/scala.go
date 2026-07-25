@@ -58,14 +58,15 @@ func (d *ScalaDetector) Detect(idx *index.FileIndex, root string) DetectorResult
 		res.Entrypoints = append(res.Entrypoints, Entrypoint{Path: "conf/routes", Kind: "route"})
 	}
 
-	res.Entrypoints = append(res.Entrypoints, d.entrypoints(idx, root)...)
-	res.ManifestIssues = mr.issues
+	eps, epIssues := d.entrypoints(idx, root)
+	res.Entrypoints = append(res.Entrypoints, eps...)
+	res.ManifestIssues = append(mr.issues, epIssues...)
 	return res
 }
 
-func (d *ScalaDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoint {
+func (d *ScalaDetector) entrypoints(idx *index.FileIndex, root string) ([]Entrypoint, []ManifestIssue) {
 	var eps []Entrypoint
-	scanSource(idx, root, []string{"scala"}, func(f *scan.FileEntry, content string) {
+	issues := scanSource(idx, root, []string{"scala"}, func(f *scan.FileEntry, content string) {
 		if f.Class != scan.ClassSource {
 			return
 		}
@@ -77,5 +78,5 @@ func (d *ScalaDetector) entrypoints(idx *index.FileIndex, root string) []Entrypo
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
 		}
 	})
-	return eps
+	return eps, issues
 }

@@ -25,6 +25,8 @@ package detect
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -550,12 +552,33 @@ const (
 // scanSource calls fn with the (bounded) content of every source-class file in
 // one of langs. Iteration order follows the file index, which is walk order,
 // so it is stable across runs.
-func scanSource(idx *index.FileIndex, root string, langs []string, fn func(f *scan.FileEntry, content string)) {
+//
+// It returns the files it could not read and, if the maxScanFiles cap cut the
+// sweep short, one issue naming that. Both used to be a bare `continue` and a
+// bare `return`: a source file that could not be opened simply contributed no
+// markers, and a repo past the cap was scanned partially, in both cases
+// producing a framework list that looked complete and was not. Content markers
+// are the fallback that catches a Flask app with no manifest, so a silent gap
+// here reads as "this framework is not used".
+//
+// The issues use the ManifestIssue shape because they are the same claim — an
+// artifact recon tried to read and could not, and the answers that are
+// therefore incomplete — and reusing it means they flow through the existing
+// sort, dedupe and Affects machinery instead of inventing a parallel channel.
+func scanSource(idx *index.FileIndex, root string, langs []string, fn func(f *scan.FileEntry, content string)) []ManifestIssue {
 	want := make(map[string]bool, len(langs))
 	for _, l := range langs {
 		want[l] = true
 	}
-	n := 0
+	// Several detectors sweep more than one language at once — java.go takes
+	// java+kotlin, node.go javascript+typescript — so the cap issue below names
+	// every language the sweep covered. Taking langs[0] would label a
+	// Kotlin-dominant repo's truncation "java", which is a detail wrong in
+	// exactly the direction that makes a caveat hard to act on.
+	lang := strings.Join(langs, "+")
+
+	var issues []ManifestIssue
+	n, eligible := 0, 0
 	for _, f := range idx.All() {
 		if !want[f.Lang] {
 			continue
@@ -563,31 +586,66 @@ func scanSource(idx *index.FileIndex, root string, langs []string, fn func(f *sc
 		if f.Class != scan.ClassSource && f.Class != scan.ClassScript {
 			continue
 		}
+		eligible++
 		if n >= maxScanFiles {
-			return
+			continue // keep counting so the issue can say how many were skipped
 		}
 		n++
-		content, ok := readBounded(root, f.RelPath)
-		if !ok {
+		content, err := readBounded(root, f.RelPath)
+		if err != nil {
+			issues = append(issues, ManifestIssue{
+				Manifest: f.RelPath,
+				Language: f.Lang,
+				Reason:   readReason(err),
+				Affects:  []Feature{FeatureFrameworks, FeatureEntrypoints},
+			})
 			continue
 		}
 		fn(f, content)
 	}
+
+	if eligible > n {
+		issues = append(issues, ManifestIssue{
+			Manifest: fmt.Sprintf("(%d of %d %s source files)", eligible-n, eligible, lang),
+			Language: lang,
+			Reason:   fmt.Sprintf("content scan stopped at the %d-file cap", maxScanFiles),
+			Affects:  []Feature{FeatureFrameworks, FeatureEntrypoints},
+		})
+	}
+	return issues
 }
 
-// readBounded reads at most maxScanBytes from a file.
-func readBounded(root, rel string) (string, bool) {
+// readBounded reads at most maxScanBytes from a file, returning the error so
+// the caller can name the reason rather than reporting a bare failure.
+func readBounded(root, rel string) (string, error) {
 	fh, err := os.Open(filepath.Join(root, filepath.FromSlash(rel)))
 	if err != nil {
-		return "", false
+		return "", err
 	}
 	defer fh.Close()
 	buf := make([]byte, maxScanBytes)
 	n, err := fh.Read(buf)
-	if n == 0 && err != nil {
-		return "", false
+	if n == 0 && err != nil && !errors.Is(err, io.EOF) {
+		return "", err
 	}
-	return string(buf[:n]), true
+	return string(buf[:n]), nil
+}
+
+// readReason reduces a read error to the short, machine-independent cause the
+// ManifestIssue contract asks for — the full error embeds an absolute path and
+// would make output differ between machines.
+func readReason(err error) string {
+	switch {
+	case errors.Is(err, fs.ErrPermission):
+		return "permission denied"
+	case errors.Is(err, fs.ErrNotExist):
+		return "file disappeared during scan"
+	}
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err.Error()
+	}
+	return err.Error()
 }
 
 // sortedKeys returns a map's keys in sorted order, so map iteration never

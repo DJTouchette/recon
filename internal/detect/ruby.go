@@ -52,12 +52,13 @@ func (d *RubyDetector) Detect(idx *index.FileIndex, root string) DetectorResult 
 		}
 	}
 
-	res.Entrypoints = d.entrypoints(idx, root)
-	res.ManifestIssues = mr.issues
+	eps, epIssues := d.entrypoints(idx, root)
+	res.Entrypoints = eps
+	res.ManifestIssues = append(mr.issues, epIssues...)
 	return res
 }
 
-func (d *RubyDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoint {
+func (d *RubyDetector) entrypoints(idx *index.FileIndex, root string) ([]Entrypoint, []ManifestIssue) {
 	var eps []Entrypoint
 	for _, ef := range []struct{ path, kind string }{
 		{"config.ru", "server"},
@@ -71,7 +72,7 @@ func (d *RubyDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoi
 	}
 
 	// A plain ruby script with the __FILE__ == $0 guard is an entrypoint too.
-	scanSource(idx, root, []string{"ruby"}, func(f *scan.FileEntry, content string) {
+	issues := scanSource(idx, root, []string{"ruby"}, func(f *scan.FileEntry, content string) {
 		if f.Class != scan.ClassSource && f.Class != scan.ClassScript {
 			return
 		}
@@ -80,5 +81,5 @@ func (d *RubyDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoi
 		}
 	})
 
-	return eps
+	return eps, issues
 }

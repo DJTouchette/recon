@@ -44,8 +44,9 @@ func (d *DartDetector) Detect(idx *index.FileIndex, root string) DetectorResult 
 		}
 	}
 
-	res.Entrypoints = d.entrypoints(idx, root)
-	res.ManifestIssues = mr.issues
+	eps, epIssues := d.entrypoints(idx, root)
+	res.Entrypoints = eps
+	res.ManifestIssues = append(mr.issues, epIssues...)
 	return res
 }
 
@@ -80,7 +81,7 @@ func parsePubspecDeps(content string) []pubDependency {
 	return deps
 }
 
-func (d *DartDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoint {
+func (d *DartDetector) entrypoints(idx *index.FileIndex, root string) ([]Entrypoint, []ManifestIssue) {
 	var eps []Entrypoint
 
 	for _, f := range idx.ByLang("dart") {
@@ -90,7 +91,7 @@ func (d *DartDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoi
 		}
 	}
 
-	scanSource(idx, root, []string{"dart"}, func(f *scan.FileEntry, content string) {
+	issues := scanSource(idx, root, []string{"dart"}, func(f *scan.FileEntry, content string) {
 		if f.Class != scan.ClassSource {
 			return
 		}
@@ -104,5 +105,5 @@ func (d *DartDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoi
 		eps = append(eps, Entrypoint{Path: f.RelPath, Kind: kind})
 	})
 
-	return eps
+	return eps, issues
 }

@@ -78,10 +78,10 @@ func (d *PythonDetector) Detect(idx *index.FileIndex, root string) DetectorResul
 		})
 	}
 
-	fw, eps := d.scanSources(idx, root)
+	fw, eps, scanIssues := d.scanSources(idx, root)
 	res.Frameworks = append(res.Frameworks, fw...)
 	res.Entrypoints = append(res.Entrypoints, eps...)
-	res.ManifestIssues = mr.issues
+	res.ManifestIssues = append(mr.issues, scanIssues...)
 	return res
 }
 
@@ -217,12 +217,12 @@ var pySourceMarkers = []struct {
 // pyServerApps mark a module as a server entrypoint.
 var pyServerApps = []string{"Flask(__name__)", "FastAPI(", "Sanic(", "Starlette(", "Application()"}
 
-func (d *PythonDetector) scanSources(idx *index.FileIndex, root string) ([]Framework, []Entrypoint) {
+func (d *PythonDetector) scanSources(idx *index.FileIndex, root string) ([]Framework, []Entrypoint, []ManifestIssue) {
 	var fws []Framework
 	var eps []Entrypoint
 	seen := make(map[string]bool)
 
-	scanSource(idx, root, []string{"python"}, func(f *scan.FileEntry, content string) {
+	issues := scanSource(idx, root, []string{"python"}, func(f *scan.FileEntry, content string) {
 		for _, m := range pySourceMarkers {
 			if seen[m.name] {
 				continue
@@ -255,5 +255,5 @@ func (d *PythonDetector) scanSources(idx *index.FileIndex, root string) ([]Frame
 		}
 	})
 
-	return fws, eps
+	return fws, eps, issues
 }

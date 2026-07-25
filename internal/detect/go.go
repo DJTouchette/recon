@@ -27,7 +27,7 @@ func (d *GoDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
 	if !hasFile(idx, "go.mod") {
 		// Still worth looking for entrypoints: a repo can vendor Go code or
 		// live inside a parent module.
-		res.Entrypoints = d.entrypoints(idx, root)
+		res.Entrypoints, res.ManifestIssues = d.entrypoints(idx, root)
 		return res
 	}
 
@@ -53,8 +53,9 @@ func (d *GoDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
 		}
 	}
 
-	res.Entrypoints = d.entrypoints(idx, root)
-	res.ManifestIssues = mr.issues
+	eps, epIssues := d.entrypoints(idx, root)
+	res.Entrypoints = eps
+	res.ManifestIssues = append(mr.issues, epIssues...)
 	return res
 }
 
@@ -95,9 +96,9 @@ func parseGoMod(content string) []goDep {
 // entrypoints finds every file that declares package main and defines func
 // main(). Filename equality (the old "is it called main.go?" rule) misses
 // cmd/serve.go and friends entirely.
-func (d *GoDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoint {
+func (d *GoDetector) entrypoints(idx *index.FileIndex, root string) ([]Entrypoint, []ManifestIssue) {
 	var eps []Entrypoint
-	scanSource(idx, root, []string{"go"}, func(f *scan.FileEntry, content string) {
+	issues := scanSource(idx, root, []string{"go"}, func(f *scan.FileEntry, content string) {
 		if f.Class != scan.ClassSource {
 			return
 		}
@@ -106,7 +107,7 @@ func (d *GoDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoint
 		}
 		eps = append(eps, Entrypoint{Path: f.RelPath, Kind: goEntryKind(f.RelPath)})
 	})
-	return eps
+	return eps, issues
 }
 
 // goEntryKind labels a main package under a cmd/ directory as a CLI, matching

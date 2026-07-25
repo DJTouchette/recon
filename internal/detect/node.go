@@ -79,9 +79,13 @@ func (d *NodeDetector) Detect(idx *index.FileIndex, root string) DetectorResult 
 		}
 	}
 
-	// With no manifest at all, source imports are the only evidence available.
+	// With no manifest at all, source imports are the only evidence available —
+	// which is also why a file this sweep could not read matters more here than
+	// elsewhere: it was the last remaining witness.
 	if !hasPkg {
-		res.Frameworks = append(res.Frameworks, d.sourceFrameworks(idx, root)...)
+		fw, scanIssues := d.sourceFrameworks(idx, root)
+		res.Frameworks = append(res.Frameworks, fw...)
+		mr.issues = append(mr.issues, scanIssues...)
 	}
 
 	res.Entrypoints = d.entrypoints(idx, pkg, hasPkg)
@@ -148,10 +152,10 @@ var nodeImportMarkers = []struct {
 	{"socket.io", "Socket.IO"},
 }
 
-func (d *NodeDetector) sourceFrameworks(idx *index.FileIndex, root string) []Framework {
+func (d *NodeDetector) sourceFrameworks(idx *index.FileIndex, root string) ([]Framework, []ManifestIssue) {
 	var out []Framework
 	seen := make(map[string]bool)
-	scanSource(idx, root, []string{"javascript", "typescript"}, func(f *scan.FileEntry, content string) {
+	issues := scanSource(idx, root, []string{"javascript", "typescript"}, func(f *scan.FileEntry, content string) {
 		for _, m := range nodeImportMarkers {
 			if seen[m.name] {
 				continue
@@ -169,7 +173,7 @@ func (d *NodeDetector) sourceFrameworks(idx *index.FileIndex, root string) []Fra
 			}
 		}
 	})
-	return out
+	return out, issues
 }
 
 var nodeEntryFiles = []struct {
