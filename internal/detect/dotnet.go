@@ -1,7 +1,6 @@
 package detect
 
 import (
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -11,86 +10,88 @@ import (
 )
 
 var (
-	// Matches <PackageReference Include="Foo.Bar" ... /> or <PackageReference Include="Foo.Bar">
-	packageRefRe = regexp.MustCompile(`<PackageReference\s+Include="([^"]+)"`)
-	// Matches <PackageVersion Include="Foo.Bar" ... /> (Directory.Packages.props central management)
-	packageVerRe = regexp.MustCompile(`<PackageVersion\s+Include="([^"]+)"`)
-	// Matches Sdk="Microsoft.NET.Sdk.Web" or <Project Sdk="...">
+	// <PackageReference Include="Foo.Bar" Version="1.0" />
+	packageRefRe = regexp.MustCompile(`<PackageReference\s+Include="([^"]+)"(?:[^>]*Version="([^"]*)")?`)
+	// <PackageVersion Include="Foo.Bar" Version="1.0" /> (central management)
+	packageVerRe = regexp.MustCompile(`<PackageVersion\s+Include="([^"]+)"(?:[^>]*Version="([^"]*)")?`)
+	// Sdk="Microsoft.NET.Sdk.Web"
 	sdkRe = regexp.MustCompile(`Sdk="([^"]+)"`)
+	// C#'s classic entrypoint signature.
+	csharpMainRe = regexp.MustCompile(`(?m)^\s*(?:public\s+|private\s+|internal\s+)?static\s+(?:async\s+)?(?:void|int|Task|Task<int>)\s+Main\s*\(`)
 )
 
 type DotNetDetector struct{}
 
-func (d *DotNetDetector) DetectFrameworks(idx *index.FileIndex, root string) []Framework {
-	csFiles := idx.ByLang("csharp")
-	if len(csFiles) == 0 {
-		return nil
+func (d *DotNetDetector) Key() string         { return "dotnet" }
+func (d *DotNetDetector) Languages() []string { return []string{"csharp", "fsharp"} }
+
+func (d *DotNetDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
+	var res DetectorResult
+	if len(idx.ByLang("csharp")) == 0 && len(idx.ByLang("fsharp")) == 0 {
+		return res
 	}
 
-	var frameworks []Framework
-	seen := make(map[string]bool)
-
-	addPkg := func(name, evidence string) {
-		if !seen[name] {
-			seen[name] = true
-			frameworks = append(frameworks, Framework{
-				Name:     name,
+	addPkg := func(name, version, manifest string) {
+		res.Dependencies = append(res.Dependencies, Dependency{
+			Name:     name,
+			Version:  version,
+			Language: "csharp",
+			Manifest: manifest,
+		})
+		if fw, ok := nugetFrameworks.lookup(name); ok {
+			res.Frameworks = append(res.Frameworks, Framework{
+				Name:     fw,
 				Language: "csharp",
-				Evidence: evidence,
+				Evidence: manifest + ": " + name,
 			})
 		}
 	}
 
-	// Parse .csproj / .fsproj files
 	for _, f := range idx.ByClass(scan.ClassConfig) {
 		ext := strings.ToLower(filepath.Ext(f.RelPath))
 		if ext != ".csproj" && ext != ".fsproj" {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(root, f.RelPath))
-		if err != nil {
+		content, ok := readManifest(root, f.RelPath)
+		if !ok {
 			continue
 		}
-		content := string(data)
-
-		// Detect SDK type (ASP.NET, MAUI, Worker, Blazor, etc.)
 		for _, m := range sdkRe.FindAllStringSubmatch(content, -1) {
-			sdk := m[1]
-			if name, ok := sdkNames[sdk]; ok {
-				addPkg(name, f.RelPath+": Sdk="+sdk)
+			if name, ok := sdkNames[m[1]]; ok {
+				res.Frameworks = append(res.Frameworks, Framework{
+					Name:     name,
+					Language: "csharp",
+					Evidence: f.RelPath + ": Sdk=" + m[1],
+				})
 			}
 		}
-
-		// Extract all PackageReferences
 		for _, m := range packageRefRe.FindAllStringSubmatch(content, -1) {
-			addPkg(m[1], f.RelPath)
+			addPkg(m[1], m[2], f.RelPath)
 		}
 	}
 
-	// Parse Directory.Build.props and Directory.Packages.props
 	for _, propsFile := range []string{
 		"Directory.Build.props",
 		"Directory.Packages.props",
 		"Directory.Build.targets",
 	} {
-		data, err := os.ReadFile(filepath.Join(root, propsFile))
-		if err != nil {
+		content, ok := readManifest(root, propsFile)
+		if !ok {
 			continue
 		}
-		content := string(data)
 		for _, m := range packageRefRe.FindAllStringSubmatch(content, -1) {
-			addPkg(m[1], propsFile)
+			addPkg(m[1], m[2], propsFile)
 		}
 		for _, m := range packageVerRe.FindAllStringSubmatch(content, -1) {
-			addPkg(m[1], propsFile)
+			addPkg(m[1], m[2], propsFile)
 		}
 	}
 
-	return frameworks
+	res.Entrypoints = d.entrypoints(idx, root)
+	return res
 }
 
 // sdkNames maps well-known SDK identifiers to friendly names.
-// Everything else comes straight from PackageReference parsing.
 var sdkNames = map[string]string{
 	"Microsoft.NET.Sdk.Web":               "ASP.NET Core",
 	"Microsoft.NET.Sdk.BlazorWebAssembly": "Blazor WebAssembly",
@@ -100,7 +101,7 @@ var sdkNames = map[string]string{
 	"Tizen.NET.Sdk":                       "Tizen .NET",
 }
 
-func (d *DotNetDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
+func (d *DotNetDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoint {
 	var eps []Entrypoint
 
 	for _, f := range idx.ByLang("csharp") {
@@ -113,14 +114,11 @@ func (d *DotNetDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
 		case "Startup.cs":
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "server"})
-		case "MauiProgram.cs":
-			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
-		case "App.xaml.cs":
+		case "MauiProgram.cs", "App.xaml.cs":
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
 		case "AppShell.xaml.cs":
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "route"})
 		}
-
 		if strings.HasSuffix(base, "Controller.cs") {
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "handler"})
 		}
@@ -128,6 +126,13 @@ func (d *DotNetDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "handler"})
 		}
 	}
+
+	// A static Main can live in any file, not just Program.cs.
+	scanSource(idx, root, []string{"csharp"}, func(f *scan.FileEntry, content string) {
+		if f.Class == scan.ClassSource && csharpMainRe.MatchString(content) {
+			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
+		}
+	})
 
 	return eps
 }

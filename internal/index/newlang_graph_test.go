@@ -21,7 +21,7 @@ func TestNewLangReferences(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.lang, func(t *testing.T) {
-			refs, ok := extractReferencesTS([]byte(tc.src), "f", tc.lang)
+			refs, _, ok := extractReferencesTS([]byte(tc.src), "f", tc.lang)
 			if !ok {
 				t.Fatalf("%s: references not handled", tc.lang)
 			}
@@ -58,7 +58,7 @@ func TestMoreLangReferences(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.lang, func(t *testing.T) {
-			refs, ok := extractReferencesTS([]byte(tc.src), "f", tc.lang)
+			refs, _, ok := extractReferencesTS([]byte(tc.src), "f", tc.lang)
 			if !ok {
 				t.Fatalf("%s: references not handled", tc.lang)
 			}
@@ -123,10 +123,10 @@ func TestRubyRustTaggedImports(t *testing.T) {
 
 	// And resolution still works end to end.
 	rbIdx := mkPathIdx("lib/app.rb", "lib/auth/session.rb", "lib/util.rb")
-	got := resolveRubySpecs([]string{"rel:../util", "abs:auth/session"}, "lib/sub/x.rb", rbIdx)
+	got := resolveRubySpecs([]string{"rel:../util", "abs:auth/session"}, "lib/sub/x.rb", rbIdx, nil)
 	_ = got // exercise path; detailed resolution covered in depgraph_resolve_test.go
 	ruIdx := mkPathIdx("src/main.rs", "src/foo.rs", "src/foo/bar.rs")
-	if r := resolveRustSpecs([]string{"use:crate::foo::Thing"}, "src/main.rs", ruIdx); len(r) == 0 {
+	if r := resolveRustSpecs([]string{"use:crate::foo::Thing"}, "src/main.rs", ruIdx, nil); len(r) == 0 {
 		t.Errorf("rust resolution produced no edge for crate::foo::Thing (want src/foo.rs)")
 	}
 }
@@ -155,7 +155,7 @@ func TestNewLangImports(t *testing.T) {
 		if !ok {
 			t.Fatal("zig imports not handled")
 		}
-		got := resolveZigSpecs(specs, "app/main.zig", idx)
+		got := resolveZigSpecs(specs, "app/main.zig", idx, nil)
 		if len(got) != 1 || got[0] != "app/util.zig" {
 			t.Errorf("zig: got %v, want [app/util.zig]", got)
 		}
@@ -163,7 +163,7 @@ func TestNewLangImports(t *testing.T) {
 
 	t.Run("lua", func(t *testing.T) {
 		idx := mk("src/main.lua", "src/foo/bar.lua")
-		got := resolveLuaSpecs([]string{"foo.bar"}, "src/main.lua", idx)
+		got := resolveLuaSpecs([]string{"foo.bar"}, "src/main.lua", idx, nil)
 		if len(got) != 1 || got[0] != "src/foo/bar.lua" {
 			t.Errorf("lua: got %v, want [src/foo/bar.lua]", got)
 		}
@@ -171,7 +171,7 @@ func TestNewLangImports(t *testing.T) {
 
 	t.Run("julia", func(t *testing.T) {
 		idx := mk("main.jl", "sub/mod.jl")
-		got := resolveJuliaSpecs([]string{"sub/mod.jl"}, "main.jl", idx)
+		got := resolveJuliaSpecs([]string{`("sub/mod.jl")`}, "main.jl", idx, nil)
 		if len(got) != 1 || got[0] != "sub/mod.jl" {
 			t.Errorf("julia: got %v, want [sub/mod.jl]", got)
 		}
@@ -179,7 +179,7 @@ func TestNewLangImports(t *testing.T) {
 
 	t.Run("shell", func(t *testing.T) {
 		idx := mk("run.sh", "lib.sh")
-		got := resolveShellSpecs([]string{"./lib.sh", "$X/skip.sh"}, "run.sh", idx)
+		got := resolveShellSpecs([]string{`"./lib.sh"`, `"$X/skip.sh"`}, "run.sh", idx, nil)
 		if len(got) != 1 || got[0] != "lib.sh" {
 			t.Errorf("shell: got %v, want [lib.sh]", got)
 		}

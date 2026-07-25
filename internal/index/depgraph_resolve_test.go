@@ -12,6 +12,22 @@ func mkIdx(entries ...scan.FileEntry) *FileIndex {
 	return NewFileIndex(entries)
 }
 
+// mkCtx wraps an index in a resolution context rooted at the current directory.
+// Resolvers that only consult the index work with it directly; the ones that
+// read files (C#, JVM declarations, Elixir) need an on-disk fixture — see
+// newRepoFixture.
+func mkCtx(idx *FileIndex) *resolveCtx {
+	return newResolveCtx("", idx)
+}
+
+// goMods builds the single-module list a non-workspace repo has.
+func goMods(modPath string) []goModule {
+	if modPath == "" {
+		return nil
+	}
+	return []goModule{{Path: modPath}}
+}
+
 // sortedStrings returns a sorted copy of ss.
 func sortedStrings(ss []string) []string {
 	out := make([]string, len(ss))
@@ -38,7 +54,7 @@ func TestResolveGoImports_Basic(t *testing.T) {
 		`)`,
 	}
 
-	got := resolveGoSpecs(goRegexSpecs(lines), "cmd/main.go", "github.com/example/myapp", idx)
+	got := resolveGoSpecs(goRegexSpecs(lines), "cmd/main.go", goMods("github.com/example/myapp"), idx, nil)
 	sort.Strings(got)
 
 	want := []string{
@@ -63,7 +79,7 @@ func TestResolveGoImports_SingleImport(t *testing.T) {
 
 	lines := []string{`import "github.com/acme/app/internal/store"`}
 
-	got := resolveGoSpecs(goRegexSpecs(lines), "main.go", "github.com/acme/app", idx)
+	got := resolveGoSpecs(goRegexSpecs(lines), "main.go", goMods("github.com/acme/app"), idx, nil)
 	if len(got) != 1 || got[0] != "internal/store/store.go" {
 		t.Fatalf("got %v, want [internal/store/store.go]", got)
 	}
@@ -82,7 +98,7 @@ func TestResolveGoImports_SkipsExternalPackages(t *testing.T) {
 		`)`,
 	}
 
-	got := resolveGoSpecs(goRegexSpecs(lines), "main.go", "github.com/example/myapp", idx)
+	got := resolveGoSpecs(goRegexSpecs(lines), "main.go", goMods("github.com/example/myapp"), idx, nil)
 	if len(got) != 0 {
 		t.Fatalf("expected no imports, got %v", got)
 	}
@@ -92,7 +108,7 @@ func TestResolveGoImports_EmptyModPath(t *testing.T) {
 	idx := mkIdx(scan.FileEntry{RelPath: "pkg/auth/auth.go", Lang: "go", Class: scan.ClassSource})
 	lines := []string{`import "github.com/acme/app/pkg/auth"`}
 
-	got := resolveGoSpecs(goRegexSpecs(lines), "main.go", "", idx)
+	got := resolveGoSpecs(goRegexSpecs(lines), "main.go", goMods(""), idx, nil)
 	if len(got) != 0 {
 		t.Fatalf("expected nil/empty when goModPath is empty, got %v", got)
 	}
@@ -108,7 +124,7 @@ func TestResolveGoImports_SkipsTestFiles(t *testing.T) {
 
 	lines := []string{`import "github.com/example/app/pkg/auth"`}
 
-	got := resolveGoSpecs(goRegexSpecs(lines), "main.go", "github.com/example/app", idx)
+	got := resolveGoSpecs(goRegexSpecs(lines), "main.go", goMods("github.com/example/app"), idx, nil)
 	// Should only find the ClassSource file.
 	if len(got) != 1 || got[0] != "pkg/auth/auth.go" {
 		t.Fatalf("got %v, want [pkg/auth/auth.go]", got)
@@ -122,7 +138,7 @@ func TestResolveJSSpecs_RelativeWithExtension(t *testing.T) {
 		scan.FileEntry{RelPath: "src/utils/format.ts", Lang: "typescript", Class: scan.ClassSource},
 	)
 
-	got := resolveJSSpecs([]string{"./utils/format"}, "src/app.ts", idx)
+	got := resolveJSSpecs([]string{"./utils/format"}, "src/app.ts", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "src/utils/format.ts" {
 		t.Fatalf("got %v, want [src/utils/format.ts]", got)
 	}
@@ -133,7 +149,7 @@ func TestResolveJSSpecs_ExactPathWithExtension(t *testing.T) {
 		scan.FileEntry{RelPath: "src/components/Button.tsx", Lang: "typescript", Class: scan.ClassSource},
 	)
 
-	got := resolveJSSpecs([]string{"./components/Button.tsx"}, "src/App.tsx", idx)
+	got := resolveJSSpecs([]string{"./components/Button.tsx"}, "src/App.tsx", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "src/components/Button.tsx" {
 		t.Fatalf("got %v, want [src/components/Button.tsx]", got)
 	}
@@ -144,7 +160,7 @@ func TestResolveJSSpecs_IndexResolution(t *testing.T) {
 		scan.FileEntry{RelPath: "src/utils/index.ts", Lang: "typescript", Class: scan.ClassSource},
 	)
 
-	got := resolveJSSpecs([]string{"./utils"}, "src/app.ts", idx)
+	got := resolveJSSpecs([]string{"./utils"}, "src/app.ts", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "src/utils/index.ts" {
 		t.Fatalf("got %v, want [src/utils/index.ts]", got)
 	}
@@ -155,7 +171,7 @@ func TestResolveJSSpecs_IndexJSFallback(t *testing.T) {
 		scan.FileEntry{RelPath: "lib/helpers/index.js", Lang: "javascript", Class: scan.ClassSource},
 	)
 
-	got := resolveJSSpecs([]string{"./helpers"}, "lib/main.js", idx)
+	got := resolveJSSpecs([]string{"./helpers"}, "lib/main.js", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "lib/helpers/index.js" {
 		t.Fatalf("got %v, want [lib/helpers/index.js]", got)
 	}
@@ -166,7 +182,7 @@ func TestResolveJSSpecs_SkipsExternalModules(t *testing.T) {
 		scan.FileEntry{RelPath: "src/utils.ts", Lang: "typescript", Class: scan.ClassSource},
 	)
 
-	got := resolveJSSpecs([]string{"react", "lodash", "@emotion/react"}, "src/app.ts", idx)
+	got := resolveJSSpecs([]string{"react", "lodash", "@emotion/react"}, "src/app.ts", mkCtx(idx), nil)
 	if len(got) != 0 {
 		t.Fatalf("expected no results for external modules, got %v", got)
 	}
@@ -177,7 +193,7 @@ func TestResolveJSSpecs_ParentDirectory(t *testing.T) {
 		scan.FileEntry{RelPath: "src/shared.ts", Lang: "typescript", Class: scan.ClassSource},
 	)
 
-	got := resolveJSSpecs([]string{"../shared"}, "src/components/Button.tsx", idx)
+	got := resolveJSSpecs([]string{"../shared"}, "src/components/Button.tsx", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "src/shared.ts" {
 		t.Fatalf("got %v, want [src/shared.ts]", got)
 	}
@@ -189,7 +205,7 @@ func TestResolveJSSpecs_Deduplication(t *testing.T) {
 	)
 
 	// Same file resolved from two specifiers
-	got := resolveJSSpecs([]string{"./utils", "./utils.ts"}, "src/app.ts", idx)
+	got := resolveJSSpecs([]string{"./utils", "./utils.ts"}, "src/app.ts", mkCtx(idx), nil)
 	if len(got) != 1 {
 		t.Fatalf("expected deduplication, got %v", got)
 	}
@@ -200,7 +216,7 @@ func TestResolveJSSpecs_MissingFile(t *testing.T) {
 		scan.FileEntry{RelPath: "src/real.ts", Lang: "typescript", Class: scan.ClassSource},
 	)
 
-	got := resolveJSSpecs([]string{"./missing"}, "src/app.ts", idx)
+	got := resolveJSSpecs([]string{"./missing"}, "src/app.ts", mkCtx(idx), nil)
 	if len(got) != 0 {
 		t.Fatalf("expected no results for missing file, got %v", got)
 	}
@@ -214,7 +230,7 @@ func TestResolvePySpecs_SingleDot(t *testing.T) {
 		scan.FileEntry{RelPath: "pkg/models.py", Lang: "python", Class: scan.ClassSource},
 	)
 
-	got := resolvePySpecs([]string{".models"}, "pkg/app.py", idx)
+	got := resolvePySpecs([]string{".models"}, "pkg/app.py", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "pkg/models.py" {
 		t.Fatalf("got %v, want [pkg/models.py]", got)
 	}
@@ -228,7 +244,7 @@ func TestResolvePySpecs_DoubleDot(t *testing.T) {
 		scan.FileEntry{RelPath: "pkg/utils.py", Lang: "python", Class: scan.ClassSource},
 	)
 
-	got := resolvePySpecs([]string{"..utils"}, "pkg/subpkg/views.py", idx)
+	got := resolvePySpecs([]string{"..utils"}, "pkg/subpkg/views.py", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "pkg/utils.py" {
 		t.Fatalf("got %v, want [pkg/utils.py]", got)
 	}
@@ -240,20 +256,29 @@ func TestResolvePySpecs_DoubleDotRootLevel(t *testing.T) {
 		scan.FileEntry{RelPath: "utils.py", Lang: "python", Class: scan.ClassSource},
 	)
 
-	got := resolvePySpecs([]string{"..utils"}, "pkg/views.py", idx)
+	got := resolvePySpecs([]string{"..utils"}, "pkg/views.py", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "utils.py" {
 		t.Fatalf("got %v, want [utils.py]", got)
 	}
 }
 
-func TestResolvePySpecs_SkipsAbsoluteImports(t *testing.T) {
+// Absolute imports are resolved now, but only against files that exist: a
+// third-party package must never become an edge, and must be counted External
+// (an expected non-edge) rather than Unresolved (a dropped edge).
+func TestResolvePySpecs_ThirdPartyAbsoluteImportsAreNotEdges(t *testing.T) {
 	idx := mkIdx(
-		scan.FileEntry{RelPath: "os.py", Lang: "python", Class: scan.ClassSource},
+		scan.FileEntry{RelPath: "app/views.py", Lang: "python", Class: scan.ClassSource},
+		scan.FileEntry{RelPath: "app/models.py", Lang: "python", Class: scan.ClassSource},
 	)
 
-	got := resolvePySpecs([]string{"os", "django.db"}, "app/views.py", idx)
+	tally := &importTally{lang: "python"}
+	got := resolvePySpecs([]string{"imp:os", "mod:django.db", "mod:requests"}, "app/views.py", mkCtx(idx), tally)
 	if len(got) != 0 {
-		t.Fatalf("expected no results for absolute imports, got %v", got)
+		t.Fatalf("expected no results for third-party absolute imports, got %v", got)
+	}
+	st := tally.stats()
+	if st.External != 3 || st.Unresolved != 0 {
+		t.Fatalf("stats = %+v, want 3 external / 0 unresolved", st)
 	}
 }
 
@@ -263,7 +288,7 @@ func TestResolvePySpecs_NestedModule(t *testing.T) {
 		scan.FileEntry{RelPath: "app/api/v1/views.py", Lang: "python", Class: scan.ClassSource},
 	)
 
-	got := resolvePySpecs([]string{".api.v1.views"}, "app/main.py", idx)
+	got := resolvePySpecs([]string{".api.v1.views"}, "app/main.py", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "app/api/v1/views.py" {
 		t.Fatalf("got %v, want [app/api/v1/views.py]", got)
 	}
@@ -274,7 +299,7 @@ func TestResolvePySpecs_Deduplication(t *testing.T) {
 		scan.FileEntry{RelPath: "pkg/models.py", Lang: "python", Class: scan.ClassSource},
 	)
 
-	got := resolvePySpecs([]string{".models", ".models"}, "pkg/app.py", idx)
+	got := resolvePySpecs([]string{".models", ".models"}, "pkg/app.py", mkCtx(idx), nil)
 	if len(got) != 1 {
 		t.Fatalf("expected deduplication, got %v", got)
 	}
@@ -325,7 +350,7 @@ func TestResolveJavaImports_Basic(t *testing.T) {
 		"import com.example.UserService;",
 	}
 
-	got := resolveJavaSpecs(javaRegexSpecs(lines), "src/main/java/com/example/UserController.java", "java", idx)
+	got := resolveJavaSpecs(javaRegexSpecs(lines), "src/main/java/com/example/UserController.java", "java", mkCtx(idx), nil)
 	sort.Strings(got)
 
 	want := []string{
@@ -348,7 +373,7 @@ func TestResolveJavaImports_StaticImport(t *testing.T) {
 	)
 
 	lines := []string{"import static com.example.MathUtils.pow;"}
-	got := resolveJavaSpecs(javaRegexSpecs(lines), "src/main/java/com/example/Calculator.java", "java", idx)
+	got := resolveJavaSpecs(javaRegexSpecs(lines), "src/main/java/com/example/Calculator.java", "java", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "src/main/java/com/example/MathUtils.java" {
 		t.Fatalf("got %v, want [src/main/java/com/example/MathUtils.java]", got)
 	}
@@ -363,7 +388,7 @@ func TestResolveJavaImports_SkipsStdLib(t *testing.T) {
 		"import java.util.List;",
 		"import javax.servlet.http.HttpServlet;",
 	}
-	got := resolveJavaSpecs(javaRegexSpecs(lines), "src/Foo.java", "java", idx)
+	got := resolveJavaSpecs(javaRegexSpecs(lines), "src/Foo.java", "java", mkCtx(idx), nil)
 	if len(got) != 0 {
 		t.Fatalf("expected no results for stdlib imports, got %v", got)
 	}
@@ -375,7 +400,7 @@ func TestResolveJavaImports_RootLevelFallback(t *testing.T) {
 	)
 
 	lines := []string{"import com.example.Config;"}
-	got := resolveJavaSpecs(javaRegexSpecs(lines), "com/example/Main.java", "java", idx)
+	got := resolveJavaSpecs(javaRegexSpecs(lines), "com/example/Main.java", "java", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "com/example/Config.java" {
 		t.Fatalf("got %v, want [com/example/Config.java]", got)
 	}
@@ -388,7 +413,7 @@ func TestResolveJavaImports_KotlinLang(t *testing.T) {
 
 	// Kotlin imports don't have semicolons
 	lines := []string{"import com.example.Repository"}
-	got := resolveJavaSpecs(kotlinRegexSpecs(lines), "src/main/kotlin/com/example/Service.kt", "kotlin", idx)
+	got := resolveJavaSpecs(kotlinRegexSpecs(lines), "src/main/kotlin/com/example/Service.kt", "kotlin", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "src/main/kotlin/com/example/Repository.kt" {
 		t.Fatalf("got %v, want [src/main/kotlin/com/example/Repository.kt]", got)
 	}
@@ -401,24 +426,27 @@ func TestResolveJavaImports_SkipsSelf(t *testing.T) {
 
 	lines := []string{"import com.example.User;"}
 	// The file itself is in the same location — should not self-reference.
-	got := resolveJavaSpecs(javaRegexSpecs(lines), "src/main/java/com/example/User.java", "java", idx)
+	got := resolveJavaSpecs(javaRegexSpecs(lines), "src/main/java/com/example/User.java", "java", mkCtx(idx), nil)
 	if len(got) != 0 {
 		t.Fatalf("expected no self-reference, got %v", got)
 	}
 }
 
 // ─── C# resolver ─────────────────────────────────────────────────────────────
+//
+// C# resolution reads the namespace each file declares, so these tests need
+// real files rather than a path-only index.
 
-func TestResolveCSharpImports_SlashedDirectoryMatch(t *testing.T) {
-	// using Public.Common.Services → look for files under Public/Common/Services/
-	idx := mkIdx(
-		scan.FileEntry{RelPath: "Public/Common/Services/AuthService.cs", Lang: "csharp", Class: scan.ClassSource},
-		scan.FileEntry{RelPath: "Public/Common/Services/UserService.cs", Lang: "csharp", Class: scan.ClassSource},
-	)
+func TestResolveCSharpImports_DeclaredNamespace(t *testing.T) {
+	root, idx, rc := newRepoFixture(t, map[string]string{
+		"Public/Common/Services/AuthService.cs": "namespace Public.Common.Services;\npublic class AuthService {}\n",
+		"Public/Common/Services/UserService.cs": "namespace Public.Common.Services;\npublic class UserService {}\n",
+		"OtherProject/Startup.cs":               "using Public.Common.Services;\n",
+	})
+	_ = root
 
 	lines := []string{"using Public.Common.Services;"}
-	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "OtherProject/Startup.cs", idx)
-	sort.Strings(got)
+	got := sortedStrings(resolveCSharpSpecs(csharpRegexSpecs(lines), "OtherProject/Startup.cs", rc, nil))
 
 	want := []string{
 		"Public/Common/Services/AuthService.cs",
@@ -432,64 +460,109 @@ func TestResolveCSharpImports_SlashedDirectoryMatch(t *testing.T) {
 			t.Errorf("got[%d] = %q, want %q", i, g, want[i])
 		}
 	}
+	_ = idx
+}
+
+func TestResolveCSharpImports_BlockNamespace(t *testing.T) {
+	// The block form `namespace A.B { ... }` must be read too.
+	_, _, rc := newRepoFixture(t, map[string]string{
+		"src/Widgets/Widget.cs": "namespace Acme.Widgets\n{\n    public class Widget {}\n}\n",
+		"src/App/Program.cs":    "using Acme.Widgets;\n",
+	})
+
+	got := resolveCSharpSpecs(csharpRegexSpecs([]string{"using Acme.Widgets;"}), "src/App/Program.cs", rc, nil)
+	if len(got) != 1 || got[0] != "src/Widgets/Widget.cs" {
+		t.Fatalf("got %v, want [src/Widgets/Widget.cs]", got)
+	}
 }
 
 func TestResolveCSharpImports_SkipsSystemNamespaces(t *testing.T) {
-	idx := mkIdx(
-		scan.FileEntry{RelPath: "System/Linq/Enumerable.cs", Lang: "csharp", Class: scan.ClassSource},
-	)
+	_, _, rc := newRepoFixture(t, map[string]string{
+		"System/Linq/Enumerable.cs": "namespace System.Linq;\npublic class Enumerable {}\n",
+		"src/App.cs":                "using System;\n",
+	})
 
 	lines := []string{
 		"using System;",
 		"using System.Linq;",
 		"using Microsoft.Extensions.DependencyInjection;",
 	}
-	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "src/App.cs", idx)
+	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "src/App.cs", rc, nil)
 	if len(got) != 0 {
 		t.Fatalf("expected no results for system namespaces, got %v", got)
 	}
 }
 
-func TestResolveCSharpImports_SuffixMatching(t *testing.T) {
-	// Strategy 2: directory suffix matching.
-	// using MyApp.Domain.Models → matches any file in a dir ending with "Domain/Models"
-	idx := mkIdx(
-		scan.FileEntry{RelPath: "src/MyApp.Domain/Models/User.cs", Lang: "csharp", Class: scan.ClassSource},
-		scan.FileEntry{RelPath: "src/MyApp.Domain/Models/Order.cs", Lang: "csharp", Class: scan.ClassSource},
-	)
+// The defect this replaces: when the direct directory match failed, every .cs
+// file whose directory merely *ended* in one of the last 1–3 lowercased
+// namespace segments became an edge, without ever reading a namespace. One
+// `using MyApp.Models;` produced three edges, two of them pointing at unrelated
+// projects. The negative assertion below is the point of the test.
+func TestResolveCSharpImports_DoesNotMatchDirectoryNames(t *testing.T) {
+	_, _, rc := newRepoFixture(t, map[string]string{
+		"src/Domain/Models/User.cs":  "namespace MyApp.Models;\npublic class User {}\n",
+		"src/Legacy/Models/Thing.cs": "namespace Legacy.Models;\npublic class Thing {}\n",
+		"src/Old/Models/Widget.cs":   "namespace Totally.Unrelated.Models\n{\n public class Widget {}\n}\n",
+		"src/Web/Startup.cs":         "using MyApp.Models;\n",
+	})
 
-	lines := []string{"using MyApp.Domain.Models;"}
-	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "src/MyApp.Web/Controllers/UserController.cs", idx)
-	sort.Strings(got)
+	got := resolveCSharpSpecs(csharpRegexSpecs([]string{"using MyApp.Models;"}), "src/Web/Startup.cs", rc, nil)
 
-	if len(got) == 0 {
-		t.Skip("C# heuristic did not match — known limitation of suffix strategy")
+	if len(got) != 1 || got[0] != "src/Domain/Models/User.cs" {
+		t.Fatalf("got %v, want exactly [src/Domain/Models/User.cs]", got)
 	}
 	for _, g := range got {
-		if g == "src/MyApp.Web/Controllers/UserController.cs" {
-			t.Errorf("self-reference included: %q", g)
+		if g == "src/Legacy/Models/Thing.cs" || g == "src/Old/Models/Widget.cs" {
+			t.Errorf("fabricated edge to a directory that merely ends in Models: %q", g)
 		}
 	}
 }
 
-func TestResolveCSharpImports_UsingStatic(t *testing.T) {
-	idx := mkIdx(
-		scan.FileEntry{RelPath: "src/App/MathHelpers.cs", Lang: "csharp", Class: scan.ClassSource},
-	)
+func TestResolveCSharpImports_UnresolvedIsReported(t *testing.T) {
+	_, _, rc := newRepoFixture(t, map[string]string{
+		"src/Web/Startup.cs": "using MyApp.Nowhere;\n",
+	})
 
-	lines := []string{"using static App.MathHelpers;"}
-	// Should match strategy-2 suffix on "MathHelpers" or "App/MathHelpers"
-	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "src/App/Calculator.cs", idx)
-	_ = got // result depends on which segment suffixes match; just ensure no panic
+	tally := &importTally{lang: "csharp"}
+	got := resolveCSharpSpecs(csharpRegexSpecs([]string{"using MyApp.Nowhere;"}), "src/Web/Startup.cs", rc, tally)
+	if len(got) != 0 {
+		t.Fatalf("expected no edges, got %v", got)
+	}
+	st := tally.stats()
+	if st.Extracted != 1 || st.Unresolved != 1 || st.Resolved != 0 {
+		t.Fatalf("stats = %+v, want 1 extracted / 1 unresolved", st)
+	}
+	if len(st.UnresolvedSpecs) != 1 || st.UnresolvedSpecs[0] != "MyApp.Nowhere" {
+		t.Errorf("unresolved specs = %v, want [MyApp.Nowhere]", st.UnresolvedSpecs)
+	}
+}
+
+func TestResolveCSharpImports_UsingStatic(t *testing.T) {
+	// `using static App.MathHelpers;` names a type in namespace App; it is
+	// accepted only on an exact file-name match inside that namespace.
+	_, _, rc := newRepoFixture(t, map[string]string{
+		"src/App/MathHelpers.cs": "namespace App;\npublic static class MathHelpers {}\n",
+		"src/App/Other.cs":       "namespace App;\npublic class Other {}\n",
+		"src/App/Calculator.cs":  "namespace App;\n",
+	})
+
+	got := resolveCSharpSpecs(csharpRegexSpecs([]string{"using static App.MathHelpers;"}), "src/App/Calculator.cs", rc, nil)
+	if len(got) != 1 || got[0] != "src/App/MathHelpers.cs" {
+		t.Fatalf("got %v, want [src/App/MathHelpers.cs]", got)
+	}
+	for _, g := range got {
+		if g == "src/App/Other.cs" {
+			t.Errorf("using static pulled in an unrelated file in the same namespace: %q", g)
+		}
+	}
 }
 
 func TestResolveCSharpImports_SkipsSelf(t *testing.T) {
-	idx := mkIdx(
-		scan.FileEntry{RelPath: "src/Models/User.cs", Lang: "csharp", Class: scan.ClassSource},
-	)
+	_, _, rc := newRepoFixture(t, map[string]string{
+		"src/Models/User.cs": "namespace Models;\npublic class User {}\n",
+	})
 
-	lines := []string{"using Models;"}
-	got := resolveCSharpSpecs(csharpRegexSpecs(lines), "src/Models/User.cs", idx)
+	got := resolveCSharpSpecs(csharpRegexSpecs([]string{"using Models;"}), "src/Models/User.cs", rc, nil)
 	for _, g := range got {
 		if g == "src/Models/User.cs" {
 			t.Errorf("self-reference included in result")
@@ -686,7 +759,7 @@ func TestResolvePHPImports_DirectPath(t *testing.T) {
 
 	lines := []string{"use App\\Models\\User;"}
 	// Strategy 2: direct path (App/Models/User.php)
-	got := resolvePHPSpecs(phpRegexSpecs(lines), "App/Controllers/UserController.php", "", idx)
+	got := resolvePHPSpecs(phpRegexSpecs(lines), "App/Controllers/UserController.php", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "App/Models/User.php" {
 		t.Fatalf("got %v, want [App/Models/User.php]", got)
 	}
@@ -699,7 +772,7 @@ func TestResolvePHPImports_StripFirstSegment(t *testing.T) {
 	)
 
 	lines := []string{"use App\\Models\\Order;"}
-	got := resolvePHPSpecs(phpRegexSpecs(lines), "src/Controllers/OrderController.php", "", idx)
+	got := resolvePHPSpecs(phpRegexSpecs(lines), "src/Controllers/OrderController.php", mkCtx(idx), nil)
 	if len(got) != 1 || got[0] != "src/Models/Order.php" {
 		t.Fatalf("got %v, want [src/Models/Order.php]", got)
 	}
@@ -714,7 +787,7 @@ func TestResolvePHPImports_SkipsBuiltinNamespaces(t *testing.T) {
 		"use Psr\\Log\\LoggerInterface;",
 		"use Symfony\\Component\\HttpFoundation\\Request;",
 	}
-	got := resolvePHPSpecs(phpRegexSpecs(lines), "src/Service.php", "", idx)
+	got := resolvePHPSpecs(phpRegexSpecs(lines), "src/Service.php", mkCtx(idx), nil)
 	if len(got) != 0 {
 		t.Fatalf("expected no results for builtin namespaces, got %v", got)
 	}
@@ -726,7 +799,7 @@ func TestResolvePHPImports_SkipsSelf(t *testing.T) {
 	)
 
 	lines := []string{"use App\\Models\\User;"}
-	got := resolvePHPSpecs(phpRegexSpecs(lines), "App/Models/User.php", "", idx)
+	got := resolvePHPSpecs(phpRegexSpecs(lines), "App/Models/User.php", mkCtx(idx), nil)
 	for _, g := range got {
 		if g == "App/Models/User.php" {
 			t.Errorf("self-reference included")
@@ -742,7 +815,7 @@ func TestResolveScalaImports_Basic(t *testing.T) {
 	)
 
 	lines := []string{"import com.example.User"}
-	got := resolveScalaSpecs(scalaRegexSpecs(lines), "src/main/scala/com/example/Service.scala", idx)
+	got := resolveScalaSpecs(scalaRegexSpecs(lines), "src/main/scala/com/example/Service.scala", idx, nil)
 	if len(got) != 1 || got[0] != "src/main/scala/com/example/User.scala" {
 		t.Fatalf("got %v, want [src/main/scala/com/example/User.scala]", got)
 	}
@@ -756,7 +829,7 @@ func TestResolveScalaImports_WildcardDirectory(t *testing.T) {
 
 	// Wildcard import: import com.example.models._
 	lines := []string{"import com.example.models.{User, Order}"}
-	got := resolveScalaSpecs(scalaRegexSpecs(lines), "src/main/scala/com/example/Service.scala", idx)
+	got := resolveScalaSpecs(scalaRegexSpecs(lines), "src/main/scala/com/example/Service.scala", idx, nil)
 	sort.Strings(got)
 
 	if len(got) == 0 {
@@ -770,7 +843,7 @@ func TestResolveScalaImports_SkipsStdLib(t *testing.T) {
 	)
 
 	lines := []string{"import scala.collection.mutable.Map"}
-	got := resolveScalaSpecs(scalaRegexSpecs(lines), "src/main/scala/App.scala", idx)
+	got := resolveScalaSpecs(scalaRegexSpecs(lines), "src/main/scala/App.scala", idx, nil)
 	if len(got) != 0 {
 		t.Fatalf("expected no results for scala stdlib, got %v", got)
 	}
@@ -782,7 +855,7 @@ func TestResolveScalaImports_SkipsSelf(t *testing.T) {
 	)
 
 	lines := []string{"import com.example.User"}
-	got := resolveScalaSpecs(scalaRegexSpecs(lines), "src/main/scala/com/example/User.scala", idx)
+	got := resolveScalaSpecs(scalaRegexSpecs(lines), "src/main/scala/com/example/User.scala", idx, nil)
 	for _, g := range got {
 		if g == "src/main/scala/com/example/User.scala" {
 			t.Errorf("self-reference included")

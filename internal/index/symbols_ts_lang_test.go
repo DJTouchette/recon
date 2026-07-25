@@ -233,7 +233,7 @@ fn helper() void {}
 
 	for _, tc := range cases {
 		t.Run(tc.lang, func(t *testing.T) {
-			syms, ok := extractSymbolsTS([]byte(tc.src), "f."+tc.lang, tc.lang)
+			syms, _, ok := extractSymbolsTS([]byte(tc.src), "f."+tc.lang, tc.lang)
 			if !ok {
 				t.Fatalf("%s: not handled by tree-sitter", tc.lang)
 			}

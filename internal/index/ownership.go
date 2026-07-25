@@ -21,8 +21,8 @@ type Ownership struct {
 }
 
 type compiledOwnerRule struct {
-	rule     OwnerRule
-	matchFn  func(string) bool
+	rule    OwnerRule
+	matchFn func(string) bool
 }
 
 // ParseCodeowners finds and parses the CODEOWNERS file from standard locations.

@@ -57,7 +57,7 @@ func main() {
 
 	for _, tc := range cases {
 		t.Run(tc.lang, func(t *testing.T) {
-			refs, ok := extractReferencesTS([]byte(tc.src), "f."+tc.lang, tc.lang)
+			refs, _, ok := extractReferencesTS([]byte(tc.src), "f."+tc.lang, tc.lang)
 			if !ok {
 				t.Fatalf("%s: not handled by tree-sitter refs", tc.lang)
 			}

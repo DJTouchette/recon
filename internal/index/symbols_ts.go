@@ -8,8 +8,8 @@ import (
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 
-	ts_c "github.com/tree-sitter/tree-sitter-c/bindings/go"
 	ts_csharp "github.com/tree-sitter/tree-sitter-c-sharp/bindings/go"
+	ts_c "github.com/tree-sitter/tree-sitter-c/bindings/go"
 	ts_cpp "github.com/tree-sitter/tree-sitter-cpp/bindings/go"
 	ts_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
 	ts_java "github.com/tree-sitter/tree-sitter-java/bindings/go"
@@ -24,8 +24,8 @@ import (
 	ts_kotlin "github.com/tree-sitter-grammars/tree-sitter-kotlin/bindings/go"
 	ts_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
 
-	ts_bash "github.com/tree-sitter/tree-sitter-bash/bindings/go"
 	ts_zig "github.com/tree-sitter-grammars/tree-sitter-zig/bindings/go"
+	ts_bash "github.com/tree-sitter/tree-sitter-bash/bindings/go"
 	ts_julia "github.com/tree-sitter/tree-sitter-julia/bindings/go"
 )
 
@@ -59,22 +59,43 @@ var tsRegistry = map[string]*tsLang{}
 // shared freely; each goroutine gets its own parser and query cursor.
 var tsParserPool = sync.Pool{New: func() any { return tree_sitter.NewParser() }}
 
-// tsGrammar pairs a recon language key with a grammar pointer and its query
-// file. Some grammars expose more than one language (TypeScript/TSX, PHP); we
-// pick the variant that parses the broadest set of files recon classifies under
-// that key (TSX parses both .ts and .tsx; the full PHP grammar handles inline
-// HTML).
+// tsxLangKey is the registry key for the TSX grammar. It is not a recon
+// language of its own — scan.LangFromExt reports "typescript" for both .ts and
+// .tsx — but the two need different grammars, so TSX gets its own registry
+// entry that grammarCandidates selects by file extension.
+const tsxLangKey = "tsx"
+
+// tsGrammar pairs a registry key with a grammar pointer and its query file.
+// Some grammars expose more than one language (TypeScript/TSX, PHP). Where the
+// variants are interchangeable we pick the broadest (the full PHP grammar
+// handles inline HTML); where they are not, each variant gets its own key.
+//
+// TypeScript and TSX are the "not interchangeable" case. TSX reinterprets `<`
+// as the start of a JSX element, so it cannot parse the angle-bracket type
+// assertion `<number>x` that is legal in .ts. Registering TSX for all of
+// "typescript" meant every .ts file using a legacy cast parsed into a tree full
+// of ERROR nodes and lost most of its declarations.
 type tsGrammar struct {
 	lang    string
 	langPtr unsafe.Pointer
 	query   string // filename under queries/
 }
 
+// refQueryFile is the refs query for this grammar, under queries/refs/. TSX
+// shares TypeScript's queries; every other grammar uses its own key.
+func (g tsGrammar) refQueryFile() string {
+	if g.lang == tsxLangKey {
+		return "typescript.scm"
+	}
+	return g.lang + ".scm"
+}
+
 var tsGrammars = []tsGrammar{
 	{"go", ts_go.Language(), "go.scm"},
 	{"python", ts_python.Language(), "python.scm"},
 	{"javascript", ts_js.Language(), "javascript.scm"},
-	{"typescript", ts_ts.LanguageTSX(), "typescript.scm"},
+	{"typescript", ts_ts.LanguageTypescript(), "typescript.scm"},
+	{tsxLangKey, ts_ts.LanguageTSX(), "typescript.scm"},
 	{"rust", ts_rust.Language(), "rust.scm"},
 	{"ruby", ts_ruby.Language(), "ruby.scm"},
 	{"java", ts_java.Language(), "java.scm"},
@@ -119,24 +140,84 @@ func hasTSLang(lang string) bool {
 	return ok
 }
 
-// extractSymbolsTS parses source with the registered grammar for lang and
+// tsParseResult describes the parse behind a symbol list: which grammar was
+// used and whether the resulting tree was free of syntax errors.
+type tsParseResult struct {
+	key   string
+	clean bool
+}
+
+// extractWithGrammars runs each candidate grammar in turn and returns the best
+// result. A clean parse wins immediately; when no candidate parses cleanly the
+// one with the most symbols is kept, and the result is flagged partial so the
+// caller can say so rather than presenting a truncated list as complete.
+//
+// Candidates after the first only run when the earlier ones did not parse
+// cleanly, except for genuinely ambiguous extensions (.h) where every candidate
+// is tried and compared. That keeps the common case at exactly one parse.
+func extractWithGrammars(source []byte, relPath string, candidates []string) ([]Symbol, tsParseResult, bool) {
+	var (
+		best     []Symbol
+		bestRes  tsParseResult
+		haveBest bool
+		compare  = len(candidates) > 1 && ambiguousGrammar(relPath)
+	)
+
+	for _, key := range candidates {
+		syms, res, ok := extractSymbolsTS(source, relPath, key)
+		if !ok {
+			continue
+		}
+		if !haveBest || betterParse(syms, res, best, bestRes) {
+			best, bestRes, haveBest = syms, res, true
+		}
+		// Stop at the first clean parse unless the extension is ambiguous, in
+		// which case a later grammar may still find strictly more.
+		if res.clean && !compare {
+			break
+		}
+	}
+	return best, bestRes, haveBest
+}
+
+// betterParse reports whether candidate (a) should replace the incumbent (b):
+// a clean parse always beats a partial one, otherwise more symbols wins.
+func betterParse(a []Symbol, ares tsParseResult, b []Symbol, bres tsParseResult) bool {
+	if ares.clean != bres.clean {
+		return ares.clean
+	}
+	return len(a) > len(b)
+}
+
+// ambiguousGrammar reports whether a path's extension is claimed by more than
+// one language, so every candidate grammar must be tried and compared instead
+// of stopping at the first one that happens to parse.
+func ambiguousGrammar(relPath string) bool {
+	return strings.HasSuffix(strings.ToLower(relPath), ".h")
+}
+
+// extractSymbolsTS parses source with the grammar registered under key and
 // returns its symbols. The bool is false when no grammar is registered (the
-// caller should fall back to regex) or the parse fails outright.
-func extractSymbolsTS(source []byte, relPath, lang string) ([]Symbol, bool) {
-	tl := tsRegistry[lang]
+// caller should fall back to regex) or the parse fails outright. The
+// tsParseResult reports whether the tree was free of ERROR/MISSING nodes — a
+// tree with errors still yields whatever the query could match, but that list
+// is incomplete and must not be presented as authoritative.
+func extractSymbolsTS(source []byte, relPath, key string) ([]Symbol, tsParseResult, bool) {
+	res := tsParseResult{key: key}
+	tl := tsRegistry[key]
 	if tl == nil {
-		return nil, false
+		return nil, res, false
 	}
 
 	p := tsParserPool.Get().(*tree_sitter.Parser)
 	defer tsParserPool.Put(p)
 	if err := p.SetLanguage(tl.lang); err != nil {
-		return nil, false
+		return nil, res, false
 	}
 
 	tree := p.Parse(source, nil)
 	if tree == nil {
-		return nil, false
+		return nil, res, false
 	}
 	defer tree.Close()
 
@@ -144,6 +225,8 @@ func extractSymbolsTS(source []byte, relPath, lang string) ([]Symbol, bool) {
 	defer qc.Close()
 
 	root := tree.RootNode()
+	// HasError covers ERROR nodes and MISSING nodes anywhere in the tree.
+	res.clean = !root.HasError()
 	names := tl.query.CaptureNames()
 	matches := qc.Matches(tl.query, root, source)
 
@@ -183,25 +266,26 @@ func extractSymbolsTS(source []byte, relPath, lang string) ([]Symbol, bool) {
 		// Several patterns can match the same declaration — e.g. a top-level
 		// arrow-function `const` matches both the @function rule and the broad
 		// @constant rule. Keep the most specific kind for a given name+line.
-		key := name + ":" + itoa(line)
+		dedupKey := name + ":" + itoa(line)
 		sym := Symbol{
 			File:      relPath,
 			Name:      name,
 			Kind:      kind,
 			Line:      line,
 			Signature: trimSig(tsSignature(defNode, nameNode, source)),
+			Extractor: ExtractorTreeSitter,
 		}
-		if idx, ok := at[key]; ok {
+		if idx, ok := at[dedupKey]; ok {
 			if kindRank(kind) < kindRank(syms[idx].Kind) {
 				syms[idx] = sym
 			}
 			continue
 		}
-		at[key] = len(syms)
+		at[dedupKey] = len(syms)
 		syms = append(syms, sym)
 	}
 
-	return syms, true
+	return syms, res, true
 }
 
 // kindRank orders symbol kinds by specificity so the de-dup keeps the most

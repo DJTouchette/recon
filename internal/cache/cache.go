@@ -2,11 +2,14 @@ package cache
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/djtouchette/recon/internal/index"
 	"github.com/djtouchette/recon/internal/scan"
@@ -14,10 +17,29 @@ import (
 )
 
 const (
-	cacheDir   = ".recon"
-	dbFile     = "recon.db"
-	schemaVer  = 5
+	cacheDir  = ".recon"
+	dbFile    = "recon.db"
+	schemaVer = 6
+
+	// busyTimeoutMS is how long a writer waits for a competing writer's lock
+	// before giving up with SQLITE_BUSY. Several recon processes routinely run
+	// against the same repo (editor plugin, CLI, agent tooling); without this
+	// every concurrent write fails instantly.
+	busyTimeoutMS = 10000
 )
+
+// connPragmas are applied to every pooled connection via the DSN. They must be
+// set per-connection: database/sql opens connections lazily, so a single
+// `db.Exec("PRAGMA ...")` after Open only configures whichever connection
+// happened to serve it. All of these are connection state and cheap to repeat.
+// journal_mode is not here on purpose — see enableWAL.
+var connPragmas = []string{
+	"busy_timeout(" + strconv.Itoa(busyTimeoutMS) + ")",
+	"synchronous(NORMAL)",
+	"cache_size(-64000)",
+	"temp_store(MEMORY)",
+	"mmap_size(268435456)",
+}
 
 // Snapshot holds all indexed data for save/load.
 type Snapshot struct {
@@ -29,6 +51,7 @@ type Snapshot struct {
 	CoChangePairs map[string]map[string]int
 	Churn         map[string]int
 	Symbols       []index.Symbol
+	FileParses    []index.FileParse
 	References    []index.Reference
 	ContextDocs   []index.ContextDoc
 	FileExtras    []index.FileExtra
@@ -57,22 +80,21 @@ func OpenAt(root, dir string) (*Store, error) {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
 
+	writeCacheGitignore(dir)
+
 	dbPath := filepath.Join(dir, dbFile)
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", buildDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 
-	// Performance tuning
-	for _, pragma := range []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA cache_size=-64000",
-		"PRAGMA temp_store=MEMORY",
-		"PRAGMA mmap_size=268435456",
-	} {
-		db.Exec(pragma)
+	// sql.Open is lazy — force one connection now so a broken path or a bad
+	// pragma surfaces here rather than halfway through an index build.
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open db %s: %w", dbPath, err)
 	}
+	enableWAL(db)
 
 	s := &Store{db: db, Root: root, path: dbPath, cacheDir: dir}
 	if err := s.ensureSchema(); err != nil {
@@ -83,6 +105,69 @@ func OpenAt(root, dir string) (*Store, error) {
 	return s, nil
 }
 
+// buildDSN appends the per-connection pragmas to the database path. The driver
+// strips the query string from a non-`file:` DSN before opening, so a plain
+// path stays a plain path (important on Windows); paths that themselves contain
+// a query/fragment character need the URI form with escaping.
+func buildDSN(dbPath string) string {
+	params := make([]string, 0, len(connPragmas))
+	for _, p := range connPragmas {
+		params = append(params, "_pragma="+url.QueryEscape(p))
+	}
+	// Every transaction in this package is a write transaction. Taking the
+	// write lock up front (BEGIN IMMEDIATE) means busy_timeout can retry it;
+	// a deferred transaction that upgrades mid-way gets SQLITE_BUSY_SNAPSHOT,
+	// which is *not* retried by busy_timeout.
+	params = append(params, "_txlock=immediate")
+
+	prefix := dbPath
+	if strings.ContainsAny(dbPath, "?#") {
+		r := strings.NewReplacer("?", "%3f", "#", "%23")
+		prefix = "file:" + r.Replace(dbPath)
+	}
+	return prefix + "?" + strings.Join(params, "&")
+}
+
+// enableWAL switches the database to write-ahead logging, which is what lets
+// readers run while a writer holds the lock.
+//
+// It is deliberately not one of the DSN pragmas. journal_mode is persisted in
+// the database file, so it only has to succeed once — and the initial
+// conversion needs exclusive access and returns SQLITE_BUSY *immediately*
+// rather than honouring busy_timeout. Applying it on every connection therefore
+// made a pack of processes opening a fresh cache at the same instant fail to
+// open at all. Whoever wins the race sets the mode for everyone, so losing it is
+// harmless: retry briefly, and if the mode is already wal (the overwhelmingly
+// common case after the first ever open) return at once.
+//
+// Best-effort by design: a database that stays in rollback-journal mode is
+// slower and serialises readers against writers, but it is still correct, and
+// failing the open would be a worse outcome than a slow cache.
+func enableWAL(db *sql.DB) {
+	for i := 0; i < 50; i++ {
+		var mode string
+		if err := db.QueryRow("PRAGMA journal_mode").Scan(&mode); err == nil && strings.EqualFold(mode, "wal") {
+			return
+		}
+		if err := db.QueryRow("PRAGMA journal_mode=WAL").Scan(&mode); err == nil && strings.EqualFold(mode, "wal") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// writeCacheGitignore drops a self-ignoring .gitignore into the cache dir so a
+// `git add -A` in the repo never sweeps up the multi-MB SQLite file. Advisory
+// only: an existing file is left alone (the user may have edited it) and a
+// write failure must not stop us from serving an already-built cache.
+func writeCacheGitignore(dir string) {
+	p := filepath.Join(dir, ".gitignore")
+	if _, err := os.Stat(p); err == nil {
+		return
+	}
+	_ = os.WriteFile(p, []byte("*\n"), 0o644)
+}
+
 // Close closes the database.
 func (s *Store) Close() error {
 	if s.db != nil {
@@ -91,28 +176,65 @@ func (s *Store) Close() error {
 	return nil
 }
 
-func (s *Store) ensureSchema() error {
+// allTables lists every table the schema owns, in drop order.
+var allTables = []string{"meta", "files", "imports", "tests", "cochange", "churn", "symbols", "file_parse", "references_", "file_extras", "file_metrics", "nearby_configs", "codeowners", "context_docs"}
+
+// dataTables is allTables minus meta — the tables a rebuild clears.
+var dataTables = allTables[1:]
+
+// rowQuerier is satisfied by both *sql.DB and *sql.Tx.
+type rowQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// schemaUpToDate reports whether the stored schema version matches this build.
+// A missing meta table (fresh DB) or unreadable version means "no".
+func (s *Store) schemaUpToDate(q rowQuerier) bool {
 	var versionStr string
-	err := s.db.QueryRow("SELECT value FROM meta WHERE key='schema_version'").Scan(&versionStr)
-	if err == nil {
-		v, _ := strconv.Atoi(versionStr)
-		if v == schemaVer {
-			return nil
+	if err := q.QueryRow("SELECT value FROM meta WHERE key='schema_version'").Scan(&versionStr); err != nil {
+		return false
+	}
+	v, err := strconv.Atoi(versionStr)
+	return err == nil && v == schemaVer
+}
+
+// ensureSchema migrates the database to the current schema version, destroying
+// any older data (the cache is fully rebuildable from the repo, so migration is
+// drop-and-recreate). The whole migration runs in one transaction: SQLite DDL
+// is transactional, so a concurrent process or a crash never observes a
+// half-dropped schema.
+func (s *Store) ensureSchema() error {
+	if s.schemaUpToDate(s.db) {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin schema tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Re-check under the write lock: another process may have migrated while
+	// we were waiting for it.
+	if s.schemaUpToDate(tx) {
+		return nil // deferred Rollback releases the lock
+	}
+
+	for _, table := range allTables {
+		if _, err := tx.Exec("DROP TABLE IF EXISTS " + table); err != nil {
+			return fmt.Errorf("drop %s: %w", table, err)
 		}
 	}
 
-	// Drop and recreate all tables
-	for _, table := range []string{"meta", "files", "imports", "tests", "cochange", "churn", "symbols", "references_", "file_extras", "file_metrics", "nearby_configs", "codeowners", "context_docs"} {
-		s.db.Exec("DROP TABLE IF EXISTS " + table)
+	if _, err := tx.Exec(schema); err != nil {
+		return fmt.Errorf("create schema: %w", err)
 	}
 
-	_, err = s.db.Exec(schema)
-	if err != nil {
-		return err
+	if _, err := tx.Exec("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", strconv.Itoa(schemaVer)); err != nil {
+		return fmt.Errorf("record schema version: %w", err)
 	}
 
-	_, err = s.db.Exec("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", strconv.Itoa(schemaVer))
-	return err
+	return tx.Commit()
 }
 
 const schema = `
@@ -148,13 +270,38 @@ CREATE TABLE churn (
 	file_path TEXT PRIMARY KEY,
 	commits INTEGER NOT NULL DEFAULT 0
 );
+-- extractor is per-symbol provenance (tree-sitter vs regex); '' means unknown.
+-- It is NOT the parse-status signal — see file_parse below, which is the only
+-- structure that can represent a file that produced no symbols at all.
 CREATE TABLE symbols (
 	file_path TEXT NOT NULL,
 	name TEXT NOT NULL,
 	kind TEXT NOT NULL,
 	line INTEGER NOT NULL DEFAULT 0,
-	signature TEXT NOT NULL DEFAULT ''
+	signature TEXT NOT NULL DEFAULT '',
+	extractor TEXT NOT NULL DEFAULT ''
 );
+-- Extraction provenance is a property of the FILE, not of a symbol. The three
+-- states worth warning about — unsupported language, failed parse, truncated
+-- parse — all yield zero symbol rows, so a per-symbol column is structurally
+-- unable to represent them and a cached run would read as "clean" for exactly
+-- the files that are broken. Hence a row per candidate file, including the ones
+-- that produced nothing.
+CREATE TABLE file_parse (
+	rel_path TEXT PRIMARY KEY,
+	lang TEXT NOT NULL DEFAULT '',
+	extractor TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL DEFAULT '',
+	symbol_count INTEGER NOT NULL DEFAULT 0,
+	detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_file_parse_status ON file_parse(status);
+-- No uniqueness constraint here, deliberately: (name, file_path, line) is not
+-- a key. Two calls to the same function on one line -- f(g(x)) + f(y) -- are
+-- two distinct, legitimate references that share all three columns, and
+-- reference counts are user-visible. Duplicate protection for this table comes
+-- from the delete-then-insert cycle being correctly error-checked, not from a
+-- constraint that would silently under-count real call sites.
 CREATE TABLE references_ (
 	name TEXT NOT NULL,
 	file_path TEXT NOT NULL,
@@ -200,7 +347,15 @@ CREATE TABLE context_docs (
 CREATE INDEX idx_ctxdocs_file ON context_docs(file_path);
 CREATE INDEX idx_ctxdocs_symbol ON context_docs(symbol);
 CREATE INDEX idx_ctxdocs_origin ON context_docs(origin_path);
-CREATE INDEX idx_symbols_file ON symbols(file_path);
+-- (file_path, name, kind, line) is a genuine key for a symbol definition: the
+-- same name may appear many times in a file (overloads, a method and a field,
+-- re-declarations in sibling scopes) but not twice at the same line with the
+-- same kind. Making it UNIQUE turns "duplicate symbol row" from silent cache
+-- corruption into an impossibility, and inserts use OR REPLACE so a re-index of
+-- an identical definition refreshes the signature instead of failing. Also
+-- serves file_path lookups as the leftmost prefix, so no separate
+-- idx_symbols_file is needed.
+CREATE UNIQUE INDEX idx_symbols_key ON symbols(file_path, name, kind, line);
 CREATE INDEX idx_symbols_name ON symbols(name);
 CREATE INDEX idx_symbols_kind ON symbols(kind);
 CREATE INDEX idx_references_name ON references_(name);
@@ -244,7 +399,7 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 	defer tx.Rollback()
 
 	// Clear data tables (not meta)
-	for _, table := range []string{"files", "imports", "tests", "cochange", "churn", "symbols", "references_", "file_extras", "file_metrics", "nearby_configs", "codeowners", "context_docs"} {
+	for _, table := range dataTables {
 		if _, err := tx.Exec("DELETE FROM " + table); err != nil {
 			return fmt.Errorf("clear %s: %w", table, err)
 		}
@@ -278,7 +433,9 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 
 		for src, targets := range snap.Imports {
 			for _, target := range targets {
-				importStmt.Exec(src, target)
+				if _, err := importStmt.Exec(src, target); err != nil {
+					return fmt.Errorf("insert import %s→%s: %w", src, target, err)
+				}
 			}
 		}
 	}
@@ -296,7 +453,9 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 			if kind == "" {
 				kind = "unit"
 			}
-			testStmt.Exec(testPath, sourcePath, kind)
+			if _, err := testStmt.Exec(testPath, sourcePath, kind); err != nil {
+				return fmt.Errorf("insert test %s: %w", testPath, err)
+			}
 		}
 	}
 
@@ -310,7 +469,9 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 
 		for a, bs := range snap.CoChangePairs {
 			for b, count := range bs {
-				ccStmt.Exec(a, b, count)
+				if _, err := ccStmt.Exec(a, b, count); err != nil {
+					return fmt.Errorf("insert cochange %s/%s: %w", a, b, err)
+				}
 			}
 		}
 	}
@@ -324,21 +485,41 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 		defer churnStmt.Close()
 
 		for path, commits := range snap.Churn {
-			churnStmt.Exec(path, commits)
+			if _, err := churnStmt.Exec(path, commits); err != nil {
+				return fmt.Errorf("insert churn %s: %w", path, err)
+			}
 		}
 	}
 
 	// --- Symbols ---
 	if len(snap.Symbols) > 0 {
-		symStmt, err := tx.Prepare("INSERT INTO symbols (file_path, name, kind, line, signature) VALUES (?, ?, ?, ?, ?)")
+		symStmt, err := tx.Prepare(insertSymbolSQL)
 		if err != nil {
 			return fmt.Errorf("prepare symbols: %w", err)
 		}
 		defer symStmt.Close()
 
 		for i := range snap.Symbols {
-			s := &snap.Symbols[i]
-			symStmt.Exec(s.File, s.Name, s.Kind, s.Line, s.Signature)
+			sym := &snap.Symbols[i]
+			if _, err := symStmt.Exec(sym.File, sym.Name, sym.Kind, sym.Line, sym.Signature, sym.Extractor); err != nil {
+				return fmt.Errorf("insert symbol %s:%s: %w", sym.File, sym.Name, err)
+			}
+		}
+	}
+
+	// --- File parses ---
+	if len(snap.FileParses) > 0 {
+		fpStmt, err := tx.Prepare(insertFileParseSQL)
+		if err != nil {
+			return fmt.Errorf("prepare file_parse: %w", err)
+		}
+		defer fpStmt.Close()
+
+		for i := range snap.FileParses {
+			p := &snap.FileParses[i]
+			if _, err := fpStmt.Exec(p.RelPath, p.Lang, p.Extractor, p.Status, p.SymbolCount, p.Detail); err != nil {
+				return fmt.Errorf("insert file_parse %s: %w", p.RelPath, err)
+			}
 		}
 	}
 
@@ -352,7 +533,9 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 
 		for i := range snap.References {
 			r := &snap.References[i]
-			refStmt.Exec(r.Name, r.File, r.Line)
+			if _, err := refStmt.Exec(r.Name, r.File, r.Line); err != nil {
+				return fmt.Errorf("insert reference %s:%s: %w", r.File, r.Name, err)
+			}
 		}
 	}
 
@@ -366,7 +549,9 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 
 		for i := range snap.ContextDocs {
 			d := &snap.ContextDocs[i]
-			cdStmt.Exec(d.File, d.Symbol, d.Line, d.Source, d.Origin, d.Body)
+			if _, err := cdStmt.Exec(d.File, d.Symbol, d.Line, d.Source, d.Origin, d.Body); err != nil {
+				return fmt.Errorf("insert context_doc %s: %w", d.Origin, err)
+			}
 		}
 	}
 
@@ -380,7 +565,9 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 
 		for i := range snap.FileExtras {
 			e := &snap.FileExtras[i]
-			extraStmt.Exec(e.RelPath, e.Preview, e.ContentHash)
+			if _, err := extraStmt.Exec(e.RelPath, e.Preview, e.ContentHash); err != nil {
+				return fmt.Errorf("insert file_extra %s: %w", e.RelPath, err)
+			}
 		}
 	}
 
@@ -393,7 +580,9 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 		defer metStmt.Close()
 		for i := range snap.Metrics {
 			m := &snap.Metrics[i]
-			metStmt.Exec(m.RelPath, m.FanIn, m.FanOut, m.Churn, m.HotspotScore)
+			if _, err := metStmt.Exec(m.RelPath, m.FanIn, m.FanOut, m.Churn, m.HotspotScore); err != nil {
+				return fmt.Errorf("insert file_metrics %s: %w", m.RelPath, err)
+			}
 		}
 	}
 
@@ -406,7 +595,9 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 		defer ncStmt.Close()
 		for i := range snap.NearbyConfigs {
 			nc := &snap.NearbyConfigs[i]
-			ncStmt.Exec(nc.Dir, nc.ConfigType, nc.ConfigPath)
+			if _, err := ncStmt.Exec(nc.Dir, nc.ConfigType, nc.ConfigPath); err != nil {
+				return fmt.Errorf("insert nearby_config %s/%s: %w", nc.Dir, nc.ConfigType, err)
+			}
 		}
 	}
 
@@ -419,7 +610,9 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 		defer coStmt.Close()
 		for i := range snap.OwnerRules {
 			r := &snap.OwnerRules[i]
-			coStmt.Exec(r.Priority, r.Pattern, strings.Join(r.Owners, " "))
+			if _, err := coStmt.Exec(r.Priority, r.Pattern, strings.Join(r.Owners, " ")); err != nil {
+				return fmt.Errorf("insert codeowner %s: %w", r.Pattern, err)
+			}
 		}
 	}
 
@@ -539,7 +732,7 @@ func (s *Store) LoadSnapshot() (*Snapshot, error) {
 	}
 
 	// --- Symbols ---
-	rows, err = s.db.Query("SELECT file_path, name, kind, line, signature FROM symbols")
+	rows, err = s.db.Query("SELECT file_path, name, kind, line, signature, extractor FROM symbols")
 	if err != nil {
 		return nil, fmt.Errorf("query symbols: %w", err)
 	}
@@ -547,13 +740,31 @@ func (s *Store) LoadSnapshot() (*Snapshot, error) {
 
 	for rows.Next() {
 		var sym index.Symbol
-		if err := rows.Scan(&sym.File, &sym.Name, &sym.Kind, &sym.Line, &sym.Signature); err != nil {
+		if err := rows.Scan(&sym.File, &sym.Name, &sym.Kind, &sym.Line, &sym.Signature, &sym.Extractor); err != nil {
 			return nil, fmt.Errorf("scan symbol row: %w", err)
 		}
 		snap.Symbols = append(snap.Symbols, sym)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("symbol rows: %w", err)
+	}
+
+	// --- File parses ---
+	rows, err = s.db.Query("SELECT " + fileParseCols + " FROM file_parse")
+	if err != nil {
+		return nil, fmt.Errorf("query file_parse: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		p, err := scanFileParse(rows)
+		if err != nil {
+			return nil, err
+		}
+		snap.FileParses = append(snap.FileParses, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("file_parse rows: %w", err)
 	}
 
 	// --- References ---
@@ -691,6 +902,39 @@ func (s *Store) GetFileMtimes() (map[string]int64, error) {
 	return mtimes, rows.Err()
 }
 
+// FileSig is the cheap change-detection signature for a cached file.
+//
+// mtime alone is not enough: `tar -x`, `rsync -t`, `cp -p` and Docker/CI
+// workspace restores all reproduce the recorded mtime while the bytes differ,
+// which makes recon serve symbols for content that is no longer on disk. Size
+// catches those, and it costs nothing — the same os.Stat already provides it
+// and the column has always been stored.
+type FileSig struct {
+	ModTime int64
+	Size    int64
+}
+
+// GetFileSignatures returns the stored mtime and size for every cached file,
+// for refresh diffing against the working tree.
+func (s *Store) GetFileSignatures() (map[string]FileSig, error) {
+	rows, err := s.db.Query("SELECT rel_path, mtime, size FROM files")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	sigs := make(map[string]FileSig, 8192)
+	for rows.Next() {
+		var path string
+		var sig FileSig
+		if err := rows.Scan(&path, &sig.ModTime, &sig.Size); err != nil {
+			return nil, err
+		}
+		sigs[path] = sig
+	}
+	return sigs, rows.Err()
+}
+
 // UpdateFiles upserts changed/added files and removes deleted files.
 func (s *Store) UpdateFiles(upsert []scan.FileEntry, remove []string) error {
 	tx, err := s.db.Begin()
@@ -706,7 +950,9 @@ func (s *Store) UpdateFiles(upsert []scan.FileEntry, remove []string) error {
 		}
 		defer delStmt.Close()
 		for _, p := range remove {
-			delStmt.Exec(p)
+			if _, err := delStmt.Exec(p); err != nil {
+				return fmt.Errorf("delete file %s: %w", p, err)
+			}
 		}
 	}
 
@@ -722,7 +968,9 @@ func (s *Store) UpdateFiles(upsert []scan.FileEntry, remove []string) error {
 			if dir == "." {
 				dir = ""
 			}
-			stmt.Exec(f.RelPath, dir, f.Lang, int(f.Class), f.Size, f.ModTime)
+			if _, err := stmt.Exec(f.RelPath, dir, f.Lang, int(f.Class), f.Size, f.ModTime); err != nil {
+				return fmt.Errorf("upsert file %s: %w", f.RelPath, err)
+			}
 		}
 	}
 
@@ -743,12 +991,17 @@ func (s *Store) UpdateImports(newImports map[string][]string, removedSources []s
 	}
 	defer delStmt.Close()
 
-	// Delete imports for all changed/removed sources
+	// Delete imports for all changed/removed sources. A swallowed failure here
+	// leaves the old rows in place and the inserts below pile new ones on top.
 	for _, src := range removedSources {
-		delStmt.Exec(src)
+		if _, err := delStmt.Exec(src); err != nil {
+			return fmt.Errorf("delete imports for %s: %w", src, err)
+		}
 	}
 	for src := range newImports {
-		delStmt.Exec(src)
+		if _, err := delStmt.Exec(src); err != nil {
+			return fmt.Errorf("delete imports for %s: %w", src, err)
+		}
 	}
 
 	// Insert new imports
@@ -760,7 +1013,9 @@ func (s *Store) UpdateImports(newImports map[string][]string, removedSources []s
 		defer insStmt.Close()
 		for src, targets := range newImports {
 			for _, target := range targets {
-				insStmt.Exec(src, target)
+				if _, err := insStmt.Exec(src, target); err != nil {
+					return fmt.Errorf("insert import %s→%s: %w", src, target, err)
+				}
 			}
 		}
 	}
@@ -776,7 +1031,9 @@ func (s *Store) SaveTests(sourceToTest map[string][]string, testToSource map[str
 	}
 	defer tx.Rollback()
 
-	tx.Exec("DELETE FROM tests")
+	if _, err := tx.Exec("DELETE FROM tests"); err != nil {
+		return fmt.Errorf("clear tests: %w", err)
+	}
 
 	if len(testToSource) > 0 {
 		stmt, err := tx.Prepare("INSERT INTO tests (test_path, source_path, kind) VALUES (?, ?, ?)")
@@ -789,7 +1046,9 @@ func (s *Store) SaveTests(sourceToTest map[string][]string, testToSource map[str
 			if kind == "" {
 				kind = "unit"
 			}
-			stmt.Exec(testPath, sourcePath, kind)
+			if _, err := stmt.Exec(testPath, sourcePath, kind); err != nil {
+				return fmt.Errorf("insert test %s: %w", testPath, err)
+			}
 		}
 	}
 
@@ -804,8 +1063,12 @@ func (s *Store) SaveCoChange(pairs map[string]map[string]int, churn map[string]i
 	}
 	defer tx.Rollback()
 
-	tx.Exec("DELETE FROM cochange")
-	tx.Exec("DELETE FROM churn")
+	if _, err := tx.Exec("DELETE FROM cochange"); err != nil {
+		return fmt.Errorf("clear cochange: %w", err)
+	}
+	if _, err := tx.Exec("DELETE FROM churn"); err != nil {
+		return fmt.Errorf("clear churn: %w", err)
+	}
 
 	if len(pairs) > 0 {
 		ccStmt, err := tx.Prepare("INSERT INTO cochange (file_a, file_b, count) VALUES (?, ?, ?)")
@@ -815,7 +1078,9 @@ func (s *Store) SaveCoChange(pairs map[string]map[string]int, churn map[string]i
 		defer ccStmt.Close()
 		for a, bs := range pairs {
 			for b, count := range bs {
-				ccStmt.Exec(a, b, count)
+				if _, err := ccStmt.Exec(a, b, count); err != nil {
+					return fmt.Errorf("insert cochange %s/%s: %w", a, b, err)
+				}
 			}
 		}
 	}
@@ -827,14 +1092,25 @@ func (s *Store) SaveCoChange(pairs map[string]map[string]int, churn map[string]i
 		}
 		defer churnStmt.Close()
 		for path, commits := range churn {
-			churnStmt.Exec(path, commits)
+			if _, err := churnStmt.Exec(path, commits); err != nil {
+				return fmt.Errorf("insert churn %s: %w", path, err)
+			}
 		}
 	}
 
 	return tx.Commit()
 }
 
+// insertSymbolSQL upserts on the (file_path, name, kind, line) unique key: a
+// re-indexed identical definition refreshes its signature instead of failing.
+const insertSymbolSQL = "INSERT OR REPLACE INTO symbols (file_path, name, kind, line, signature, extractor) VALUES (?, ?, ?, ?, ?, ?)"
+
 // UpdateSymbols deletes old symbols for given files and inserts new ones.
+//
+// The delete and the insert must succeed or fail together. Historically the
+// delete's error was discarded, so a busy database dropped the DELETE on the
+// floor and the INSERTs appended a second copy of every symbol in the file —
+// silently, with a zero exit code.
 func (s *Store) UpdateSymbols(symbols []index.Symbol, removedFiles []string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -854,25 +1130,119 @@ func (s *Store) UpdateSymbols(symbols []index.Symbol, removedFiles []string) err
 		changedFiles[symbols[i].File] = true
 	}
 	for f := range changedFiles {
-		delStmt.Exec(f)
+		if _, err := delStmt.Exec(f); err != nil {
+			return fmt.Errorf("delete symbols for %s: %w", f, err)
+		}
 	}
 	for _, f := range removedFiles {
-		delStmt.Exec(f)
+		if _, err := delStmt.Exec(f); err != nil {
+			return fmt.Errorf("delete symbols for %s: %w", f, err)
+		}
 	}
 
 	if len(symbols) > 0 {
-		insStmt, err := tx.Prepare("INSERT INTO symbols (file_path, name, kind, line, signature) VALUES (?, ?, ?, ?, ?)")
+		insStmt, err := tx.Prepare(insertSymbolSQL)
 		if err != nil {
 			return err
 		}
 		defer insStmt.Close()
 		for i := range symbols {
-			s := &symbols[i]
-			insStmt.Exec(s.File, s.Name, s.Kind, s.Line, s.Signature)
+			sym := &symbols[i]
+			if _, err := insStmt.Exec(sym.File, sym.Name, sym.Kind, sym.Line, sym.Signature, sym.Extractor); err != nil {
+				return fmt.Errorf("insert symbol %s:%s: %w", sym.File, sym.Name, err)
+			}
 		}
 	}
 
 	return tx.Commit()
+}
+
+const (
+	insertFileParseSQL = "INSERT OR REPLACE INTO file_parse (rel_path, lang, extractor, status, symbol_count, detail) VALUES (?, ?, ?, ?, ?, ?)"
+	fileParseCols      = "rel_path, lang, extractor, status, symbol_count, detail"
+)
+
+func scanFileParse(rows *sql.Rows) (index.FileParse, error) {
+	var p index.FileParse
+	if err := rows.Scan(&p.RelPath, &p.Lang, &p.Extractor, &p.Status, &p.SymbolCount, &p.Detail); err != nil {
+		return p, fmt.Errorf("scan file_parse row: %w", err)
+	}
+	return p, nil
+}
+
+// UpdateFileParses upserts per-file parse results and drops the rows for
+// deleted files.
+//
+// This is the incremental counterpart to the file_parse rows written by
+// SaveSnapshot, and it must be called from the refresh path as well as the
+// rebuild path. file_metrics, nearby_configs and codeowners are all populated
+// only on full rebuild and are therefore frozen at the last rebuild; parse
+// status must not become the fourth such table, because a stale "ok" is read as
+// an all-clear for a file that no longer parses.
+//
+// rel_path is the primary key, so a re-index replaces in place: unlike symbols
+// and references_, this table cannot accumulate duplicates even if a caller
+// double-writes.
+func (s *Store) UpdateFileParses(parses []index.FileParse, removedFiles []string) error {
+	if len(parses) == 0 && len(removedFiles) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if len(removedFiles) > 0 {
+		delStmt, err := tx.Prepare("DELETE FROM file_parse WHERE rel_path=?")
+		if err != nil {
+			return err
+		}
+		defer delStmt.Close()
+		for _, f := range removedFiles {
+			if _, err := delStmt.Exec(f); err != nil {
+				return fmt.Errorf("delete file_parse for %s: %w", f, err)
+			}
+		}
+	}
+
+	if len(parses) > 0 {
+		insStmt, err := tx.Prepare(insertFileParseSQL)
+		if err != nil {
+			return err
+		}
+		defer insStmt.Close()
+		for i := range parses {
+			p := &parses[i]
+			if _, err := insStmt.Exec(p.RelPath, p.Lang, p.Extractor, p.Status, p.SymbolCount, p.Detail); err != nil {
+				return fmt.Errorf("upsert file_parse %s: %w", p.RelPath, err)
+			}
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetFileParses returns the stored parse result for every indexed file, keyed
+// by path. Files that produced no symbols are present too — that is the point:
+// "no symbols" must be distinguishable from "not parsed".
+func (s *Store) GetFileParses() (map[string]index.FileParse, error) {
+	rows, err := s.db.Query("SELECT " + fileParseCols + " FROM file_parse")
+	if err != nil {
+		return nil, fmt.Errorf("query file_parse: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]index.FileParse, 4096)
+	for rows.Next() {
+		p, err := scanFileParse(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[p.RelPath] = p
+	}
+	return out, rows.Err()
 }
 
 // UpdateReferences deletes old references for given files and inserts new ones.
@@ -895,10 +1265,14 @@ func (s *Store) UpdateReferences(refs []index.Reference, removedFiles []string) 
 		changedFiles[refs[i].File] = true
 	}
 	for f := range changedFiles {
-		delStmt.Exec(f)
+		if _, err := delStmt.Exec(f); err != nil {
+			return fmt.Errorf("delete references for %s: %w", f, err)
+		}
 	}
 	for _, f := range removedFiles {
-		delStmt.Exec(f)
+		if _, err := delStmt.Exec(f); err != nil {
+			return fmt.Errorf("delete references for %s: %w", f, err)
+		}
 	}
 
 	if len(refs) > 0 {
@@ -909,7 +1283,9 @@ func (s *Store) UpdateReferences(refs []index.Reference, removedFiles []string) 
 		defer insStmt.Close()
 		for i := range refs {
 			r := &refs[i]
-			insStmt.Exec(r.Name, r.File, r.Line)
+			if _, err := insStmt.Exec(r.Name, r.File, r.Line); err != nil {
+				return fmt.Errorf("insert reference %s:%s: %w", r.File, r.Name, err)
+			}
 		}
 	}
 
@@ -942,7 +1318,9 @@ func (s *Store) UpdateContextDocs(docs []index.ContextDoc, changedOrigins []stri
 		origins[o] = true
 	}
 	for o := range origins {
-		delStmt.Exec(o)
+		if _, err := delStmt.Exec(o); err != nil {
+			return fmt.Errorf("delete context_docs for %s: %w", o, err)
+		}
 	}
 
 	if len(docs) > 0 {
@@ -953,7 +1331,9 @@ func (s *Store) UpdateContextDocs(docs []index.ContextDoc, changedOrigins []stri
 		defer insStmt.Close()
 		for i := range docs {
 			d := &docs[i]
-			insStmt.Exec(d.File, d.Symbol, d.Line, d.Source, d.Origin, d.Body)
+			if _, err := insStmt.Exec(d.File, d.Symbol, d.Line, d.Source, d.Origin, d.Body); err != nil {
+				return fmt.Errorf("insert context_doc %s: %w", d.Origin, err)
+			}
 		}
 	}
 
@@ -975,7 +1355,9 @@ func (s *Store) UpdateFileExtras(extras []index.FileExtra, removedFiles []string
 		}
 		defer delStmt.Close()
 		for _, f := range removedFiles {
-			delStmt.Exec(f)
+			if _, err := delStmt.Exec(f); err != nil {
+				return fmt.Errorf("delete file_extras for %s: %w", f, err)
+			}
 		}
 	}
 
@@ -987,15 +1369,17 @@ func (s *Store) UpdateFileExtras(extras []index.FileExtra, removedFiles []string
 		defer stmt.Close()
 		for i := range extras {
 			e := &extras[i]
-			stmt.Exec(e.RelPath, e.Preview, e.ContentHash)
+			if _, err := stmt.Exec(e.RelPath, e.Preview, e.ContentHash); err != nil {
+				return fmt.Errorf("upsert file_extra %s: %w", e.RelPath, err)
+			}
 		}
 	}
 
 	return tx.Commit()
 }
 
-// Clear removes the cache database file.
+// Clear closes the store and removes the cache directory.
 func (s *Store) Clear() error {
-	s.db.Close()
-	return os.RemoveAll(s.cacheDir)
+	closeErr := s.db.Close()
+	return errors.Join(closeErr, os.RemoveAll(s.cacheDir))
 }

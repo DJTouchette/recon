@@ -54,7 +54,7 @@ func (s *Service) Greet(name string) string {
 
 func extractGo(t *testing.T, src string) map[string]string {
 	t.Helper()
-	syms, ok := extractSymbolsTS([]byte(src), "sample.go", "go")
+	syms, _, ok := extractSymbolsTS([]byte(src), "sample.go", "go")
 	if !ok {
 		t.Fatal("tree-sitter extraction not handled for go")
 	}
@@ -110,7 +110,7 @@ func TestTreeSitterGoNoFalsePositives(t *testing.T) {
 }
 
 func TestTreeSitterGoMultiLineSignature(t *testing.T) {
-	syms, ok := extractSymbolsTS([]byte(goFixture), "sample.go", "go")
+	syms, _, ok := extractSymbolsTS([]byte(goFixture), "sample.go", "go")
 	if !ok {
 		t.Fatal("not handled")
 	}

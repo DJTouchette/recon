@@ -199,8 +199,8 @@ func TestHasUpper(t *testing.T) {
 		{"payment", false},
 		{"Payment", true},
 		{`func \w+`, false},
-		{`\Wfoo`, false},   // escaped W is a character class, not a literal
-		{`\\Wfoo`, true},   // escaped backslash, then a literal W
+		{`\Wfoo`, false}, // escaped W is a character class, not a literal
+		{`\\Wfoo`, true}, // escaped backslash, then a literal W
 		{`todo|fixme`, false},
 		{`TODO|fixme`, true},
 	}

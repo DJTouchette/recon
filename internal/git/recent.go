@@ -1,29 +1,26 @@
 package git
 
 import (
-	"os/exec"
 	"strings"
 )
 
 // RecentChanges returns commits since the given time spec (e.g. "7d", "2024-01-01").
+// Paths are relative to root, as with ParseLog.
 func RecentChanges(root string, since string) ([]Commit, error) {
-	// Convert shorthand like "7d" to git-compatible format
-	gitSince := convertSince(since)
-
-	cmd := exec.Command("git", "log",
-		"--name-only",
-		"--pretty=format:%H%n%an%n%ai%n%s",
-		"--no-merges",
-		"--since="+gitSince,
-	)
-	cmd.Dir = root
-
-	out, err := cmd.Output()
+	res, err := RecentChangesOpts(root, since)
 	if err != nil {
 		return nil, err
 	}
+	return res.Commits, nil
+}
 
-	return parseLogOutput(out), nil
+// RecentChangesOpts is RecentChanges plus the coverage of the window it read.
+// The window is bounded by time only, not by a commit count.
+func RecentChangesOpts(root string, since string) (*LogResult, error) {
+	return ParseLogOpts(root, Options{
+		MaxCommits: Unlimited,
+		Since:      convertSince(since),
+	})
 }
 
 func convertSince(since string) string {

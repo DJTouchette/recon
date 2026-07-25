@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
@@ -15,8 +16,110 @@ import (
 
 // DepGraph holds the import/require dependency graph between files.
 type DepGraph struct {
-	imports    map[string][]string // file → files it imports
-	importedBy map[string][]string // file → files that import it
+	imports    map[string][]string    // file → files it imports
+	importedBy map[string][]string    // file → files that import it
+	stats      map[string]ImportStats // file → import-resolution telemetry
+}
+
+// ImportStats records what happened to one file's import specifiers.
+//
+// A bare `fan_in: 0` is ambiguous: it can mean "nothing imports this" or "recon
+// does not understand your import style". These counts disambiguate the two.
+// Every specifier an extractor produced lands in exactly one bucket:
+//
+//	Resolved   — produced at least one edge to a local file
+//	External   — deliberately not a local file (stdlib, third-party, unknown
+//	             module path) — expected to produce no edge
+//	Unresolved — looked like it should name a local file but nothing matched;
+//	             this is the bucket that means "recon dropped a real edge"
+type ImportStats struct {
+	Lang            string   `json:"lang"`
+	Extracted       int      `json:"extracted"`
+	Resolved        int      `json:"resolved"`
+	External        int      `json:"external"`
+	Unresolved      int      `json:"unresolved"`
+	UnresolvedSpecs []string `json:"unresolved_specs,omitempty"`
+}
+
+// LangImportCoverage aggregates ImportStats over the files of one language.
+type LangImportCoverage struct {
+	Lang       string `json:"lang"`
+	Files      int    `json:"files"`
+	Extracted  int    `json:"extracted"`
+	Resolved   int    `json:"resolved"`
+	External   int    `json:"external"`
+	Unresolved int    `json:"unresolved"`
+}
+
+// maxUnresolvedSamples bounds the specifier samples kept per file.
+const maxUnresolvedSamples = 20
+
+// importTally accumulates ImportStats while a file's specifiers are resolved.
+// A nil *importTally is a no-op so resolvers stay callable without one.
+type importTally struct {
+	lang       string
+	extracted  int
+	resolved   int
+	external   int
+	unresolved int
+	samples    []string
+	seen       map[string]bool
+}
+
+func (t *importTally) extract(n int) {
+	if t == nil {
+		return
+	}
+	t.extracted += n
+}
+
+// hit records a specifier that resolved to at least one local file.
+func (t *importTally) hit() {
+	if t == nil {
+		return
+	}
+	t.resolved++
+}
+
+// skip records a specifier deliberately treated as non-local.
+func (t *importTally) skip() {
+	if t == nil {
+		return
+	}
+	t.external++
+}
+
+// miss records a specifier that should have named a local file but did not.
+func (t *importTally) miss(spec string) {
+	if t == nil {
+		return
+	}
+	t.unresolved++
+	if spec == "" || len(t.samples) >= maxUnresolvedSamples {
+		return
+	}
+	if t.seen == nil {
+		t.seen = make(map[string]bool)
+	}
+	if t.seen[spec] {
+		return
+	}
+	t.seen[spec] = true
+	t.samples = append(t.samples, spec)
+}
+
+func (t *importTally) stats() ImportStats {
+	if t == nil {
+		return ImportStats{}
+	}
+	return ImportStats{
+		Lang:            t.lang,
+		Extracted:       t.extracted,
+		Resolved:        t.resolved,
+		External:        t.external,
+		Unresolved:      t.unresolved,
+		UnresolvedSpecs: t.samples,
+	}
 }
 
 // NewDepGraph builds a dependency graph by scanning source files for import statements.
@@ -24,10 +127,10 @@ func NewDepGraph(root string, idx *FileIndex) *DepGraph {
 	dg := &DepGraph{
 		imports:    make(map[string][]string),
 		importedBy: make(map[string][]string),
+		stats:      make(map[string]ImportStats),
 	}
 
-	// Detect Go module path
-	goModPath := detectGoModulePath(root)
+	rc := newResolveCtx(root, idx)
 
 	// Scan both source and test files for imports.
 	// Test files need import resolution for languages like C# where
@@ -53,15 +156,20 @@ func NewDepGraph(root string, idx *FileIndex) *DepGraph {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			imports := extractImports(root, f, goModPath, idx)
-			if len(imports) == 0 {
+			imports, st := extractImports(f, rc)
+			if len(imports) == 0 && st.Extracted == 0 {
 				return
 			}
 
 			mu.Lock()
-			dg.imports[f.RelPath] = imports
-			for _, imp := range imports {
-				dg.importedBy[imp] = append(dg.importedBy[imp], f.RelPath)
+			if st.Extracted > 0 {
+				dg.stats[f.RelPath] = st
+			}
+			if len(imports) > 0 {
+				dg.imports[f.RelPath] = imports
+				for _, imp := range imports {
+					dg.importedBy[imp] = append(dg.importedBy[imp], f.RelPath)
+				}
 			}
 			mu.Unlock()
 		}()
@@ -72,10 +180,13 @@ func NewDepGraph(root string, idx *FileIndex) *DepGraph {
 }
 
 // NewDepGraphFromData creates a DepGraph from pre-computed import edges.
+// Import telemetry is not part of the edge data, so a graph restored this way
+// reports no ImportStats until a scan recomputes them.
 func NewDepGraphFromData(imports map[string][]string) *DepGraph {
 	dg := &DepGraph{
 		imports:    imports,
 		importedBy: make(map[string][]string),
+		stats:      make(map[string]ImportStats),
 	}
 	for src, targets := range imports {
 		for _, t := range targets {
@@ -100,12 +211,53 @@ func (dg *DepGraph) AllImports() map[string][]string {
 	return dg.imports
 }
 
+// ImportStatsOf returns the import-resolution telemetry for a file.
+func (dg *DepGraph) ImportStatsOf(path string) (ImportStats, bool) {
+	st, ok := dg.stats[path]
+	return st, ok
+}
+
+// AllImportStats returns per-file import-resolution telemetry.
+func (dg *DepGraph) AllImportStats() map[string]ImportStats {
+	return dg.stats
+}
+
+// ImportCoverage aggregates the per-file telemetry by language, sorted by
+// unresolved count (worst first) so a caller can surface the languages whose
+// import styles recon is silently dropping.
+func (dg *DepGraph) ImportCoverage() []LangImportCoverage {
+	byLang := make(map[string]*LangImportCoverage)
+	for _, st := range dg.stats {
+		c := byLang[st.Lang]
+		if c == nil {
+			c = &LangImportCoverage{Lang: st.Lang}
+			byLang[st.Lang] = c
+		}
+		c.Files++
+		c.Extracted += st.Extracted
+		c.Resolved += st.Resolved
+		c.External += st.External
+		c.Unresolved += st.Unresolved
+	}
+	out := make([]LangImportCoverage, 0, len(byLang))
+	for _, c := range byLang {
+		out = append(out, *c)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Unresolved != out[j].Unresolved {
+			return out[i].Unresolved > out[j].Unresolved
+		}
+		return out[i].Lang < out[j].Lang
+	})
+	return out
+}
+
 // ScanFileImports extracts imports for specific files. Used during incremental refresh.
 func ScanFileImports(root string, files []*scan.FileEntry, idx *FileIndex) map[string][]string {
-	goModPath := detectGoModulePath(root)
+	rc := newResolveCtx(root, idx)
 	result := make(map[string][]string)
 	for _, f := range files {
-		imports := extractImports(root, f, goModPath, idx)
+		imports, _ := extractImports(f, rc)
 		if len(imports) > 0 {
 			result[f.RelPath] = imports
 		}
@@ -113,20 +265,102 @@ func ScanFileImports(root string, files []*scan.FileEntry, idx *FileIndex) map[s
 	return result
 }
 
-func detectGoModulePath(root string) string {
-	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "module ") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "module "))
-		}
-	}
-	return ""
+// ─── Resolution context ───────────────────────────────────────────────────────
+
+// resolveCtx carries the repo-wide facts import resolution needs (module paths,
+// source roots, namespace maps). It is built once per scan and shared by every
+// file's resolver; the expensive maps are built lazily and only for languages
+// the repo actually contains.
+//
+// Before this existed, per-repo maps (the Elixir module map in particular) were
+// rebuilt for every file — O(files²) reads — and file lookups were resolved
+// against the process working directory rather than the scan root, so the same
+// repo produced different graphs depending on where recon was invoked from.
+type resolveCtx struct {
+	root string
+	idx  *FileIndex
+
+	goMods []goModule
+
+	pyOnce  sync.Once
+	pyRoots []string
+
+	jsOnce    sync.Once
+	jsAliases []jsAlias
+
+	csOnce sync.Once
+	csNS   map[string][]string
+
+	jvmOnce sync.Once
+	jvmPkg  map[string][]string
+	jvmDecl map[string][]string
+
+	exOnce sync.Once
+	exMods map[string]string
+
+	swiftOnce    sync.Once
+	swiftTargets map[string][]string
+
+	phpOnce sync.Once
+	phpPSR4 map[string][]string
 }
 
-// Import extraction regexes — compiled once.
+func newResolveCtx(root string, idx *FileIndex) *resolveCtx {
+	rc := &resolveCtx{root: root, idx: idx}
+	rc.goMods = detectGoModules(root, idx)
+	return rc
+}
+
+// langFileScan is one file's contribution to a lazily-built language map.
+type langFileScan[T any] struct {
+	file *scan.FileEntry
+	val  T
+}
+
+// scanLangFilesParallel reads every file of the given language and maps it with
+// fn, concurrently, returning the results in index order so the maps built from
+// them stay deterministic.
+//
+// The language maps touch every file of a language exactly once. Doing that
+// serially inside the sync.Once would stall every resolver goroutine behind a
+// single thread of I/O and parsing.
+func scanLangFilesParallel[T any](rc *resolveCtx, langs []string, fn func(*scan.FileEntry, []byte) T) []langFileScan[T] {
+	wanted := make(map[string]bool, len(langs))
+	for _, l := range langs {
+		wanted[l] = true
+	}
+
+	var files []*scan.FileEntry
+	for _, f := range rc.idx.All() {
+		if wanted[f.Lang] {
+			files = append(files, f)
+		}
+	}
+
+	out := make([]langFileScan[T], len(files))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.GOMAXPROCS(0)*2)
+	for i, f := range files {
+		i, f := i, f
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			data, err := os.ReadFile(filepath.Join(rc.root, f.RelPath))
+			if err != nil {
+				return
+			}
+			out[i] = langFileScan[T]{file: f, val: fn(f, data)}
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
+// ─── Import extraction regexes ────────────────────────────────────────────────
+
 var (
 	goImportSingle = regexp.MustCompile(`import\s+"([^"]+)"`)
 	goImportBlock  = regexp.MustCompile(`import\s*\(([^)]+)\)`)
@@ -134,19 +368,37 @@ var (
 
 	jsImportFrom = regexp.MustCompile(`(?:import\s+.*?from\s+|require\s*\(\s*)['"]([^'"]+)['"]`)
 
-	pyImportFrom = regexp.MustCompile(`^from\s+(\S+)\s+import`)
-	pyImport     = regexp.MustCompile(`^import\s+(\S+)`)
+	pyImportFrom = regexp.MustCompile(`^from\s+(\.*[\w.]*)\s+import\s+(.*)$`)
+	pyImport     = regexp.MustCompile(`^import\s+([\w.,\s]+?)\s*$`)
 
 	csUsing = regexp.MustCompile(`^using\s+(?:static\s+)?([A-Za-z][\w.]*)\s*;`)
+	// csNamespaceRe matches a C# namespace declaration in either the
+	// file-scoped (`namespace A.B;`) or block (`namespace A.B {`) form.
+	csNamespaceRe = regexp.MustCompile(`^\s*namespace\s+([A-Za-z_][\w.]*)\s*[;{]?\s*$`)
 
-	javaImportRe   = regexp.MustCompile(`^import\s+(?:static\s+)?([A-Za-z][\w.]*)\s*;`)
-	kotlinImportRe = regexp.MustCompile(`^import\s+([A-Za-z][\w.]*)\s*$`)
+	// The trailing (\.\*)? group is what makes on-demand ("wildcard") imports
+	// visible: `import com.example.models.*;`.
+	javaImportRe   = regexp.MustCompile(`^import\s+(?:static\s+)?([A-Za-z][\w.]*?)(\.\*)?\s*;`)
+	kotlinImportRe = regexp.MustCompile(`^import\s+([A-Za-z][\w.]*?)(\.\*)?\s*$`)
+
+	// jvmPackageRe matches the package declaration of a Java/Kotlin file.
+	jvmPackageRe = regexp.MustCompile(`(?m)^\s*package\s+([\w.]+)`)
+	// jvmDeclRe matches a *top-level* Java/Kotlin declaration — anchored at
+	// column 0, so members of a class (which are indented) cannot match. This
+	// is what lets a Kotlin file declaring several types be found by an import
+	// of any one of them.
+	jvmDeclRe = regexp.MustCompile(`(?m)^(?:@\w+(?:\([^)\n]*\))?\s+)*` +
+		`(?:(?:public|private|protected|internal|open|final|abstract|sealed|non-sealed|static|strictfp|` +
+		`data|value|inner|annotation|enum|expect|actual|external|const|suspend|operator|infix|inline|` +
+		`lateinit|tailrec|companion)\s+)*` +
+		`(?:@interface|class|interface|object|typealias|record|enum|fun|val|var)\b\s*` +
+		`(?:<[^>\n]*>\s*)?([A-Za-z_]\w*)`)
 
 	rbRequire         = regexp.MustCompile(`^\s*require\s+['"]([^'"]+)['"]`)
 	rbRequireRelative = regexp.MustCompile(`^\s*require_relative\s+['"]([^'"]+)['"]`)
 
 	// Elixir module reference patterns
-	exModuleRef = regexp.MustCompile(`\b([A-Z][A-Za-z0-9]*(?:\.[A-Z][A-Za-z0-9]*)+)`)
+	exModuleRef = regexp.MustCompile(`\b([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)+)`)
 
 	// Rust import patterns
 	rsUseStmt = regexp.MustCompile(`^use\s+((?:crate|self|super)(?:::\w+)+)`)
@@ -163,74 +415,67 @@ var (
 
 	// Scala import pattern
 	scalaImportRe = regexp.MustCompile(`^import\s+([A-Za-z_][\w.]*)(?:\.\{|\.[\w*]+)`)
+
+	// Julia: string literals inside an include(...) argument list.
+	juliaStringRe = regexp.MustCompile(`"((?:[^"\\]|\\.)*)"`)
 )
 
-func extractImports(root string, f *scan.FileEntry, goModPath string, idx *FileIndex) []string {
-	fullPath := filepath.Join(root, f.RelPath)
+func extractImports(f *scan.FileEntry, rc *resolveCtx) ([]string, ImportStats) {
+	fullPath := filepath.Join(rc.root, f.RelPath)
+	t := &importTally{lang: f.Lang}
 
+	var out []string
 	switch f.Lang {
 	case "go":
-		specs := importSpecs(fullPath, f.Lang, 150, goRegexSpecs)
-		return resolveGoSpecs(specs, f.RelPath, goModPath, idx)
+		out = resolveGoSpecs(importSpecs(fullPath, f.Lang, 150, goRegexSpecs), f.RelPath, rc.goMods, rc.idx, t)
 	case "javascript", "typescript":
-		specs := importSpecs(fullPath, f.Lang, 150, jsRegexSpecs)
-		return resolveJSSpecs(specs, f.RelPath, idx)
+		out = resolveJSSpecs(importSpecs(fullPath, f.Lang, 150, jsRegexSpecs), f.RelPath, rc, t)
 	case "python":
-		specs := importSpecs(fullPath, f.Lang, 150, pyRegexSpecs)
-		return resolvePySpecs(specs, f.RelPath, idx)
+		out = resolvePySpecs(pythonImportSpecs(fullPath), f.RelPath, rc, t)
 	case "zig":
-		specs := importSpecs(fullPath, f.Lang, 300, noRegexSpecs)
-		return resolveZigSpecs(specs, f.RelPath, idx)
+		out = resolveZigSpecs(importSpecs(fullPath, f.Lang, 300, noRegexSpecs), f.RelPath, rc.idx, t)
 	case "lua":
-		specs := importSpecs(fullPath, f.Lang, 150, noRegexSpecs)
-		return resolveLuaSpecs(specs, f.RelPath, idx)
+		out = resolveLuaSpecs(importSpecs(fullPath, f.Lang, 150, noRegexSpecs), f.RelPath, rc.idx, t)
 	case "julia":
-		specs := importSpecs(fullPath, f.Lang, 300, noRegexSpecs)
-		return resolveJuliaSpecs(specs, f.RelPath, idx)
+		out = resolveJuliaSpecs(importSpecs(fullPath, f.Lang, 300, noRegexSpecs), f.RelPath, rc.idx, t)
 	case "shell":
-		specs := importSpecs(fullPath, f.Lang, 200, noRegexSpecs)
-		return resolveShellSpecs(specs, f.RelPath, idx)
-	case "java":
-		specs := importSpecs(fullPath, f.Lang, 100, javaRegexSpecs)
-		return resolveJavaSpecs(specs, f.RelPath, "java", idx)
-	case "kotlin":
-		specs := importSpecs(fullPath, f.Lang, 100, kotlinRegexSpecs)
-		return resolveJavaSpecs(specs, f.RelPath, "kotlin", idx)
+		out = resolveShellSpecs(importSpecs(fullPath, f.Lang, 200, noRegexSpecs), f.RelPath, rc.idx, t)
+	case "java", "kotlin":
+		out = resolveJavaSpecs(jvmImportSpecs(fullPath, f.Lang), f.RelPath, f.Lang, rc, t)
 	case "csharp":
-		specs := importSpecs(fullPath, f.Lang, 100, csharpRegexSpecs)
-		return resolveCSharpSpecs(specs, f.RelPath, idx)
+		out = resolveCSharpSpecs(csharpImportSpecs(fullPath), f.RelPath, rc, t)
 	case "ruby":
-		return resolveRubySpecs(rubyImportSpecs(fullPath), f.RelPath, idx)
+		out = resolveRubySpecs(rubyImportSpecs(fullPath), f.RelPath, rc.idx, t)
 	case "rust":
-		return resolveRustSpecs(rustImportSpecs(fullPath), f.RelPath, idx)
+		out = resolveRustSpecs(rustImportSpecs(fullPath), f.RelPath, rc.idx, t)
 	case "swift":
 		lines, err := readHeadLines(fullPath, 50)
 		if err != nil {
-			return nil
+			return nil, ImportStats{}
 		}
-		return resolveSwiftImports(lines, f.RelPath, idx)
+		out = resolveSwiftImports(lines, f.RelPath, rc, t)
 	case "php":
-		specs := importSpecs(fullPath, f.Lang, 100, phpRegexSpecs)
-		return resolvePHPSpecs(specs, f.RelPath, root, idx)
+		out = resolvePHPSpecs(importSpecs(fullPath, f.Lang, 100, phpRegexSpecs), f.RelPath, rc, t)
 	case "dart":
 		lines, err := readHeadLines(fullPath, 100)
 		if err != nil {
-			return nil
+			return nil, ImportStats{}
 		}
-		return resolveDartImports(lines, f.RelPath, root, idx)
+		out = resolveDartImports(lines, f.RelPath, rc.root, rc.idx, t)
 	case "scala":
-		specs := importSpecs(fullPath, f.Lang, 100, scalaRegexSpecs)
-		return resolveScalaSpecs(specs, f.RelPath, idx)
+		out = resolveScalaSpecs(importSpecs(fullPath, f.Lang, 100, scalaRegexSpecs), f.RelPath, rc.idx, t)
 	case "elixir":
-		// Elixir needs full file scan — module refs appear anywhere, not just top
+		// Elixir needs a full file scan — module refs appear anywhere, not just
+		// at the top.
 		lines, err := readAllLines(fullPath)
 		if err != nil {
-			return nil
+			return nil, ImportStats{}
 		}
-		return resolveElixirImports(lines, f.RelPath, idx)
+		out = resolveElixirImports(lines, f.RelPath, rc, t)
 	default:
-		return nil
+		return nil, ImportStats{}
 	}
+	return out, t.stats()
 }
 
 func readHeadLines(path string, maxLines int) ([]string, error) {
@@ -246,6 +491,132 @@ func readHeadLines(path string, maxLines int) ([]string, error) {
 		lines = append(lines, scanner.Text())
 	}
 	return lines, nil
+}
+
+func readAllLines(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	return lines, scanner.Err()
+}
+
+// importSpecs returns the raw import specifiers for a file, preferring
+// tree-sitter extraction and falling back to a per-language regex extractor
+// (over the first maxLines lines) when no grammar/import-query is available or
+// the parse fails.
+func importSpecs(fullPath, lang string, maxLines int, regexFallback func([]string) []string) []string {
+	if hasTSImports(lang) {
+		if data, err := os.ReadFile(fullPath); err == nil {
+			if specs, ok := tsImportSpecs(data, lang); ok {
+				return specs
+			}
+		}
+	}
+	lines, err := readHeadLines(fullPath, maxLines)
+	if err != nil {
+		return nil
+	}
+	return regexFallback(lines)
+}
+
+// noRegexSpecs is the no-op fallback for languages whose import extraction is
+// tree-sitter-only (no regex extractor).
+func noRegexSpecs([]string) []string { return nil }
+
+// splitSpec splits a "kind:value" tagged specifier. Untagged specifiers (which
+// is what the resolver unit tests pass) fall back to defKind.
+func splitSpec(spec, defKind string) (kind, value string) {
+	k, v, ok := strings.Cut(spec, ":")
+	if !ok {
+		return defKind, spec
+	}
+	return k, v
+}
+
+// ─── Go ───────────────────────────────────────────────────────────────────────
+
+// goModule is one go.mod found in the repo: its declared module path and the
+// repo-relative directory it lives in ("" for the repo root).
+type goModule struct {
+	Path string
+	Dir  string
+}
+
+// detectGoModules finds every go.mod in the repo, not just the one at the root.
+// Multi-module repos (go.work workspaces, services/*/go.mod layouts) are common
+// and a root-only lookup silently produces an empty Go import graph for them.
+func detectGoModules(root string, idx *FileIndex) []goModule {
+	seen := make(map[string]bool)
+	var mods []goModule
+
+	add := func(rel string) {
+		if seen[rel] {
+			return
+		}
+		seen[rel] = true
+		modPath := readGoModulePath(filepath.Join(root, rel))
+		if modPath == "" {
+			return
+		}
+		dir := filepath.Dir(rel)
+		if dir == "." {
+			dir = ""
+		}
+		mods = append(mods, goModule{Path: modPath, Dir: dir})
+	}
+
+	add("go.mod")
+	if idx != nil {
+		for _, f := range idx.All() {
+			if filepath.Base(f.RelPath) == "go.mod" {
+				add(f.RelPath)
+			}
+		}
+	}
+
+	// Longest module path first so nested modules win over their parents.
+	sort.Slice(mods, func(i, j int) bool {
+		if len(mods[i].Path) != len(mods[j].Path) {
+			return len(mods[i].Path) > len(mods[j].Path)
+		}
+		return mods[i].Path < mods[j].Path
+	})
+	return mods
+}
+
+func readGoModulePath(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "module ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "module "))
+		}
+	}
+	return ""
+}
+
+// matchGoModule returns the module owning an import path and the package path
+// within it ("" when the import names the module's own root package).
+func matchGoModule(imp string, mods []goModule) (goModule, string, bool) {
+	for _, m := range mods {
+		if imp == m.Path {
+			return m, "", true
+		}
+		if strings.HasPrefix(imp, m.Path+"/") {
+			return m, imp[len(m.Path)+1:], true
+		}
+	}
+	return goModule{}, "", false
 }
 
 // goRegexSpecs is the regex fallback extractor for Go import specifiers. It
@@ -268,49 +639,47 @@ func goRegexSpecs(lines []string) []string {
 	return specs
 }
 
-// resolveGoSpecs resolves Go import paths under the module path to local files.
-func resolveGoSpecs(specs []string, filePath, goModPath string, idx *FileIndex) []string {
-	if goModPath == "" {
-		return nil
-	}
+// resolveGoSpecs resolves Go import paths belonging to any module in the repo.
+func resolveGoSpecs(specs []string, filePath string, mods []goModule, idx *FileIndex, t *importTally) []string {
+	t.extract(len(specs))
 
-	// Resolve to local files
+	seen := make(map[string]bool)
 	var resolved []string
-	prefix := goModPath + "/"
 	for _, imp := range specs {
-		if !strings.HasPrefix(imp, prefix) {
+		mod, pkgPath, ok := matchGoModule(imp, mods)
+		if !ok {
+			t.skip()
 			continue
 		}
-		localPath := strings.TrimPrefix(imp, prefix)
-		// Go packages map to directories; find any .go file in that dir
-		files := idx.ByDir(localPath)
-		for _, f := range files {
-			if f.Lang == "go" && f.Class == scan.ClassSource {
-				resolved = append(resolved, f.RelPath)
+		// pkgPath == "" is the module's own root package — a library whose API
+		// lives at its module root is imported exactly this way.
+		localDir := mod.Dir
+		if pkgPath != "" {
+			localDir = filepath.Join(mod.Dir, pkgPath)
+		}
+
+		found := false
+		for _, f := range idx.ByDir(localDir) {
+			if f.Lang != "go" || f.Class != scan.ClassSource {
+				continue
 			}
+			found = true
+			if f.RelPath == filePath || seen[f.RelPath] {
+				continue
+			}
+			seen[f.RelPath] = true
+			resolved = append(resolved, f.RelPath)
+		}
+		if found {
+			t.hit()
+		} else {
+			t.miss(imp)
 		}
 	}
 	return resolved
 }
 
-// importSpecs returns the raw import specifiers for a file, preferring
-// tree-sitter extraction and falling back to a per-language regex extractor
-// (over the first maxLines lines) when no grammar/import-query is available or
-// the parse fails.
-func importSpecs(fullPath, lang string, maxLines int, regexFallback func([]string) []string) []string {
-	if hasTSImports(lang) {
-		if data, err := os.ReadFile(fullPath); err == nil {
-			if specs, ok := tsImportSpecs(data, lang); ok {
-				return specs
-			}
-		}
-	}
-	lines, err := readHeadLines(fullPath, maxLines)
-	if err != nil {
-		return nil
-	}
-	return regexFallback(lines)
-}
+// ─── JavaScript / TypeScript ──────────────────────────────────────────────────
 
 // jsRegexSpecs is the regex fallback extractor for JS/TS import specifiers.
 func jsRegexSpecs(lines []string) []string {
@@ -323,23 +692,95 @@ func jsRegexSpecs(lines []string) []string {
 	return specs
 }
 
-// resolveJSSpecs resolves relative JS/TS module specifiers to local files.
-func resolveJSSpecs(specs []string, filePath string, idx *FileIndex) []string {
+// jsAlias is one tsconfig `paths` entry. Patterns contain at most one "*".
+type jsAlias struct {
+	prefix   string
+	suffix   string
+	wildcard bool
+	targets  []string // baseUrl-joined, repo-relative, "*" kept as placeholder
+}
+
+// resolveJSSpecs resolves JS/TS module specifiers to local files: relative
+// paths, and bare specifiers matched by a tsconfig/jsconfig `paths` alias.
+func resolveJSSpecs(specs []string, filePath string, rc *resolveCtx, t *importTally) []string {
+	t.extract(len(specs))
+
 	dir := filepath.Dir(filePath)
 	seen := make(map[string]bool)
 	var resolved []string
-	for _, imp := range specs {
-		if !strings.HasPrefix(imp, ".") {
-			continue // external package
+
+	add := func(found string) {
+		if found == "" || found == filePath || seen[found] {
+			return
 		}
-		target := filepath.Clean(filepath.Join(dir, imp))
-		found := resolveJSPath(target, idx)
-		if found != "" && !seen[found] {
-			seen[found] = true
-			resolved = append(resolved, found)
+		seen[found] = true
+		resolved = append(resolved, found)
+	}
+
+	for _, imp := range specs {
+		if strings.HasPrefix(imp, ".") {
+			target := filepath.Clean(filepath.Join(dir, imp))
+			found := resolveJSPath(target, rc.idx)
+			if found == "" {
+				t.miss(imp)
+				continue
+			}
+			t.hit()
+			add(found)
+			continue
+		}
+
+		matched, found := resolveJSAlias(imp, rc)
+		switch {
+		case found != "":
+			t.hit()
+			add(found)
+		case matched:
+			// An alias claimed this specifier but no file backs it.
+			t.miss(imp)
+		default:
+			t.skip() // third-party package
 		}
 	}
 	return resolved
+}
+
+// resolveJSAlias maps a bare specifier through the tsconfig `paths` aliases.
+// The bool reports whether an alias pattern matched at all, which is what
+// separates "unresolved local alias" from "third-party package".
+func resolveJSAlias(imp string, rc *resolveCtx) (bool, string) {
+	matched := false
+	for _, a := range rc.jsPathAliases() {
+		var star string
+		if a.wildcard {
+			if !strings.HasPrefix(imp, a.prefix) || !strings.HasSuffix(imp, a.suffix) ||
+				len(imp) < len(a.prefix)+len(a.suffix) {
+				continue
+			}
+			star = imp[len(a.prefix) : len(imp)-len(a.suffix)]
+		} else if imp != a.prefix {
+			continue
+		}
+		matched = true
+		for _, target := range a.targets {
+			cand := filepath.Clean(strings.Replace(target, "*", star, 1))
+			if found := resolveJSPath(cand, rc.idx); found != "" {
+				return true, found
+			}
+		}
+	}
+	return matched, ""
+}
+
+// jsExtCandidates maps the extension written in a specifier to the extensions
+// that may back it on disk. Under moduleResolution NodeNext/Node16, TypeScript
+// *requires* ESM specifiers to say ".js" while the file on disk is ".ts", so a
+// literal extension match finds nothing in a modern TS ESM repo.
+var jsExtCandidates = map[string][]string{
+	".js":  {".ts", ".tsx", ".js", ".jsx"},
+	".jsx": {".tsx", ".jsx"},
+	".mjs": {".mts", ".mjs"},
+	".cjs": {".cts", ".cjs"},
 }
 
 func resolveJSPath(target string, idx *FileIndex) string {
@@ -347,7 +788,22 @@ func resolveJSPath(target string, idx *FileIndex) string {
 	if idx.Exists(target) {
 		return target
 	}
-	// Try with extensions
+	// A written extension may name the compiler *output*; try the sources that
+	// could produce it.
+	if ext := filepath.Ext(target); ext != "" {
+		if cands, ok := jsExtCandidates[ext]; ok {
+			base := strings.TrimSuffix(target, ext)
+			for _, c := range cands {
+				if idx.Exists(base + c) {
+					return base + c
+				}
+			}
+			// ./dir/index.js written for ./dir/index.ts is covered above; a
+			// ".js" specifier naming a directory is not legal ESM, so stop here.
+			return ""
+		}
+	}
+	// Extensionless specifier
 	for _, ext := range []string{".ts", ".tsx", ".js", ".jsx", ".mjs", ".mts"} {
 		if idx.Exists(target + ext) {
 			return target + ext
@@ -361,6 +817,117 @@ func resolveJSPath(target string, idx *FileIndex) string {
 	}
 	return ""
 }
+
+// jsPathAliases parses `compilerOptions.paths` from the repo-root tsconfig.json
+// (or jsconfig.json).
+//
+// Scope: the root config only — `extends` chains, per-package configs and
+// workspace/monorepo package resolution are deliberately not followed. Those
+// need the package.json graph and produce ambiguous many-to-one mappings; a
+// wrong guess there fabricates edges, which is worse than dropping them. Bare
+// specifiers no alias claims stay classified External, so the telemetry shows
+// how much is being left on the table.
+func (rc *resolveCtx) jsPathAliases() []jsAlias {
+	rc.jsOnce.Do(func() {
+		for _, name := range []string{"tsconfig.json", "jsconfig.json"} {
+			data, err := os.ReadFile(filepath.Join(rc.root, name))
+			if err != nil {
+				continue
+			}
+			var cfg struct {
+				CompilerOptions struct {
+					BaseURL string              `json:"baseUrl"`
+					Paths   map[string][]string `json:"paths"`
+				} `json:"compilerOptions"`
+			}
+			if err := json.Unmarshal(stripJSONComments(data), &cfg); err != nil {
+				continue
+			}
+			base := cfg.CompilerOptions.BaseURL
+			if base == "." {
+				base = ""
+			}
+			for pattern, targets := range cfg.CompilerOptions.Paths {
+				a := jsAlias{}
+				if i := strings.IndexByte(pattern, '*'); i >= 0 {
+					a.wildcard = true
+					a.prefix = pattern[:i]
+					a.suffix = pattern[i+1:]
+				} else {
+					a.prefix = pattern
+				}
+				for _, tgt := range targets {
+					a.targets = append(a.targets, filepath.Join(base, tgt))
+				}
+				sort.Strings(a.targets)
+				rc.jsAliases = append(rc.jsAliases, a)
+			}
+			// Longest prefix first so a more specific alias wins.
+			sort.Slice(rc.jsAliases, func(i, j int) bool {
+				return len(rc.jsAliases[i].prefix) > len(rc.jsAliases[j].prefix)
+			})
+			return
+		}
+	})
+	return rc.jsAliases
+}
+
+// stripJSONComments removes // and /* */ comments and trailing commas so a
+// JSONC file (which is what tsconfig.json really is) parses as JSON.
+func stripJSONComments(data []byte) []byte {
+	out := make([]byte, 0, len(data))
+	inStr, esc := false, false
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if inStr {
+			out = append(out, c)
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch {
+		case c == '"':
+			inStr = true
+			out = append(out, c)
+		case c == '/' && i+1 < len(data) && data[i+1] == '/':
+			for i < len(data) && data[i] != '\n' {
+				i++
+			}
+			out = append(out, '\n')
+		case c == '/' && i+1 < len(data) && data[i+1] == '*':
+			i += 2
+			for i+1 < len(data) && !(data[i] == '*' && data[i+1] == '/') {
+				i++
+			}
+			i++
+		default:
+			out = append(out, c)
+		}
+	}
+	// Drop trailing commas before } or ].
+	res := make([]byte, 0, len(out))
+	for i := 0; i < len(out); i++ {
+		if out[i] == ',' {
+			j := i + 1
+			for j < len(out) && (out[j] == ' ' || out[j] == '\t' || out[j] == '\n' || out[j] == '\r') {
+				j++
+			}
+			if j < len(out) && (out[j] == '}' || out[j] == ']') {
+				continue
+			}
+		}
+		res = append(res, out[i])
+	}
+	return res
+}
+
+// ─── Ruby ─────────────────────────────────────────────────────────────────────
 
 // rubyImportSpecs returns tagged Ruby import specifiers, preferring tree-sitter
 // and falling back to regex.
@@ -390,6 +957,101 @@ func rubyImportSpecs(fullPath string) []string {
 	return rubyRegexSpecs(lines)
 }
 
+// resolveRubyImports is the line-based entry point kept for tests; it extracts
+// specifiers with regex and resolves them.
+func resolveRubyImports(lines []string, filePath string, idx *FileIndex) []string {
+	return resolveRubySpecs(rubyRegexSpecs(lines), filePath, idx, nil)
+}
+
+// rubyRegexSpecs is the regex fallback extractor for Ruby. Specifiers are tagged
+// with their directive: "rel:<path>" for require_relative, "abs:<path>" for
+// require — the resolver needs the distinction.
+func rubyRegexSpecs(lines []string) []string {
+	var specs []string
+	for _, line := range lines {
+		if m := rbRequireRelative.FindStringSubmatch(line); m != nil {
+			specs = append(specs, "rel:"+m[1])
+			continue
+		}
+		if m := rbRequire.FindStringSubmatch(line); m != nil {
+			specs = append(specs, "abs:"+m[1])
+		}
+	}
+	return specs
+}
+
+// resolveRubySpecs resolves tagged Ruby require/require_relative specifiers.
+func resolveRubySpecs(specs []string, filePath string, idx *FileIndex, t *importTally) []string {
+	t.extract(len(specs))
+
+	dir := filepath.Dir(filePath)
+	seen := make(map[string]bool)
+	var resolved []string
+
+	for _, spec := range specs {
+		kind, imp := splitSpec(spec, "abs")
+
+		if kind == "rel" {
+			// require_relative — resolve relative to the current file's directory
+			target := filepath.Clean(filepath.Join(dir, imp))
+			if !strings.HasSuffix(target, ".rb") {
+				target += ".rb"
+			}
+			if !idx.Exists(target) {
+				t.miss(imp)
+				continue
+			}
+			t.hit()
+			if !seen[target] {
+				seen[target] = true
+				resolved = append(resolved, target)
+			}
+			continue
+		}
+
+		// require — try common Ruby source roots.
+		// Skip gem-like requires: no "/" or "." and no local file match.
+		if !strings.Contains(imp, "/") && !strings.Contains(imp, ".") {
+			found := false
+			for _, root := range []string{"lib/", "app/", "src/"} {
+				if idx.Exists(root + imp + ".rb") {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.skip()
+				continue
+			}
+		}
+
+		hit := false
+		for _, root := range []string{"lib/", "app/", "src/", ""} {
+			candidate := filepath.Clean(root + imp)
+			if !strings.HasSuffix(candidate, ".rb") {
+				candidate += ".rb"
+			}
+			if !idx.Exists(candidate) {
+				continue
+			}
+			hit = true
+			if !seen[candidate] {
+				seen[candidate] = true
+				resolved = append(resolved, candidate)
+			}
+			break
+		}
+		if hit {
+			t.hit()
+		} else {
+			t.skip() // a gem, not a local file
+		}
+	}
+	return resolved
+}
+
+// ─── Rust ─────────────────────────────────────────────────────────────────────
+
 // rustImportSpecs returns tagged Rust import specifiers, preferring tree-sitter
 // and falling back to regex.
 func rustImportSpecs(fullPath string) []string {
@@ -415,259 +1077,9 @@ func rustImportSpecs(fullPath string) []string {
 	return rustRegexSpecs(lines)
 }
 
-// resolveRubyImports is the line-based entry point kept for tests; it extracts
-// specifiers with regex and resolves them.
-func resolveRubyImports(lines []string, filePath string, idx *FileIndex) []string {
-	return resolveRubySpecs(rubyRegexSpecs(lines), filePath, idx)
-}
-
-// rubyRegexSpecs is the regex fallback extractor for Ruby. Specifiers are tagged
-// with their directive: "rel:<path>" for require_relative, "abs:<path>" for
-// require — the resolver needs the distinction.
-func rubyRegexSpecs(lines []string) []string {
-	var specs []string
-	for _, line := range lines {
-		if m := rbRequireRelative.FindStringSubmatch(line); m != nil {
-			specs = append(specs, "rel:"+m[1])
-			continue
-		}
-		if m := rbRequire.FindStringSubmatch(line); m != nil {
-			specs = append(specs, "abs:"+m[1])
-		}
-	}
-	return specs
-}
-
-// resolveRubySpecs resolves tagged Ruby require/require_relative specifiers.
-func resolveRubySpecs(specs []string, filePath string, idx *FileIndex) []string {
-	dir := filepath.Dir(filePath)
-	seen := make(map[string]bool)
-	var resolved []string
-
-	for _, spec := range specs {
-		kind, imp, _ := strings.Cut(spec, ":")
-
-		if kind == "rel" {
-			// require_relative — resolve relative to the current file's directory
-			target := filepath.Clean(filepath.Join(dir, imp))
-			if !strings.HasSuffix(target, ".rb") {
-				target += ".rb"
-			}
-			if idx.Exists(target) && !seen[target] {
-				seen[target] = true
-				resolved = append(resolved, target)
-			}
-			continue
-		}
-
-		// require — try common Ruby source roots.
-		// Skip gem-like requires: no "/" or "." and no local file match.
-		if !strings.Contains(imp, "/") && !strings.Contains(imp, ".") {
-			found := false
-			for _, root := range []string{"lib/", "app/", "src/"} {
-				if idx.Exists(root + imp + ".rb") {
-					found = true
-					break
-				}
-			}
-			if !found {
-				continue
-			}
-		}
-
-		for _, root := range []string{"lib/", "app/", "src/", ""} {
-			candidate := filepath.Clean(root + imp)
-			if !strings.HasSuffix(candidate, ".rb") {
-				candidate += ".rb"
-			}
-			if idx.Exists(candidate) && !seen[candidate] {
-				seen[candidate] = true
-				resolved = append(resolved, candidate)
-				break
-			}
-		}
-	}
-	return resolved
-}
-
-// javaRegexSpecs is the regex fallback extractor for Java import specifiers
-// (dotted names, e.g. com.example.User).
-func javaRegexSpecs(lines []string) []string {
-	return javaLikeRegexSpecs(lines, javaImportRe)
-}
-
-// kotlinRegexSpecs is the regex fallback extractor for Kotlin import specifiers.
-func kotlinRegexSpecs(lines []string) []string {
-	return javaLikeRegexSpecs(lines, kotlinImportRe)
-}
-
-func javaLikeRegexSpecs(lines []string, re *regexp.Regexp) []string {
-	var specs []string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if m := re.FindStringSubmatch(line); m != nil {
-			specs = append(specs, m[1])
-		}
-	}
-	return specs
-}
-
-// resolveJavaSpecs resolves Java/Kotlin dotted import names to local files using
-// the standard source-root conventions.
-func resolveJavaSpecs(specs []string, filePath string, lang string, idx *FileIndex) []string {
-	seen := make(map[string]bool)
-	var resolved []string
-
-	for _, imp := range specs {
-		// Skip standard library imports
-		if strings.HasPrefix(imp, "java.") || strings.HasPrefix(imp, "javax.") ||
-			strings.HasPrefix(imp, "kotlin.") || strings.HasPrefix(imp, "kotlinx.") ||
-			strings.HasPrefix(imp, "android.") {
-			continue
-		}
-
-		// For static imports, take the class part.
-		// If the last segment starts with lowercase, it's a member — strip it.
-		parts := strings.Split(imp, ".")
-		if len(parts) > 1 {
-			last := parts[len(parts)-1]
-			if len(last) > 0 && last[0] >= 'a' && last[0] <= 'z' {
-				parts = parts[:len(parts)-1]
-			}
-		}
-
-		// Convert dots to path separators: com.example.User → com/example/User
-		classPath := strings.Join(parts, "/")
-
-		// Source root prefixes to try (plus root-level with empty prefix)
-		roots := []string{
-			"src/main/java/",
-			"src/main/kotlin/",
-			"src/",
-			"app/src/main/java/",
-			"app/src/main/kotlin/",
-			"",
-		}
-		exts := []string{".java", ".kt"}
-
-		for _, root := range roots {
-			for _, ext := range exts {
-				candidate := root + classPath + ext
-				if idx.Exists(candidate) && candidate != filePath && !seen[candidate] {
-					seen[candidate] = true
-					resolved = append(resolved, candidate)
-				}
-			}
-		}
-	}
-	return resolved
-}
-
-// csharpRegexSpecs is the regex fallback extractor for C# using directives
-// (dotted namespaces, e.g. Public.Common.Services).
-func csharpRegexSpecs(lines []string) []string {
-	var specs []string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if m := csUsing.FindStringSubmatch(line); m != nil {
-			specs = append(specs, m[1])
-		}
-	}
-	return specs
-}
-
-// resolveCSharpSpecs resolves C# using namespaces to file paths by matching
-// namespace segments against the file index. C# has no strict namespace-to-file
-// mapping, so we use directory-based heuristics.
-func resolveCSharpSpecs(specs []string, filePath string, idx *FileIndex) []string {
-	seen := make(map[string]bool)
-	var resolved []string
-
-	for _, ns := range specs {
-		// Skip system/framework namespaces
-		if strings.HasPrefix(ns, "System") || strings.HasPrefix(ns, "Microsoft") ||
-			strings.HasPrefix(ns, "NuGet") {
-			continue
-		}
-
-		// .NET namespaces map to directories in two forms:
-		//   1. Dots as slashes:  Public.Common → Public/Common
-		//   2. Dots kept as-is:  Public.Common → Public.Common (standard .NET project naming)
-		nsSlashed := strings.ReplaceAll(ns, ".", "/")
-		nsDotted := ns
-		segments := strings.Split(ns, ".")
-
-		// Build suffix patterns from the last 1–3 segments in both forms.
-		// E.g., Public.Domain.Discount.Models → try:
-		//   slash: "Models", "Discount/Models", "Domain/Discount/Models"
-		//   dotted: "Models", "Discount.Models", "Domain.Discount.Models"
-		var slashSuffixes, dottedSuffixes []string
-		for i := len(segments) - 1; i >= 0 && len(segments)-i <= 3; i-- {
-			slashSuffixes = append(slashSuffixes, strings.Join(segments[i:], "/"))
-			dottedSuffixes = append(dottedSuffixes, strings.Join(segments[i:], "."))
-		}
-
-		// Strategy 1: direct directory match under the full namespace path.
-		// Try both dotted (Public.Common) and slashed (Public/Common) forms,
-		// with common root prefixes.
-		foundDirect := false
-		dirCandidates := []string{nsSlashed, nsDotted}
-		for _, candidate := range dirCandidates {
-			// Try bare, under src/, and with any intermediate directories.
-			for _, prefix := range []string{"", "src/"} {
-				files := idx.FilesInDir(prefix + candidate)
-				for _, f := range files {
-					if f.Lang == "csharp" && f.RelPath != filePath && !seen[f.RelPath] {
-						seen[f.RelPath] = true
-						resolved = append(resolved, f.RelPath)
-						foundDirect = true
-					}
-				}
-			}
-		}
-
-		// Strategy 2: scan all .cs files for directory paths ending with namespace segments.
-		// Match against both slash-separated and dot-separated directory names.
-		if !foundDirect {
-			for _, f := range idx.All() {
-				if f.Lang != "csharp" || f.RelPath == filePath || seen[f.RelPath] {
-					continue
-				}
-				relDir := filepath.Dir(f.RelPath)
-				lowerDir := strings.ToLower(filepath.ToSlash(relDir))
-
-				matched := false
-				// Try slash-separated suffixes (Discount/Models).
-				for _, suffix := range slashSuffixes {
-					lower := strings.ToLower(suffix)
-					if strings.HasSuffix(lowerDir, "/"+lower) || lowerDir == lower {
-						matched = true
-						break
-					}
-				}
-				// Try dotted suffixes (Public.Domain, DataLayer.Tests).
-				if !matched {
-					for _, suffix := range dottedSuffixes {
-						lower := strings.ToLower(suffix)
-						if strings.HasSuffix(lowerDir, "/"+lower) || lowerDir == lower {
-							matched = true
-							break
-						}
-					}
-				}
-				if matched {
-					seen[f.RelPath] = true
-					resolved = append(resolved, f.RelPath)
-				}
-			}
-		}
-	}
-	return resolved
-}
-
 // resolveRustImports is the line-based entry point kept for tests.
 func resolveRustImports(lines []string, filePath string, idx *FileIndex) []string {
-	return resolveRustSpecs(rustRegexSpecs(lines), filePath, idx)
+	return resolveRustSpecs(rustRegexSpecs(lines), filePath, idx, nil)
 }
 
 // rustRegexSpecs is the regex fallback extractor for Rust. Specifiers are tagged
@@ -687,9 +1099,31 @@ func rustRegexSpecs(lines []string) []string {
 	return specs
 }
 
-// resolveRustSpecs resolves tagged Rust use-paths and mod declarations.
-func resolveRustSpecs(specs []string, filePath string, idx *FileIndex) []string {
+// rustModuleDirs returns the directory that holds the submodules of the module
+// defined by filePath, and the directory that holds its siblings (its parent
+// module's submodules).
+//
+// Only mod.rs (and the crate roots lib.rs/main.rs) stand for the *directory*
+// they live in. Any other file src/models/user.rs defines module models::user,
+// whose parent (models) owns src/models — so `super::` there must resolve in
+// src/models, not one level above it.
+func rustModuleDirs(filePath string) (self, parent string) {
 	dir := filepath.Dir(filePath)
+	switch filepath.Base(filePath) {
+	case "mod.rs", "lib.rs", "main.rs":
+		return dir, filepath.Dir(dir)
+	default:
+		stem := strings.TrimSuffix(filepath.Base(filePath), ".rs")
+		return filepath.Join(dir, stem), dir
+	}
+}
+
+// resolveRustSpecs resolves tagged Rust use-paths and mod declarations.
+func resolveRustSpecs(specs []string, filePath string, idx *FileIndex, t *importTally) []string {
+	t.extract(len(specs))
+
+	dir := filepath.Dir(filePath)
+	selfDir, parentDir := rustModuleDirs(filePath)
 	seen := make(map[string]bool)
 	var resolved []string
 
@@ -705,7 +1139,7 @@ func resolveRustSpecs(specs []string, filePath string, idx *FileIndex) []string 
 
 	// resolveUnder tries {base}/{modPath}.rs, {base}/{modPath}/mod.rs, and the
 	// parent module file (the imported item may be defined in the parent module).
-	resolveUnder := func(base string, modParts []string) {
+	resolveUnder := func(base string, modParts []string) bool {
 		modPath := strings.Join(modParts, "/")
 		candidates := []string{
 			filepath.Join(base, modPath+".rs"),
@@ -716,31 +1150,47 @@ func resolveRustSpecs(specs []string, filePath string, idx *FileIndex) []string 
 			candidates = append(candidates, filepath.Join(base, parentPath+".rs"))
 		}
 		for _, candidate := range candidates {
-			if idx.Exists(candidate) && !seen[candidate] && candidate != filePath {
+			if !idx.Exists(candidate) || candidate == filePath {
+				continue
+			}
+			if !seen[candidate] {
 				seen[candidate] = true
 				resolved = append(resolved, candidate)
-				break
 			}
+			return true
 		}
+		return false
 	}
 
 	for _, spec := range specs {
-		kind, imp, _ := strings.Cut(spec, ":")
+		kind, imp := splitSpec(spec, "use")
 
 		if kind == "mod" {
 			// mod child; -> {dir}/child.rs or {dir}/child/mod.rs
 			if imp == "tests" || imp == "test" {
+				t.skip()
 				continue
 			}
+			hit := false
 			for _, candidate := range []string{
 				filepath.Join(dir, imp+".rs"),
 				filepath.Join(dir, imp, "mod.rs"),
 			} {
-				if idx.Exists(candidate) && !seen[candidate] {
+				if !idx.Exists(candidate) {
+					continue
+				}
+				hit = true
+				if !seen[candidate] {
 					seen[candidate] = true
 					resolved = append(resolved, candidate)
-					break
 				}
+				break
+			}
+			if hit {
+				t.hit()
+			} else {
+				// An inline `mod name { ... }` block has no file of its own.
+				t.skip()
 			}
 			continue
 		}
@@ -748,51 +1198,772 @@ func resolveRustSpecs(specs []string, filePath string, idx *FileIndex) []string 
 		// use crate::a::b / use self::x / use super::x
 		segments := strings.Split(imp, "::")
 		if len(segments) < 2 {
+			t.skip()
 			continue
 		}
 		modParts := segments[1:]
+		hit := false
 		switch segments[0] {
 		case "crate":
 			if crateRoot != "" {
-				resolveUnder(crateRoot, modParts)
+				hit = resolveUnder(crateRoot, modParts)
 			}
 		case "super":
-			resolveUnder(filepath.Dir(dir), modParts)
+			hit = resolveUnder(parentDir, modParts)
 		case "self":
-			resolveUnder(dir, modParts)
+			hit = resolveUnder(selfDir, modParts)
+		default:
+			t.skip()
+			continue
+		}
+		if hit {
+			t.hit()
+		} else {
+			// The item may live inline in a module file we already link, so this
+			// is a genuine drop worth reporting rather than an external crate.
+			t.miss(imp)
 		}
 	}
 	return resolved
 }
 
-// pyRegexSpecs is the regex fallback extractor for Python from-import modules.
+// ─── Python ───────────────────────────────────────────────────────────────────
+
+// pythonImportSpecs returns tagged Python import specifiers.
+//
+//	mod:<module>          the module of a from-import (relative or absolute)
+//	from:<module>|<name>  an imported name, which may itself be a submodule
+//	imp:<module>          a plain `import a.b.c`
+//
+// The names matter: `from . import mod_a` names no module at all in its
+// module_name, so without the name there is nothing to resolve.
+func pythonImportSpecs(fullPath string) []string {
+	if data, err := os.ReadFile(fullPath); err == nil {
+		if specs, ok := pythonSpecsFromSource(data); ok {
+			return specs
+		}
+	}
+	lines, err := readHeadLines(fullPath, 150)
+	if err != nil {
+		return nil
+	}
+	return pyRegexSpecs(lines)
+}
+
+// pythonSpecsFromSource is the tree-sitter half of pythonImportSpecs.
+func pythonSpecsFromSource(data []byte) ([]string, bool) {
+	if !hasTSImports("python") {
+		return nil, false
+	}
+	var specs []string
+	seen := make(map[string]bool)
+	add := func(s string) {
+		if !seen[s] {
+			seen[s] = true
+			specs = append(specs, s)
+		}
+	}
+	ok := tsImportEachMatch(data, "python", func(caps map[string]string) {
+		if p := caps["plain"]; p != "" {
+			add("imp:" + p)
+			return
+		}
+		mod := caps["mod"]
+		if mod == "" {
+			return
+		}
+		add("mod:" + mod)
+		if n := caps["name"]; n != "" {
+			add("from:" + mod + "|" + n)
+		}
+	})
+	return specs, ok
+}
+
+// pyRegexSpecs is the regex fallback extractor for Python imports.
 func pyRegexSpecs(lines []string) []string {
 	var specs []string
+	seen := make(map[string]bool)
+	add := func(s string) {
+		if !seen[s] {
+			seen[s] = true
+			specs = append(specs, s)
+		}
+	}
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if m := pyImportFrom.FindStringSubmatch(line); m != nil {
-			specs = append(specs, m[1])
+			mod := m[1]
+			add("mod:" + mod)
+			for _, name := range pySplitNames(m[2]) {
+				add("from:" + mod + "|" + name)
+			}
+			continue
+		}
+		if m := pyImport.FindStringSubmatch(line); m != nil {
+			for _, name := range pySplitNames(m[1]) {
+				add("imp:" + name)
+			}
 		}
 	}
 	return specs
 }
 
-// noRegexSpecs is the no-op fallback for languages whose import extraction is
-// tree-sitter-only (no regex extractor).
-func noRegexSpecs([]string) []string { return nil }
+// pySplitNames splits an import name list ("a, b as c, (d, e)") into names,
+// dropping aliases and wildcards.
+func pySplitNames(s string) []string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "(")
+	s = strings.TrimSuffix(s, ")")
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if i := strings.Index(part, " as "); i >= 0 {
+			part = strings.TrimSpace(part[:i])
+		}
+		if part == "" || part == "*" || part == "\\" {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
+}
+
+// pythonRoots returns the directories absolute Python imports resolve against:
+// the repo root plus every detected package root (the first directory above a
+// package that is not itself a package — which is exactly the src/ of a
+// src-layout project).
+func (rc *resolveCtx) pythonRoots() []string {
+	rc.pyOnce.Do(func() {
+		pkgDirs := make(map[string]bool)
+		hasSrc := false
+		for _, f := range rc.idx.All() {
+			if filepath.Base(f.RelPath) == "__init__.py" {
+				d := filepath.Dir(f.RelPath)
+				if d == "." {
+					d = ""
+				}
+				pkgDirs[d] = true
+			}
+			if f.Lang == "python" && strings.HasPrefix(f.RelPath, "src/") {
+				hasSrc = true
+			}
+		}
+
+		roots := map[string]bool{"": true}
+		if hasSrc {
+			// PEP 420 namespace packages have no __init__.py to walk up from.
+			roots["src"] = true
+		}
+		for d := range pkgDirs {
+			if d == "" {
+				continue
+			}
+			parent := filepath.Dir(d)
+			if parent == "." {
+				parent = ""
+			}
+			if !pkgDirs[parent] {
+				roots[parent] = true
+			}
+		}
+		for r := range roots {
+			rc.pyRoots = append(rc.pyRoots, r)
+		}
+		// Deepest root first: a more specific source root wins.
+		sort.Slice(rc.pyRoots, func(i, j int) bool {
+			if len(rc.pyRoots[i]) != len(rc.pyRoots[j]) {
+				return len(rc.pyRoots[i]) > len(rc.pyRoots[j])
+			}
+			return rc.pyRoots[i] < rc.pyRoots[j]
+		})
+	})
+	return rc.pyRoots
+}
+
+// pyModuleFile maps an absolute dotted module to a local file, or "" when no
+// file backs it. It only ever returns a path that actually exists, so a
+// third-party import cannot be turned into an edge by guessing.
+func (rc *resolveCtx) pyModuleFile(module string) string {
+	rel := strings.ReplaceAll(module, ".", "/")
+	for _, root := range rc.pythonRoots() {
+		base := filepath.Join(root, rel)
+		if rc.idx.Exists(base + ".py") {
+			return base + ".py"
+		}
+		if p := filepath.Join(base, "__init__.py"); rc.idx.Exists(p) {
+			return p
+		}
+	}
+	return ""
+}
+
+// pyTopLevelIsLocal reports whether the first segment of an absolute import
+// names a package that exists in this repo. It is what separates "we should
+// have resolved this" (unresolved) from "that's a third-party package"
+// (external) without needing a hardcoded stdlib list.
+func (rc *resolveCtx) pyTopLevelIsLocal(module string) bool {
+	top, _, _ := strings.Cut(module, ".")
+	if top == "" {
+		return false
+	}
+	for _, root := range rc.pythonRoots() {
+		base := filepath.Join(root, top)
+		if rc.idx.Exists(base+".py") || rc.idx.Exists(filepath.Join(base, "__init__.py")) {
+			return true
+		}
+		if len(rc.idx.ByDir(base)) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// pyResolveModule resolves a relative or absolute Python module to a file.
+func (rc *resolveCtx) pyResolveModule(dir, module string) string {
+	if !strings.HasPrefix(module, ".") {
+		return rc.pyModuleFile(module)
+	}
+
+	dots := 0
+	for dots < len(module) && module[dots] == '.' {
+		dots++
+	}
+	rest := module[dots:]
+
+	targetDir := dir
+	for i := 1; i < dots; i++ {
+		targetDir = filepath.Dir(targetDir)
+	}
+	if targetDir == "." {
+		targetDir = ""
+	}
+
+	if rest == "" {
+		// `from . import x` — the package itself is the module.
+		if p := filepath.Join(targetDir, "__init__.py"); rc.idx.Exists(p) {
+			return p
+		}
+		return ""
+	}
+
+	base := filepath.Join(targetDir, strings.ReplaceAll(rest, ".", "/"))
+	if rc.idx.Exists(base + ".py") {
+		return base + ".py"
+	}
+	if p := filepath.Join(base, "__init__.py"); rc.idx.Exists(p) {
+		return p
+	}
+	return ""
+}
+
+// resolvePySpecs resolves Python import specifiers to local files. Both
+// relative and absolute imports are resolved; absolute imports only ever match
+// a file that exists under a detected source root, so third-party packages
+// cannot be fabricated into edges.
+func resolvePySpecs(specs []string, filePath string, rc *resolveCtx, t *importTally) []string {
+	dir := filepath.Dir(filePath)
+	seen := make(map[string]bool)
+	var resolved []string
+	modules := 0
+
+	add := func(p string) {
+		if p == "" || p == filePath || seen[p] {
+			return
+		}
+		seen[p] = true
+		resolved = append(resolved, p)
+	}
+
+	for _, spec := range specs {
+		kind, val := splitSpec(spec, "mod")
+		switch kind {
+		case "mod", "imp":
+			modules++
+			target := rc.pyResolveModule(dir, val)
+			if target == "" {
+				if strings.HasPrefix(val, ".") || rc.pyTopLevelIsLocal(val) {
+					t.miss(val)
+				} else {
+					t.skip()
+				}
+				continue
+			}
+			t.hit()
+			add(target)
+		case "from":
+			// An imported name may itself be a submodule; if it is not, the
+			// module edge already covers it, so a miss here is not counted.
+			mod, name, _ := strings.Cut(val, "|")
+			combined := mod + "." + name
+			if strings.HasSuffix(mod, ".") {
+				combined = mod + name
+			}
+			add(rc.pyResolveModule(dir, combined))
+		}
+	}
+	t.extract(modules)
+	return resolved
+}
+
+// resolvePyRelative maps a relative from-import to a module file path. Kept as
+// the narrow, directly testable core of relative resolution.
+func resolvePyRelative(dir, imp string) string {
+	dots := 0
+	for _, c := range imp {
+		if c == '.' {
+			dots++
+		} else {
+			break
+		}
+	}
+	module := imp[dots:]
+
+	targetDir := dir
+	for i := 1; i < dots; i++ {
+		targetDir = filepath.Dir(targetDir)
+	}
+
+	if module == "" {
+		return ""
+	}
+
+	relPath := strings.ReplaceAll(module, ".", "/")
+	return filepath.Join(targetDir, relPath) + ".py"
+}
+
+// ─── Java / Kotlin ────────────────────────────────────────────────────────────
+
+// jvmImportSpecs returns tagged Java/Kotlin import specifiers:
+// "imp:<dotted>" for a normal import, "star:<package>" for an on-demand
+// (wildcard) import.
+func jvmImportSpecs(fullPath, lang string) []string {
+	if data, err := os.ReadFile(fullPath); err == nil {
+		if specs, ok := jvmSpecsFromSource(data, lang); ok {
+			return specs
+		}
+	}
+	lines, err := readHeadLines(fullPath, 100)
+	if err != nil {
+		return nil
+	}
+	if lang == "kotlin" {
+		return kotlinRegexSpecs(lines)
+	}
+	return javaRegexSpecs(lines)
+}
+
+// jvmSpecsFromSource is the tree-sitter half of jvmImportSpecs.
+func jvmSpecsFromSource(data []byte, lang string) ([]string, bool) {
+	if !hasTSImports(lang) {
+		return nil, false
+	}
+	var plain, stars []string
+	ok := tsImportEachMatch(data, lang, func(caps map[string]string) {
+		p := caps["path"]
+		if p == "" {
+			return
+		}
+		// Java marks the wildcard with an (asterisk) node; the Kotlin grammar
+		// drops it, so the statement text is the only signal.
+		if caps["star"] != "" || strings.HasSuffix(strings.TrimSpace(caps["stmt"]), ".*") {
+			stars = append(stars, p)
+			return
+		}
+		plain = append(plain, p)
+	})
+	if !ok {
+		return nil, false
+	}
+	return mergeJVMSpecs(plain, stars), true
+}
+
+// mergeJVMSpecs tags the two specifier kinds and drops the plain form of any
+// import that also matched as a wildcard (both query patterns match a
+// wildcard import).
+func mergeJVMSpecs(plain, stars []string) []string {
+	isStar := make(map[string]bool, len(stars))
+	var specs []string
+	seen := make(map[string]bool)
+	for _, s := range stars {
+		isStar[s] = true
+		if !seen["star:"+s] {
+			seen["star:"+s] = true
+			specs = append(specs, "star:"+s)
+		}
+	}
+	for _, p := range plain {
+		if isStar[p] || seen["imp:"+p] {
+			continue
+		}
+		seen["imp:"+p] = true
+		specs = append(specs, "imp:"+p)
+	}
+	return specs
+}
+
+// javaRegexSpecs is the regex fallback extractor for Java import specifiers.
+func javaRegexSpecs(lines []string) []string {
+	return javaLikeRegexSpecs(lines, javaImportRe)
+}
+
+// kotlinRegexSpecs is the regex fallback extractor for Kotlin import specifiers.
+func kotlinRegexSpecs(lines []string) []string {
+	return javaLikeRegexSpecs(lines, kotlinImportRe)
+}
+
+func javaLikeRegexSpecs(lines []string, re *regexp.Regexp) []string {
+	var specs []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		m := re.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		if len(m) > 2 && m[2] != "" {
+			specs = append(specs, "star:"+m[1])
+			continue
+		}
+		specs = append(specs, "imp:"+m[1])
+	}
+	return specs
+}
+
+// jvmIndex maps Java/Kotlin packages and fully-qualified top-level declarations
+// to the files that declare them, read from the files themselves.
+//
+// The path convention (com.example.User → .../com/example/User.java) only holds
+// for Java's one-public-type-per-file rule. Kotlin routinely declares several
+// types (and top-level functions) in one file, so convention alone drops those
+// imports entirely.
+func (rc *resolveCtx) jvmIndex() (pkgFiles, declFiles map[string][]string) {
+	rc.jvmOnce.Do(func() {
+		rc.jvmPkg = make(map[string][]string)
+		rc.jvmDecl = make(map[string][]string)
+
+		type jvmFacts struct {
+			pkg   string
+			decls []string
+		}
+		scanned := scanLangFilesParallel(rc, []string{"java", "kotlin"}, func(_ *scan.FileEntry, data []byte) jvmFacts {
+			src := string(data)
+			var facts jvmFacts
+			if m := jvmPackageRe.FindStringSubmatch(src); m != nil {
+				facts.pkg = m[1]
+			}
+			for _, m := range jvmDeclRe.FindAllStringSubmatch(src, -1) {
+				facts.decls = append(facts.decls, m[1])
+			}
+			return facts
+		})
+
+		for _, s := range scanned {
+			if s.file == nil {
+				continue
+			}
+			rc.jvmPkg[s.val.pkg] = append(rc.jvmPkg[s.val.pkg], s.file.RelPath)
+			for _, name := range s.val.decls {
+				key := name
+				if s.val.pkg != "" {
+					key = s.val.pkg + "." + name
+				}
+				rc.jvmDecl[key] = append(rc.jvmDecl[key], s.file.RelPath)
+			}
+		}
+	})
+	return rc.jvmPkg, rc.jvmDecl
+}
+
+// jvmSourceRoots are the conventional source-root prefixes a dotted name may
+// live under (plus "" for a repo whose packages start at the root).
+var jvmSourceRoots = []string{
+	"src/main/java/",
+	"src/main/kotlin/",
+	"src/",
+	"app/src/main/java/",
+	"app/src/main/kotlin/",
+	"",
+}
+
+// resolveJavaSpecs resolves Java/Kotlin imports to local files.
+func resolveJavaSpecs(specs []string, filePath string, lang string, rc *resolveCtx, t *importTally) []string {
+	t.extract(len(specs))
+
+	seen := make(map[string]bool)
+	var resolved []string
+	add := func(p string) bool {
+		if p == "" || p == filePath {
+			return false
+		}
+		if !seen[p] {
+			seen[p] = true
+			resolved = append(resolved, p)
+		}
+		return true
+	}
+
+	for _, spec := range specs {
+		kind, imp := splitSpec(spec, "imp")
+
+		// Skip standard library imports
+		if strings.HasPrefix(imp, "java.") || strings.HasPrefix(imp, "javax.") ||
+			strings.HasPrefix(imp, "kotlin.") || strings.HasPrefix(imp, "kotlinx.") ||
+			strings.HasPrefix(imp, "android.") {
+			t.skip()
+			continue
+		}
+
+		if kind == "star" {
+			if resolveJVMPackage(imp, rc, add) {
+				t.hit()
+			} else {
+				t.miss(imp)
+			}
+			continue
+		}
+
+		if resolveJVMType(imp, rc, add) {
+			t.hit()
+			continue
+		}
+		// A static / member import names a member of the type before it.
+		parts := strings.Split(imp, ".")
+		if len(parts) > 1 {
+			last := parts[len(parts)-1]
+			if len(last) > 0 && last[0] >= 'a' && last[0] <= 'z' {
+				if resolveJVMType(strings.Join(parts[:len(parts)-1], "."), rc, add) {
+					t.hit()
+					continue
+				}
+			}
+		}
+		t.miss(imp)
+	}
+	return resolved
+}
+
+// resolveJVMType resolves one fully-qualified type name, first by the file-path
+// convention and then by the declarations actually found in the sources.
+func resolveJVMType(imp string, rc *resolveCtx, add func(string) bool) bool {
+	classPath := strings.ReplaceAll(imp, ".", "/")
+	found := false
+	for _, root := range jvmSourceRoots {
+		for _, ext := range []string{".java", ".kt"} {
+			candidate := root + classPath + ext
+			if rc.idx.Exists(candidate) {
+				found = add(candidate) || found
+			}
+		}
+	}
+	if found {
+		return true
+	}
+	_, declFiles := rc.jvmIndex()
+	for _, p := range declFiles[imp] {
+		found = add(p) || found
+	}
+	return found
+}
+
+// resolveJVMPackage resolves an on-demand import to every file in the package.
+func resolveJVMPackage(pkg string, rc *resolveCtx, add func(string) bool) bool {
+	found := false
+	pkgFiles, _ := rc.jvmIndex()
+	for _, p := range pkgFiles[pkg] {
+		found = add(p) || found
+	}
+	if found {
+		return true
+	}
+	// Fall back to the directory convention for files we could not read.
+	dirPath := strings.ReplaceAll(pkg, ".", "/")
+	for _, root := range jvmSourceRoots {
+		for _, f := range rc.idx.ByDir(root + dirPath) {
+			if f.Lang == "java" || f.Lang == "kotlin" {
+				found = add(f.RelPath) || found
+			}
+		}
+	}
+	return found
+}
+
+// ─── C# ───────────────────────────────────────────────────────────────────────
+
+// csharpImportSpecs returns tagged C# specifiers: "using:<namespace>" for a
+// using directive and "ns:<namespace>" for a namespace the file itself declares.
+func csharpImportSpecs(fullPath string) []string {
+	data, err := os.ReadFile(fullPath)
+	if err != nil {
+		return nil
+	}
+	return csharpSpecsFromData(data)
+}
+
+// csharpSpecsFromData extracts C# specifiers from source bytes, falling back to
+// the line regex when the grammar is unavailable or the parse fails.
+func csharpSpecsFromData(data []byte) []string {
+	if specs, ok := csharpSpecsFromSource(data); ok {
+		return specs
+	}
+	return csharpRegexSpecs(strings.Split(string(data), "\n"))
+}
+
+// csharpSpecsFromSource is the tree-sitter half of csharpImportSpecs.
+func csharpSpecsFromSource(data []byte) ([]string, bool) {
+	if !hasTSImports("csharp") {
+		return nil, false
+	}
+	var specs []string
+	seen := make(map[string]bool)
+	add := func(s string) {
+		if !seen[s] {
+			seen[s] = true
+			specs = append(specs, s)
+		}
+	}
+	ok := tsImportEachMatch(data, "csharp", func(caps map[string]string) {
+		if ns := caps["ns"]; ns != "" {
+			add("ns:" + ns)
+		}
+		if p := caps["path"]; p != "" {
+			add("using:" + p)
+		}
+	})
+	return specs, ok
+}
+
+// csharpRegexSpecs is the regex fallback extractor for C#.
+func csharpRegexSpecs(lines []string) []string {
+	var specs []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if m := csUsing.FindStringSubmatch(trimmed); m != nil {
+			specs = append(specs, "using:"+m[1])
+			continue
+		}
+		if m := csNamespaceRe.FindStringSubmatch(line); m != nil {
+			specs = append(specs, "ns:"+m[1])
+		}
+	}
+	return specs
+}
+
+// csharpNamespaces maps each declared namespace to the files declaring it.
+func (rc *resolveCtx) csharpNamespaces() map[string][]string {
+	rc.csOnce.Do(func() {
+		rc.csNS = make(map[string][]string)
+		scanned := scanLangFilesParallel(rc, []string{"csharp"}, func(_ *scan.FileEntry, data []byte) []string {
+			var namespaces []string
+			for _, spec := range csharpSpecsFromData(data) {
+				if kind, ns := splitSpec(spec, ""); kind == "ns" && ns != "" {
+					namespaces = append(namespaces, ns)
+				}
+			}
+			return namespaces
+		})
+		for _, s := range scanned {
+			if s.file == nil {
+				continue
+			}
+			for _, ns := range s.val {
+				rc.csNS[ns] = append(rc.csNS[ns], s.file.RelPath)
+			}
+		}
+	})
+	return rc.csNS
+}
+
+// resolveCSharpSpecs resolves C# using directives against the namespaces the
+// source files actually declare.
+//
+// The previous heuristic matched the last 1–3 lowercased namespace segments
+// against *directory names* and never read a namespace declaration, so
+// `using MyApp.Models;` linked every file in any directory ending in "models".
+// A fabricated edge is worse than a missing one — it inflates fan-in and
+// corrupts hotspot ranking — so anything we cannot pin to a declared namespace
+// is now reported unresolved instead of guessed.
+func resolveCSharpSpecs(specs []string, filePath string, rc *resolveCtx, t *importTally) []string {
+	nsMap := rc.csharpNamespaces()
+	seen := make(map[string]bool)
+	var resolved []string
+	usings := 0
+
+	add := func(p string) bool {
+		if p == "" || p == filePath {
+			return false
+		}
+		if !seen[p] {
+			seen[p] = true
+			resolved = append(resolved, p)
+		}
+		return true
+	}
+
+	for _, spec := range specs {
+		kind, ns := splitSpec(spec, "using")
+		if kind != "using" {
+			continue // the file's own namespace declaration
+		}
+		usings++
+
+		// Skip system/framework namespaces
+		if strings.HasPrefix(ns, "System") || strings.HasPrefix(ns, "Microsoft") ||
+			strings.HasPrefix(ns, "NuGet") {
+			t.skip()
+			continue
+		}
+
+		found := false
+		for _, p := range nsMap[ns] {
+			found = add(p) || found
+		}
+		if found {
+			t.hit()
+			continue
+		}
+
+		// `using static Some.Namespace.Type;` names a type, not a namespace.
+		// Accept it only on an exact file-name match inside the parent
+		// namespace — never on a fuzzy directory suffix.
+		if i := strings.LastIndexByte(ns, '.'); i > 0 {
+			parent, typeName := ns[:i], ns[i+1:]
+			for _, p := range nsMap[parent] {
+				if strings.TrimSuffix(filepath.Base(p), ".cs") == typeName {
+					found = add(p) || found
+				}
+			}
+		}
+		if found {
+			t.hit()
+		} else {
+			t.miss(ns)
+		}
+	}
+	t.extract(usings)
+	return resolved
+}
+
+// ─── Zig / Lua / Julia / Shell ────────────────────────────────────────────────
 
 // resolveZigSpecs resolves Zig @import("path.zig") specifiers (relative to the
 // importing file). Non-file imports like "std"/"builtin" are skipped.
-func resolveZigSpecs(specs []string, filePath string, idx *FileIndex) []string {
+func resolveZigSpecs(specs []string, filePath string, idx *FileIndex, t *importTally) []string {
+	t.extract(len(specs))
 	dir := filepath.Dir(filePath)
 	seen := make(map[string]bool)
 	var resolved []string
 	for _, imp := range specs {
 		if !strings.HasSuffix(imp, ".zig") {
+			t.skip()
 			continue
 		}
 		target := filepath.Clean(filepath.Join(dir, imp))
-		if idx.Exists(target) && target != filePath && !seen[target] {
+		if !idx.Exists(target) {
+			t.miss(imp)
+			continue
+		}
+		t.hit()
+		if target != filePath && !seen[target] {
 			seen[target] = true
 			resolved = append(resolved, target)
 		}
@@ -802,55 +1973,136 @@ func resolveZigSpecs(specs []string, filePath string, idx *FileIndex) []string {
 
 // resolveLuaSpecs resolves Lua require("a.b.c") specifiers. Lua module names map
 // to paths with dots as separators; we try common source roots and relative.
-func resolveLuaSpecs(specs []string, filePath string, idx *FileIndex) []string {
+func resolveLuaSpecs(specs []string, filePath string, idx *FileIndex, t *importTally) []string {
+	t.extract(len(specs))
 	dir := filepath.Dir(filePath)
 	seen := make(map[string]bool)
 	var resolved []string
-	add := func(p string) {
-		if idx.Exists(p) && p != filePath && !seen[p] {
-			seen[p] = true
-			resolved = append(resolved, p)
-		}
-	}
 	for _, imp := range specs {
 		rel := strings.ReplaceAll(imp, ".", "/") + ".lua"
-		add(filepath.Clean(filepath.Join(dir, rel)))
+		candidates := []string{filepath.Clean(filepath.Join(dir, rel))}
 		for _, root := range []string{"", "src/", "lua/", "lib/"} {
-			add(filepath.Clean(root + rel))
+			candidates = append(candidates, filepath.Clean(root+rel))
+		}
+		found := false
+		for _, p := range candidates {
+			if !idx.Exists(p) {
+				continue
+			}
+			found = true
+			if p != filePath && !seen[p] {
+				seen[p] = true
+				resolved = append(resolved, p)
+			}
+		}
+		if found {
+			t.hit()
+		} else {
+			t.skip() // a rock / stdlib module
 		}
 	}
 	return resolved
 }
 
-// resolveJuliaSpecs resolves Julia include("file.jl") paths (relative to the
-// including file). using/import target packages, not local files, so the query
-// only captures include() and we resolve those here.
-func resolveJuliaSpecs(specs []string, filePath string, idx *FileIndex) []string {
+// parseJuliaInclude turns the raw text of an include(...) argument list into a
+// path relative to the including file.
+//
+// A bare literal and the joinpath(@__DIR__, "…") idiom are both extremely
+// common; anything else (a variable, an interpolated string) is reported
+// unresolvable rather than guessed at.
+func parseJuliaInclude(arg string) (string, bool) {
+	s := strings.TrimSpace(arg)
+	if !strings.HasPrefix(s, "(") {
+		return s, s != "" // already a plain path (regex/legacy callers)
+	}
+	s = strings.TrimSuffix(strings.TrimPrefix(s, "("), ")")
+
+	lits := juliaStringRe.FindAllStringSubmatch(s, -1)
+	if len(lits) == 0 {
+		return "", false
+	}
+	rest := juliaStringRe.ReplaceAllString(s, "")
+	for _, tok := range []string{"joinpath", "dirname", "@__DIR__", "@__FILE__", "(", ")", ",", " ", "\t", "\n", "\r"} {
+		rest = strings.ReplaceAll(rest, tok, "")
+	}
+	if rest != "" {
+		return "", false
+	}
+
+	parts := make([]string, 0, len(lits))
+	for _, m := range lits {
+		if strings.Contains(m[1], "$") {
+			return "", false
+		}
+		parts = append(parts, m[1])
+	}
+	return filepath.Join(parts...), true
+}
+
+// resolveJuliaSpecs resolves Julia include(...) paths (relative to the including
+// file). using/import target packages, not local files.
+func resolveJuliaSpecs(specs []string, filePath string, idx *FileIndex, t *importTally) []string {
+	t.extract(len(specs))
 	dir := filepath.Dir(filePath)
 	seen := make(map[string]bool)
 	var resolved []string
-	for _, imp := range specs {
+	for _, spec := range specs {
+		imp, ok := parseJuliaInclude(spec)
+		if !ok {
+			t.miss(spec)
+			continue
+		}
 		target := filepath.Clean(filepath.Join(dir, imp))
-		if idx.Exists(target) && target != filePath && !seen[target] {
+		if !idx.Exists(target) {
+			t.miss(imp)
+			continue
+		}
+		t.hit()
+		if target != filePath && !seen[target] {
 			seen[target] = true
 			resolved = append(resolved, target)
 		}
 	}
 	return resolved
+}
+
+// shellSpecPath strips the quoting from a captured `source` argument. The
+// argument is captured whole (not just its string_content) precisely so the
+// variable expansions stay visible: tree-sitter splits `"$LIB/util.sh"` into an
+// expansion plus the literal "/util.sh", and resolving that remainder relative
+// to the script invents an edge to a same-named file in the wrong directory.
+func shellSpecPath(spec string) string {
+	s := strings.TrimSpace(spec)
+	if len(s) >= 2 && (s[0] == '"' || s[0] == '\'') && s[len(s)-1] == s[0] {
+		s = s[1 : len(s)-1]
+	}
+	return s
 }
 
 // resolveShellSpecs resolves shell `source path` / `. path` includes (relative
-// to the sourcing script). Specifiers containing shell variables are skipped.
-func resolveShellSpecs(specs []string, filePath string, idx *FileIndex) []string {
+// to the sourcing script). Specifiers containing shell expansions are skipped.
+func resolveShellSpecs(specs []string, filePath string, idx *FileIndex, t *importTally) []string {
+	t.extract(len(specs))
 	dir := filepath.Dir(filePath)
 	seen := make(map[string]bool)
 	var resolved []string
-	for _, imp := range specs {
-		if strings.ContainsAny(imp, "$*?") {
+	for _, spec := range specs {
+		imp := shellSpecPath(spec)
+		if imp == "" {
+			continue
+		}
+		if strings.ContainsAny(imp, "$*?`") {
+			// The path is computed at run time; we cannot know it.
+			t.miss(imp)
 			continue
 		}
 		target := filepath.Clean(filepath.Join(dir, imp))
-		if idx.Exists(target) && target != filePath && !seen[target] {
+		if !idx.Exists(target) {
+			t.miss(imp)
+			continue
+		}
+		t.hit()
+		if target != filePath && !seen[target] {
 			seen[target] = true
 			resolved = append(resolved, target)
 		}
@@ -858,24 +2110,7 @@ func resolveShellSpecs(specs []string, filePath string, idx *FileIndex) []string
 	return resolved
 }
 
-// resolvePySpecs resolves relative Python from-import modules to local files.
-// Absolute imports are intentionally ignored (kept for accuracy).
-func resolvePySpecs(specs []string, filePath string, idx *FileIndex) []string {
-	dir := filepath.Dir(filePath)
-	seen := make(map[string]bool)
-	var resolved []string
-	for _, imp := range specs {
-		if !strings.HasPrefix(imp, ".") {
-			continue
-		}
-		target := resolvePyRelative(dir, imp)
-		if target != "" && idx.Exists(target) && !seen[target] {
-			seen[target] = true
-			resolved = append(resolved, target)
-		}
-	}
-	return resolved
-}
+// ─── PHP ──────────────────────────────────────────────────────────────────────
 
 // phpRegexSpecs is the regex fallback extractor for PHP use statements. It
 // returns FQCNs (backslash-separated, e.g. App\Models\User).
@@ -893,41 +2128,53 @@ func phpRegexSpecs(lines []string) []string {
 // resolvePHPSpecs resolves PHP use FQCNs to local file paths.
 // It parses PSR-4 namespace imports and maps them to files using composer.json
 // autoload config when available, falling back to common directory conventions.
-func resolvePHPSpecs(specs []string, filePath string, root string, idx *FileIndex) []string {
+func resolvePHPSpecs(specs []string, filePath string, rc *resolveCtx, t *importTally) []string {
+	t.extract(len(specs))
+
 	seen := make(map[string]bool)
 	var resolved []string
+	psr4Map := rc.phpPSR4Map()
 
-	// Parse composer.json PSR-4 autoload mappings if available
-	psr4Map := parsePHPComposerPSR4(root)
+	add := func(p string) bool {
+		if p == "" || p == filePath {
+			return false
+		}
+		if !seen[p] {
+			seen[p] = true
+			resolved = append(resolved, p)
+		}
+		return true
+	}
 
 	for _, fqcn := range specs {
 		// Skip PHP built-in namespaces that won't resolve to local files
 		if isPHPBuiltinNamespace(fqcn) {
+			t.skip()
 			continue
 		}
 
 		// Convert backslashes to forward slashes for path resolution
 		classPath := strings.ReplaceAll(fqcn, "\\", "/") + ".php"
+		found := false
 
 		// Strategy 1: Try composer.json PSR-4 mappings
 		for prefix, dirs := range psr4Map {
 			nsPrefix := strings.ReplaceAll(prefix, "\\", "/")
-			if strings.HasPrefix(classPath, nsPrefix) {
-				remainder := strings.TrimPrefix(classPath, nsPrefix)
-				for _, dir := range dirs {
-					candidate := filepath.Clean(filepath.Join(dir, remainder))
-					if idx.Exists(candidate) && candidate != filePath && !seen[candidate] {
-						seen[candidate] = true
-						resolved = append(resolved, candidate)
-					}
+			if !strings.HasPrefix(classPath, nsPrefix) {
+				continue
+			}
+			remainder := strings.TrimPrefix(classPath, nsPrefix)
+			for _, dir := range dirs {
+				candidate := filepath.Clean(filepath.Join(dir, remainder))
+				if rc.idx.Exists(candidate) {
+					found = add(candidate) || found
 				}
 			}
 		}
 
 		// Strategy 2: Try direct path (namespace mirrors directory structure)
-		if idx.Exists(classPath) && classPath != filePath && !seen[classPath] {
-			seen[classPath] = true
-			resolved = append(resolved, classPath)
+		if rc.idx.Exists(classPath) {
+			found = add(classPath) || found
 		}
 
 		// Strategy 3: Strip first namespace segment and try common root prefixes
@@ -937,14 +2184,27 @@ func resolvePHPSpecs(specs []string, filePath string, root string, idx *FileInde
 			remainder := strings.ReplaceAll(parts[1], "\\", "/") + ".php"
 			for _, prefix := range []string{"src/", "app/", "lib/", ""} {
 				candidate := filepath.Clean(prefix + remainder)
-				if idx.Exists(candidate) && candidate != filePath && !seen[candidate] {
-					seen[candidate] = true
-					resolved = append(resolved, candidate)
+				if rc.idx.Exists(candidate) {
+					found = add(candidate) || found
 				}
 			}
 		}
+
+		if found {
+			t.hit()
+		} else {
+			t.miss(fqcn)
+		}
 	}
 	return resolved
+}
+
+// phpPSR4Map reads composer.json and extracts PSR-4 autoload mappings once.
+func (rc *resolveCtx) phpPSR4Map() map[string][]string {
+	rc.phpOnce.Do(func() {
+		rc.phpPSR4 = parsePHPComposerPSR4(rc.root)
+	})
+	return rc.phpPSR4
 }
 
 // parsePHPComposerPSR4 reads composer.json and extracts PSR-4 autoload mappings.
@@ -1005,17 +2265,20 @@ func isPHPBuiltinNamespace(fqcn string) bool {
 	return false
 }
 
+// ─── Dart ─────────────────────────────────────────────────────────────────────
+
 // resolveDartImports resolves Dart import/export statements to local file paths.
 // Dart imports use either:
 //   - 'package:myapp/models/user.dart' → maps to lib/models/user.dart
 //   - 'relative/path.dart' → relative to current file
 //   - 'dart:core' → SDK, skipped
-func resolveDartImports(lines []string, filePath string, root string, idx *FileIndex) []string {
+func resolveDartImports(lines []string, filePath string, root string, idx *FileIndex, t *importTally) []string {
 	dir := filepath.Dir(filePath)
 	pkgName := detectDartPackageName(root)
 
 	seen := make(map[string]bool)
 	var resolved []string
+	count := 0
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -1024,9 +2287,11 @@ func resolveDartImports(lines []string, filePath string, root string, idx *FileI
 			continue
 		}
 		imp := m[1]
+		count++
 
 		// Skip SDK imports
 		if strings.HasPrefix(imp, "dart:") {
+			t.skip()
 			continue
 		}
 
@@ -1036,12 +2301,14 @@ func resolveDartImports(lines []string, filePath string, root string, idx *FileI
 			pkgPath := strings.TrimPrefix(imp, "package:")
 			slash := strings.IndexByte(pkgPath, '/')
 			if slash < 0 {
+				t.skip()
 				continue
 			}
 			pkg := pkgPath[:slash]
 			rest := pkgPath[slash+1:]
 			// Only resolve imports from our own package
 			if pkgName != "" && pkg != pkgName {
+				t.skip()
 				continue
 			}
 			target = filepath.Join("lib", rest)
@@ -1050,12 +2317,17 @@ func resolveDartImports(lines []string, filePath string, root string, idx *FileI
 			target = filepath.Clean(filepath.Join(dir, imp))
 		}
 
-		if target != "" && target != filePath && idx.Exists(target) && !seen[target] {
+		if target == "" || !idx.Exists(target) {
+			t.miss(imp)
+			continue
+		}
+		t.hit()
+		if target != filePath && !seen[target] {
 			seen[target] = true
 			resolved = append(resolved, target)
 		}
 	}
-
+	t.extract(count)
 	return resolved
 }
 
@@ -1073,6 +2345,8 @@ func detectDartPackageName(root string) string {
 	}
 	return ""
 }
+
+// ─── Scala ────────────────────────────────────────────────────────────────────
 
 // scalaRegexSpecs is the regex fallback extractor for Scala import statements.
 // It returns the dotted import prefix (e.g. "com.example" for
@@ -1108,7 +2382,9 @@ func scalaNormalizeSpec(spec string) string {
 
 // resolveScalaSpecs resolves Scala dotted import prefixes to local file paths.
 // Resolution uses the same source root conventions as Java.
-func resolveScalaSpecs(specs []string, filePath string, idx *FileIndex) []string {
+func resolveScalaSpecs(specs []string, filePath string, idx *FileIndex, t *importTally) []string {
+	t.extract(len(specs))
+
 	seen := make(map[string]bool)
 	var resolved []string
 
@@ -1118,6 +2394,7 @@ func resolveScalaSpecs(specs []string, filePath string, idx *FileIndex) []string
 	for _, raw := range specs {
 		imp := scalaNormalizeSpec(raw)
 		if imp == "" {
+			t.skip()
 			continue
 		}
 
@@ -1130,6 +2407,7 @@ func resolveScalaSpecs(specs []string, filePath string, idx *FileIndex) []string
 			}
 		}
 		if skip {
+			t.skip()
 			continue
 		}
 
@@ -1140,10 +2418,15 @@ func resolveScalaSpecs(specs []string, filePath string, idx *FileIndex) []string
 		roots := []string{"src/main/scala/", "src/main/java/", "src/", "app/", ""}
 		exts := []string{".scala", ".java"}
 
+		found := false
 		for _, root := range roots {
 			for _, ext := range exts {
 				target := root + classPath + ext
-				if target != filePath && idx.Exists(target) && !seen[target] {
+				if !idx.Exists(target) {
+					continue
+				}
+				found = true
+				if target != filePath && !seen[target] {
 					seen[target] = true
 					resolved = append(resolved, target)
 				}
@@ -1152,44 +2435,97 @@ func resolveScalaSpecs(specs []string, filePath string, idx *FileIndex) []string
 			// Find all source files in the directory
 			dirTarget := root + classPath
 			for _, f := range idx.ByDir(dirTarget) {
-				if f.RelPath != filePath && (f.Lang == "scala" || f.Lang == "java") &&
-					f.Class == scan.ClassSource && !seen[f.RelPath] {
+				if (f.Lang != "scala" && f.Lang != "java") || f.Class != scan.ClassSource {
+					continue
+				}
+				found = true
+				if f.RelPath != filePath && !seen[f.RelPath] {
 					seen[f.RelPath] = true
 					resolved = append(resolved, f.RelPath)
 				}
 			}
+		}
+		if found {
+			t.hit()
+		} else {
+			t.miss(imp)
 		}
 	}
 
 	return resolved
 }
 
-func readAllLines(path string) ([]string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
+// ─── Elixir ───────────────────────────────────────────────────────────────────
 
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+// stripElixirNonCode blanks out comments, string literals and heredocs so that
+// module names mentioned in @moduledoc/@doc text or in string data cannot be
+// mistaken for references. Elixir has no tree-sitter grammar here, so this is
+// the cheapest way to get the "not inside a string" guarantee the other
+// languages get from parsing.
+func stripElixirNonCode(lines []string) []string {
+	out := make([]string, len(lines))
+	inHeredoc := false
+	heredocDelim := ""
+
+	for i, line := range lines {
+		if inHeredoc {
+			if strings.Contains(line, heredocDelim) {
+				inHeredoc = false
+			}
+			out[i] = ""
+			continue
+		}
+
+		var b strings.Builder
+		var quote byte
+		for j := 0; j < len(line); j++ {
+			c := line[j]
+			if quote != 0 {
+				if c == '\\' {
+					j++
+					continue
+				}
+				if c == quote {
+					quote = 0
+				}
+				continue
+			}
+			if c == '"' || c == '\'' {
+				delim := strings.Repeat(string(c), 3)
+				if strings.HasPrefix(line[j:], delim) {
+					rest := line[j+3:]
+					if k := strings.Index(rest, delim); k >= 0 {
+						j += 3 + k + 2
+						continue
+					}
+					heredocDelim = delim
+					inHeredoc = true
+					break
+				}
+				quote = c
+				continue
+			}
+			if c == '#' {
+				break
+			}
+			b.WriteByte(c)
+		}
+		out[i] = b.String()
 	}
-	return lines, scanner.Err()
+	return out
 }
 
 // resolveElixirImports finds module references in an Elixir file and resolves
 // them to file paths. Elixir modules are referenced by name (e.g.,
-// QuotePilot.Notifications.Providers.Twilio) and map to file paths by convention.
-func resolveElixirImports(lines []string, filePath string, idx *FileIndex) []string {
-	// Build module name → file path lookup from all .ex files.
-	// Convention: lib/quote_pilot/notifications/sms.ex → QuotePilot.Notifications.Sms
-	modToFile := buildElixirModuleMap(idx)
+// QuotePilot.Notifications.Providers.Twilio) and map to file paths by reading
+// the defmodule of every source file.
+func resolveElixirImports(lines []string, filePath string, rc *resolveCtx, t *importTally) []string {
+	modToFile := rc.elixirModules()
 
 	// Find the module defined in this file so we don't self-reference.
 	selfModule := ""
-	for _, line := range lines {
+	code := stripElixirNonCode(lines)
+	for _, line := range code {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "defmodule ") {
 			parts := strings.Fields(trimmed)
@@ -1201,80 +2537,78 @@ func resolveElixirImports(lines []string, filePath string, idx *FileIndex) []str
 	}
 
 	seen := make(map[string]bool)
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		// Skip comments and module doc strings
-		if strings.HasPrefix(trimmed, "#") {
-			continue
-		}
+	seenMod := make(map[string]bool)
+	var resolved []string
+	refs := 0
 
+	for _, line := range code {
 		for _, m := range exModuleRef.FindAllString(line, -1) {
-			if m == selfModule {
+			if m == selfModule || seenMod[m] {
 				continue
 			}
+			seenMod[m] = true
+			refs++
+
 			target, ok := modToFile[m]
 			if !ok {
+				t.skip() // a dependency or stdlib module (Ecto.Query, …)
 				continue
 			}
-			if target == filePath {
+			t.hit()
+			if target == filePath || seen[target] {
 				continue
 			}
-			if !seen[target] {
-				seen[target] = true
-			}
+			seen[target] = true
+			resolved = append(resolved, target)
 		}
 	}
-
-	result := make([]string, 0, len(seen))
-	for path := range seen {
-		result = append(result, path)
-	}
-	return result
+	t.extract(refs)
+	return resolved
 }
 
-// buildElixirModuleMap creates a mapping from Elixir module names to file paths
-// by reading the actual defmodule line from each .ex file.
-func buildElixirModuleMap(idx *FileIndex) map[string]string {
-	modMap := make(map[string]string)
-	for _, f := range idx.All() {
-		if f.Lang != "elixir" {
-			continue
+// elixirModules maps Elixir module names to file paths, built once per repo by
+// reading the defmodule of every Elixir source file.
+func (rc *resolveCtx) elixirModules() map[string]string {
+	rc.exOnce.Do(func() {
+		rc.exMods = make(map[string]string)
+		// Files are read relative to the scan root, not the process working
+		// directory — otherwise the same repo yields a different graph
+		// depending on where recon was invoked from.
+		scanned := scanLangFilesParallel(rc, []string{"elixir"}, func(_ *scan.FileEntry, data []byte) string {
+			return parseDefmodule(data)
+		})
+		for _, s := range scanned {
+			if s.file == nil || s.val == "" {
+				continue
+			}
+			if _, exists := rc.exMods[s.val]; !exists {
+				rc.exMods[s.val] = s.file.RelPath
+			}
 		}
-		if !strings.HasPrefix(f.RelPath, "lib/") {
-			continue
-		}
-		modName := readDefmodule(filepath.Join("lib", strings.TrimPrefix(f.RelPath, "lib/")))
-		if modName != "" {
-			modMap[modName] = f.RelPath
-		}
-	}
-	return modMap
+	})
+	return rc.exMods
 }
 
-// readDefmodule reads the first defmodule declaration from an Elixir file.
-// Returns the module name (e.g., "QuotePilot.Notifications.SMS") or "".
-func readDefmodule(path string) string {
-	file, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "defmodule ") {
-			// Extract module name: "defmodule QuotePilot.Notifications.SMS do"
-			rest := strings.TrimPrefix(line, "defmodule ")
-			// Module name ends at space or comma
-			if idx := strings.IndexAny(rest, " ,"); idx > 0 {
-				return rest[:idx]
-			}
-			return rest
+// parseDefmodule returns the first defmodule declaration in an Elixir source
+// (e.g. "QuotePilot.Notifications.SMS"), or "".
+func parseDefmodule(data []byte) string {
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if !strings.HasPrefix(line, "defmodule ") {
+			continue
 		}
+		// "defmodule QuotePilot.Notifications.SMS do" → the name ends at the
+		// first space or comma.
+		rest := strings.TrimPrefix(line, "defmodule ")
+		if i := strings.IndexAny(rest, " ,"); i > 0 {
+			return rest[:i]
+		}
+		return rest
 	}
 	return ""
 }
+
+// ─── Swift ────────────────────────────────────────────────────────────────────
 
 // swiftSystemFrameworks lists common Apple/system frameworks to skip during import resolution.
 var swiftSystemFrameworks = map[string]bool{
@@ -1300,7 +2634,7 @@ var swiftSystemFrameworks = map[string]bool{
 
 // resolveSwiftImports resolves Swift import statements to local source files.
 // It maps cross-module dependencies in Swift Package Manager projects.
-func resolveSwiftImports(lines []string, filePath string, idx *FileIndex) []string {
+func resolveSwiftImports(lines []string, filePath string, rc *resolveCtx, t *importTally) []string {
 	// Collect imported module names
 	var moduleNames []string
 	for _, line := range lines {
@@ -1309,71 +2643,77 @@ func resolveSwiftImports(lines []string, filePath string, idx *FileIndex) []stri
 		if m == nil {
 			continue
 		}
-		modName := m[1]
-		if swiftSystemFrameworks[modName] {
-			continue
-		}
-		moduleNames = append(moduleNames, modName)
+		moduleNames = append(moduleNames, m[1])
 	}
+	t.extract(len(moduleNames))
 	if len(moduleNames) == 0 {
 		return nil
 	}
 
-	// Build a map of local module/target names → source directories
-	localTargets := buildSwiftTargetMap(idx)
+	localTargets := rc.swiftTargetMap()
 
 	seen := make(map[string]bool)
 	var resolved []string
 	for _, modName := range moduleNames {
-		dirs, ok := localTargets[modName]
-		if !ok {
+		if swiftSystemFrameworks[modName] {
+			t.skip()
 			continue
 		}
+		dirs, ok := localTargets[modName]
+		if !ok {
+			t.skip() // an external package product
+			continue
+		}
+		found := false
 		for _, dir := range dirs {
-			for _, f := range idx.FilesInDir(dir) {
-				if f.Lang == "swift" && f.Class == scan.ClassSource && f.RelPath != filePath && !seen[f.RelPath] {
+			for _, f := range rc.idx.FilesInDir(dir) {
+				if f.Lang != "swift" || f.Class != scan.ClassSource {
+					continue
+				}
+				found = true
+				if f.RelPath != filePath && !seen[f.RelPath] {
 					seen[f.RelPath] = true
 					resolved = append(resolved, f.RelPath)
 				}
 			}
 		}
+		if found {
+			t.hit()
+		} else {
+			t.miss(modName)
+		}
 	}
 	return resolved
 }
 
-// buildSwiftTargetMap discovers local Swift package targets and maps their names
-// to source directories. It looks for Package.swift to find .target(name:) definitions,
-// falling back to a directory-based heuristic under Sources/.
-func buildSwiftTargetMap(idx *FileIndex) map[string][]string {
-	targets := make(map[string][]string)
+// swiftTargetMap discovers local Swift package targets and maps their names to
+// source directories, once per repo.
+func (rc *resolveCtx) swiftTargetMap() map[string][]string {
+	rc.swiftOnce.Do(func() {
+		targets := make(map[string][]string)
 
-	// Check if Package.swift exists in the index
-	if idx.Exists("Package.swift") {
-		targets = parseSwiftPackageTargets(idx)
-	}
+		if rc.idx.Exists("Package.swift") {
+			targets = parseSwiftPackageTargets(rc.root)
+		}
 
-	// Fallback/supplement: look for directories under Sources/
-	for _, f := range idx.All() {
-		if f.Lang != "swift" {
-			continue
+		// Fallback/supplement: look for directories under Sources/
+		for _, f := range rc.idx.All() {
+			if f.Lang != "swift" || !strings.HasPrefix(f.RelPath, "Sources/") {
+				continue
+			}
+			rest := strings.TrimPrefix(f.RelPath, "Sources/")
+			parts := strings.SplitN(rest, "/", 2)
+			if len(parts) < 2 {
+				continue
+			}
+			modName := parts[0]
+			if _, ok := targets[modName]; !ok {
+				targets[modName] = []string{"Sources/" + modName}
+			}
 		}
-		if !strings.HasPrefix(f.RelPath, "Sources/") {
-			continue
-		}
-		// Extract the module directory: Sources/<ModuleName>/...
-		rest := strings.TrimPrefix(f.RelPath, "Sources/")
-		parts := strings.SplitN(rest, "/", 2)
-		if len(parts) < 2 {
-			continue
-		}
-		modName := parts[0]
-		modDir := "Sources/" + modName
-		if _, ok := targets[modName]; !ok {
-			targets[modName] = []string{modDir}
-		}
-	}
-
-	return targets
+		rc.swiftTargets = targets
+	})
+	return rc.swiftTargets
 }
 
 // swiftTargetNameRe matches .target(name: "Foo" or .executableTarget(name: "Foo" patterns.
@@ -1382,12 +2722,12 @@ var swiftTargetNameRe = regexp.MustCompile(`\.(?:target|executableTarget|testTar
 // swiftTargetPathRe matches path: "some/path" within a target definition.
 var swiftTargetPathRe = regexp.MustCompile(`path:\s*"([^"]+)"`)
 
-// parseSwiftPackageTargets reads Package.swift and extracts target name → directory mappings.
-func parseSwiftPackageTargets(idx *FileIndex) map[string][]string {
+// parseSwiftPackageTargets reads Package.swift and extracts target name →
+// directory mappings. The manifest is read relative to the scan root.
+func parseSwiftPackageTargets(root string) map[string][]string {
 	targets := make(map[string][]string)
 
-	// Read the Package.swift file
-	lines, err := readAllLines("Package.swift")
+	lines, err := readAllLines(filepath.Join(root, "Package.swift"))
 	if err != nil {
 		return targets
 	}
@@ -1420,31 +2760,4 @@ func parseSwiftPackageTargets(idx *FileIndex) map[string][]string {
 		}
 	}
 	return targets
-}
-
-func resolvePyRelative(dir, imp string) string {
-	// Count leading dots
-	dots := 0
-	for _, c := range imp {
-		if c == '.' {
-			dots++
-		} else {
-			break
-		}
-	}
-	module := imp[dots:]
-
-	// Go up (dots-1) directories
-	targetDir := dir
-	for i := 1; i < dots; i++ {
-		targetDir = filepath.Dir(targetDir)
-	}
-
-	if module == "" {
-		return ""
-	}
-
-	// Convert dots to path separators
-	relPath := strings.ReplaceAll(module, ".", "/")
-	return filepath.Join(targetDir, relPath) + ".py"
 }

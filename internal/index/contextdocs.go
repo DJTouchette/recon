@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 
+	tree_sitter "github.com/tree-sitter/go-tree-sitter"
+
 	"github.com/djtouchette/recon/internal/scan"
 )
 
@@ -162,15 +164,35 @@ func extractFileContextDocs(root string, f *scan.FileEntry, symbols *SymbolIndex
 
 // --- Comment extraction ---
 
-// commentSyntax describes how comments look in a language.
+// blockPair is one block-comment delimiter pair.
+type blockPair struct{ open, close string }
+
+// commentSyntax describes how comments look in a language. A language can have
+// more than one block form (a .vue file mixes HTML and JS comments).
 type commentSyntax struct {
-	line       []string // line-comment prefixes
-	blockOpen  string   // block-comment opener ("" = none)
-	blockClose string
+	line   []string // line-comment prefixes
+	blocks []blockPair
 }
 
-var cFamily = commentSyntax{line: []string{"//"}, blockOpen: "/*", blockClose: "*/"}
-var hashOnly = commentSyntax{line: []string{"#"}}
+// blockOpener returns the block pair that trimmed starts with.
+func (cs commentSyntax) blockOpener(trimmed string) (blockPair, bool) {
+	for _, b := range cs.blocks {
+		if strings.HasPrefix(trimmed, b.open) {
+			return b, true
+		}
+	}
+	return blockPair{}, false
+}
+
+var (
+	cBlock   = blockPair{"/*", "*/"}
+	htmlPair = blockPair{"<!--", "-->"}
+	cFamily  = commentSyntax{line: []string{"//"}, blocks: []blockPair{cBlock}}
+	hashOnly = commentSyntax{line: []string{"#"}}
+	// Single-file component formats interleave markup and script, so both
+	// comment forms are valid in the same file.
+	sfcFamily = commentSyntax{line: []string{"//"}, blocks: []blockPair{cBlock, htmlPair}}
+)
 
 var commentSyntaxes = map[string]commentSyntax{
 	"go":         cFamily,
@@ -179,7 +201,7 @@ var commentSyntaxes = map[string]commentSyntax{
 	"java":       cFamily,
 	"kotlin":     cFamily,
 	"csharp":     cFamily,
-	"fsharp":     {line: []string{"//"}, blockOpen: "(*", blockClose: "*)"},
+	"fsharp":     {line: []string{"//"}, blocks: []blockPair{{"(*", "*)"}}},
 	"swift":      cFamily,
 	"c":          cFamily,
 	"cpp":        cFamily,
@@ -187,18 +209,34 @@ var commentSyntaxes = map[string]commentSyntax{
 	"scala":      cFamily,
 	"dart":       cFamily,
 	"zig":        {line: []string{"//"}},
-	"php":        {line: []string{"//", "#"}, blockOpen: "/*", blockClose: "*/"},
+	"php":        {line: []string{"//", "#"}, blocks: []blockPair{cBlock}},
 	"python":     hashOnly,
 	"ruby":       hashOnly,
 	"elixir":     hashOnly,
 	"shell":      hashOnly,
 	"julia":      hashOnly,
 	"r":          hashOnly,
-	"powershell": {line: []string{"#"}, blockOpen: "<#", blockClose: "#>"},
-	"lua":        {line: []string{"--"}, blockOpen: "--[[", blockClose: "]]"},
-	"sql":        {line: []string{"--"}, blockOpen: "/*", blockClose: "*/"},
+	"powershell": {line: []string{"#"}, blocks: []blockPair{{"<#", "#>"}}},
+	"lua":        {line: []string{"--"}, blocks: []blockPair{{"--[[", "]]"}}},
+	"sql":        {line: []string{"--"}, blocks: []blockPair{cBlock}},
 	"erlang":     {line: []string{"%"}},
 	"clojure":    {line: []string{";"}},
+
+	// Indexed source languages that had no comment syntax registered, so any
+	// marker written in one was silently dropped.
+	"vue":       sfcFamily,
+	"svelte":    sfcFamily,
+	"astro":     sfcFamily,
+	"html":      {blocks: []blockPair{htmlPair}},
+	"css":       {blocks: []blockPair{cBlock}},
+	"scss":      cFamily,
+	"less":      cFamily,
+	"sass":      {line: []string{"//"}, blocks: []blockPair{cBlock}},
+	"nim":       {line: []string{"#"}, blocks: []blockPair{{"#[", "]#"}}},
+	"protobuf":  cFamily,
+	"graphql":   hashOnly,
+	"terraform": {line: []string{"#", "//"}, blocks: []blockPair{cBlock}},
+	"hcl":       {line: []string{"#", "//"}, blocks: []blockPair{cBlock}},
 }
 
 func commentSyntaxFor(lang string) (commentSyntax, bool) {
@@ -211,7 +249,26 @@ func commentSyntaxFor(lang string) (commentSyntax, bool) {
 // ":" and inline text that becomes the first body line.
 var markerRe = regexp.MustCompile(`^rivet:context\b(?:\(([^)\s]+)\))?[:\s]*(.*)$`)
 
+// commentBlock is one contiguous run of comment text: a block comment, or a
+// stack of line comments on consecutive lines. Text has the comment
+// delimiters stripped; startLine is the 1-indexed line of text[0].
+type commentBlock struct {
+	startLine int
+	text      []string
+	// trailing marks a comment that follows code on the same line, which
+	// documents the declaration it trails rather than whatever comes next.
+	trailing bool
+}
+
+func (b commentBlock) endLine() int { return b.startLine + len(b.text) - 1 }
+
 // extractCommentDocs scans a code file for rivet:context comment blocks.
+//
+// Where a tree-sitter grammar is available the comments come from the parse
+// tree, so a marker inside a string literal is not a comment and cannot become
+// a doc, and a marker in a comment trailing real code is still found. Other
+// languages fall back to a line scanner, which cannot tell a comment inside a
+// string from a real one.
 func extractCommentDocs(root string, f *scan.FileEntry, symbols *SymbolIndex) []ContextDoc {
 	cs, ok := commentSyntaxFor(f.Lang)
 	if !ok {
@@ -220,31 +277,37 @@ func extractCommentDocs(root string, f *scan.FileEntry, symbols *SymbolIndex) []
 
 	fullPath := filepath.Join(root, f.RelPath)
 	info, err := os.Stat(fullPath)
-	if err != nil || info.Size() > maxFileSize || info.Size() == 0 {
+	if err != nil || info.Size() == 0 {
 		return nil
 	}
+	// Deliberately no size ceiling here: symbol extraction has none either,
+	// and a cap only on docs means a big file's function is found while the
+	// doc explaining it silently is not.
 	data, err := os.ReadFile(fullPath)
 	if err != nil || !strings.Contains(string(data), ContextMarker) {
 		return nil
 	}
 
 	lines := strings.Split(string(data), "\n")
+	blocks, parsed := tsCommentBlocks(data, f.Lang, cs)
+	if !parsed {
+		blocks = scanCommentBlocks(lines, cs)
+	}
+
 	fileSyms := symbols.ForFile(f.RelPath)
 
 	var docs []ContextDoc
-	for i := 0; i < len(lines); i++ {
-		trimmed := strings.TrimSpace(lines[i])
+	for _, b := range blocks {
+		docs = append(docs, docsFromBlock(f, b, lines, fileSyms, cs)...)
+	}
+	return docs
+}
 
-		content, isLine := lineCommentContent(trimmed, cs)
-		inBlock := false
-		if !isLine && cs.blockOpen != "" && strings.HasPrefix(trimmed, cs.blockOpen) {
-			content = strings.TrimSpace(strings.TrimPrefix(trimmed, cs.blockOpen))
-			inBlock = true
-		} else if !isLine {
-			continue
-		}
-
-		m := markerRe.FindStringSubmatch(content)
+// docsFromBlock turns the markers inside one comment block into docs.
+func docsFromBlock(f *scan.FileEntry, b commentBlock, lines []string, fileSyms []Symbol, cs commentSyntax) []ContextDoc {
+	var docs []ContextDoc
+	for i := 0; i < len(b.text); i++ {
+		m := markerRe.FindStringSubmatch(b.text[i])
 		if m == nil {
 			continue
 		}
@@ -252,66 +315,263 @@ func extractCommentDocs(root string, f *scan.FileEntry, symbols *SymbolIndex) []
 		doc := ContextDoc{
 			File:   f.RelPath,
 			Symbol: m[1],
-			Line:   i + 1,
+			Line:   b.startLine + i,
 			Source: "comment",
 			Origin: f.RelPath,
 		}
 
 		var body []string
-		if first := strings.TrimSpace(m[2]); first != "" && first != cs.blockClose {
-			if inBlock {
-				first = strings.TrimSpace(strings.TrimSuffix(first, cs.blockClose))
-			}
-			if first != "" {
-				body = append(body, first)
-			}
+		if first := strings.TrimSpace(m[2]); first != "" {
+			body = append(body, first)
 		}
-
-		end := i // last line of the comment block
-		if inBlock && !strings.Contains(content, cs.blockClose) {
-			for j := i + 1; j < len(lines); j++ {
-				end = j
-				text := strings.TrimSpace(lines[j])
-				closed := strings.Contains(text, cs.blockClose)
-				if closed {
-					text = strings.TrimSpace(text[:strings.Index(text, cs.blockClose)])
-				}
-				body = append(body, strings.TrimSpace(strings.TrimPrefix(text, "*")))
-				if closed {
-					break
-				}
+		last := i
+		for j := i + 1; j < len(b.text); j++ {
+			// A new marker starts a new doc; stop this one.
+			if markerRe.MatchString(b.text[j]) {
+				break
 			}
-		} else if !inBlock {
-			for j := i + 1; j < len(lines); j++ {
-				text, ok := lineCommentContent(strings.TrimSpace(lines[j]), cs)
-				if !ok {
-					break
-				}
-				// A new marker starts a new doc; stop this one.
-				if markerRe.MatchString(text) {
-					break
-				}
-				body = append(body, text)
-				end = j
-			}
+			body = append(body, b.text[j])
+			last = j
 		}
 
 		doc.Body = trimDocBody(body)
 		if doc.Body == "" {
+			i = last
 			continue
 		}
 
-		// Positional attachment: a marked comment directly above a declaration
-		// attaches to that symbol. A small window tolerates blank lines and
-		// decorators/attributes between the comment and the declaration.
-		if doc.Symbol == "" {
-			doc.Symbol = symbolBelow(fileSyms, end+1, 6)
+		switch {
+		case doc.Symbol != "":
+			// An explicit rivet:context(Name) is a claim about a symbol, and
+			// an unchecked claim lets `recon docs` and `recon symbols`
+			// contradict each other. Keep the doc, drop the attachment.
+			doc.Symbol = resolveNamedSymbol(doc.Symbol, fileSyms)
+		case b.trailing:
+			doc.Symbol = symbolOnLine(fileSyms, b.startLine)
+		default:
+			doc.Symbol = attachedSymbol(fileSyms, lines, b.startLine+last, cs)
 		}
 
 		docs = append(docs, doc)
-		i = end
+		i = last
 	}
 	return docs
+}
+
+// resolveNamedSymbol keeps an explicit symbol name only when that symbol is
+// actually declared in the same file. A qualified name (Service.Handle)
+// matches on its last component. When the file has no indexed symbols at all
+// (a language recon cannot parse) there is nothing to check against, so the
+// name is taken at face value.
+func resolveNamedSymbol(name string, fileSyms []Symbol) string {
+	if len(fileSyms) == 0 {
+		return name
+	}
+	short := name
+	for _, sep := range []string{"::", ".", "#"} {
+		if i := strings.LastIndex(short, sep); i >= 0 {
+			short = short[i+len(sep):]
+		}
+	}
+	for i := range fileSyms {
+		if fileSyms[i].Name == name || fileSyms[i].Name == short {
+			return fileSyms[i].Name
+		}
+	}
+	return ""
+}
+
+// symbolOnLine returns the symbol declared on the given line, if any.
+func symbolOnLine(syms []Symbol, line int) string {
+	for i := range syms {
+		if syms[i].Line == line {
+			return syms[i].Name
+		}
+	}
+	return ""
+}
+
+// maxAttachWindow is how far below a comment a declaration may sit and still
+// be considered documented by it.
+const maxAttachWindow = 10
+
+// attachedSymbol returns the symbol a comment block directly precedes.
+//
+// "Directly" is the whole point: only blank lines, further comments, and
+// decorators/attributes may sit between. A nearest-symbol-within-N-lines rule
+// ignores what is in between, so a file header comment followed by
+// `package x`, an import block and then the first function attaches the
+// whole-file note to that function.
+func attachedSymbol(syms []Symbol, lines []string, blockEnd int, cs commentSyntax) string {
+	best := ""
+	bestLine := 0
+	for i := range syms {
+		l := syms[i].Line
+		if l <= blockEnd || l > blockEnd+maxAttachWindow {
+			continue
+		}
+		if bestLine != 0 && l >= bestLine {
+			continue
+		}
+		best = syms[i].Name
+		bestLine = l
+	}
+	if best == "" {
+		return ""
+	}
+	for n := blockEnd + 1; n < bestLine; n++ {
+		if n-1 >= len(lines) {
+			break
+		}
+		if !isAttachFiller(lines[n-1], cs) {
+			return ""
+		}
+	}
+	return best
+}
+
+// isAttachFiller reports whether a line may sit between a doc comment and the
+// declaration it documents: blank, comment, or a decorator/attribute/modifier.
+func isAttachFiller(line string, cs commentSyntax) bool {
+	t := strings.TrimSpace(line)
+	if t == "" {
+		return true
+	}
+	if _, ok := lineCommentContent(t, cs); ok {
+		return true
+	}
+	if _, ok := cs.blockOpener(t); ok {
+		return true
+	}
+	switch t[0] {
+	case '@', '[', '*': // Java/Python decorators, C#/Rust attributes, block continuation
+		return true
+	}
+	return strings.HasPrefix(t, "#[") // Rust attribute
+}
+
+// tsCommentBlocks extracts comment blocks from the parse tree. The bool is
+// false when no grammar is registered for lang (or the parse fails), meaning
+// the caller must fall back to the line scanner.
+//
+// This is what makes the doc scanner agree with the symbol scanner about what
+// a comment is: `# rivet:context:` inside a Python triple-quoted template is
+// a string, not a comment, and the parser knows the difference.
+func tsCommentBlocks(source []byte, lang string, cs commentSyntax) ([]commentBlock, bool) {
+	tl := tsRegistry[lang]
+	if tl == nil {
+		return nil, false
+	}
+
+	p := tsParserPool.Get().(*tree_sitter.Parser)
+	defer tsParserPool.Put(p)
+	if err := p.SetLanguage(tl.lang); err != nil {
+		return nil, false
+	}
+	tree := p.Parse(source, nil)
+	if tree == nil {
+		return nil, false
+	}
+	defer tree.Close()
+
+	type rawComment struct {
+		start, end int // 0-indexed rows
+		lines      []string
+		ownLine    bool
+	}
+	var raw []rawComment
+
+	stack := []*tree_sitter.Node{tree.RootNode()}
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if n == nil {
+			continue
+		}
+		if strings.Contains(n.Kind(), "comment") {
+			start := int(n.StartPosition().Row)
+			text := strings.Split(n.Utf8Text(source), "\n")
+			raw = append(raw, rawComment{
+				start:   start,
+				end:     int(n.EndPosition().Row),
+				lines:   text,
+				ownLine: startsItsLine(source, n.StartByte()),
+			})
+			continue
+		}
+		for i := n.ChildCount(); i > 0; i-- {
+			stack = append(stack, n.Child(i-1))
+		}
+	}
+
+	sort.Slice(raw, func(i, j int) bool { return raw[i].start < raw[j].start })
+
+	var blocks []commentBlock
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		b := commentBlock{
+			startLine: c.start + 1,
+			text:      stripCommentLines(c.lines, cs),
+			trailing:  !c.ownLine,
+		}
+		// Consecutive own-line comments read as one note.
+		for c.ownLine && i+1 < len(raw) && raw[i+1].ownLine && raw[i+1].start == c.end+1 {
+			i++
+			c = raw[i]
+			b.text = append(b.text, stripCommentLines(c.lines, cs)...)
+		}
+		blocks = append(blocks, b)
+	}
+	return blocks, true
+}
+
+// startsItsLine reports whether only whitespace precedes off on its line, i.e.
+// the comment is a standalone note rather than a trailing remark.
+func startsItsLine(source []byte, off uint) bool {
+	for i := int(off) - 1; i >= 0; i-- {
+		switch source[i] {
+		case '\n':
+			return true
+		case ' ', '\t', '\r':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// stripCommentLines removes the comment delimiters from a comment node's raw
+// text, one output line per source line.
+func stripCommentLines(lines []string, cs commentSyntax) []string {
+	out := make([]string, 0, len(lines))
+	for i, l := range lines {
+		t := strings.TrimSpace(l)
+		if i == 0 {
+			if c, ok := lineCommentContent(t, cs); ok {
+				out = append(out, c)
+				continue
+			}
+			if bp, ok := cs.blockOpener(t); ok {
+				t = strings.TrimSpace(strings.TrimPrefix(t, bp.open))
+				t = strings.TrimSpace(strings.TrimSuffix(t, bp.close))
+				out = append(out, t)
+				continue
+			}
+			out = append(out, t)
+			continue
+		}
+		for _, bp := range cs.blocks {
+			if k := strings.Index(t, bp.close); k >= 0 {
+				t = strings.TrimSpace(t[:k])
+			}
+		}
+		t = strings.TrimSpace(strings.TrimPrefix(t, "*"))
+		if c, ok := lineCommentContent(t, cs); ok {
+			t = c
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 // lineCommentContent returns the comment text if trimmed is a line comment.
@@ -324,19 +584,57 @@ func lineCommentContent(trimmed string, cs commentSyntax) (string, bool) {
 	return "", false
 }
 
-// symbolBelow returns the name of the first symbol declared within `window`
-// lines after the comment block ending at line `after` (1-indexed lines).
-func symbolBelow(syms []Symbol, after, window int) string {
-	best := ""
-	bestLine := after + window + 1
-	for i := range syms {
-		l := syms[i].Line
-		if l > after && l <= after+window && l < bestLine {
-			best = syms[i].Name
-			bestLine = l
+// scanCommentBlocks is the parser-less fallback: group consecutive line
+// comments, and read block comments to their terminator. It only recognises a
+// comment that starts its line, and cannot tell a comment inside a string
+// literal from a real one — that is what the tree-sitter path is for.
+func scanCommentBlocks(lines []string, cs commentSyntax) []commentBlock {
+	var blocks []commentBlock
+	for i := 0; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+
+		if content, ok := lineCommentContent(trimmed, cs); ok {
+			b := commentBlock{startLine: i + 1, text: []string{content}}
+			for j := i + 1; j < len(lines); j++ {
+				next, ok := lineCommentContent(strings.TrimSpace(lines[j]), cs)
+				if !ok {
+					break
+				}
+				b.text = append(b.text, next)
+				i = j
+			}
+			blocks = append(blocks, b)
+			continue
 		}
+
+		bp, ok := cs.blockOpener(trimmed)
+		if !ok {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, bp.open))
+		b := commentBlock{startLine: i + 1}
+		if k := strings.Index(rest, bp.close); k >= 0 {
+			b.text = append(b.text, strings.TrimSpace(rest[:k]))
+			blocks = append(blocks, b)
+			continue
+		}
+		b.text = append(b.text, rest)
+		for j := i + 1; j < len(lines); j++ {
+			text := strings.TrimSpace(lines[j])
+			closed := false
+			if k := strings.Index(text, bp.close); k >= 0 {
+				text = strings.TrimSpace(text[:k])
+				closed = true
+			}
+			b.text = append(b.text, strings.TrimSpace(strings.TrimPrefix(text, "*")))
+			i = j
+			if closed {
+				break
+			}
+		}
+		blocks = append(blocks, b)
 	}
-	return best
+	return blocks
 }
 
 // trimDocBody joins body lines, dropping leading/trailing blanks and capping size.

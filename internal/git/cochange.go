@@ -5,15 +5,69 @@ import (
 	"strings"
 )
 
+// DefaultCoChangeMaxFiles is the per-commit file count above which a commit is
+// excluded from CO-CHANGE (a 200-file reformat would otherwise manufacture
+// ~20k spurious pairs). It deliberately does not apply to CHURN: those files
+// genuinely changed, and dropping them is what makes a shallow clone or a
+// large refactor look like a repository with no history at all.
+const DefaultCoChangeMaxFiles = 50
+
+// CoChangeOptions tunes the co-change build.
+type CoChangeOptions struct {
+	// MaxFilesPerCommit is the co-change cutoff. Zero means
+	// DefaultCoChangeMaxFiles; negative means no cutoff.
+	MaxFilesPerCommit int
+}
+
+func (o CoChangeOptions) maxFiles() int {
+	if o.MaxFilesPerCommit == 0 {
+		return DefaultCoChangeMaxFiles
+	}
+	return o.MaxFilesPerCommit
+}
+
 // CoChange tracks files that frequently appear in the same commits.
 type CoChange struct {
 	pairs map[string]map[string]int // file → file → co-occurrence count
 	churn map[string]int            // file → number of commits touching it
+	cov   Coverage
 }
 
 // NewCoChangeFromData creates a CoChange from pre-computed data.
+// Coverage is unknown for cached data and reports as such.
 func NewCoChangeFromData(pairs map[string]map[string]int, churn map[string]int) *CoChange {
 	return &CoChange{pairs: pairs, churn: churn}
+}
+
+// Coverage reports how much history this co-change data was built from.
+// The zero value (Repo false) means "unknown", e.g. when loaded from cache.
+func (cc *CoChange) Coverage() Coverage {
+	if cc == nil {
+		return Coverage{}
+	}
+	return cc.cov
+}
+
+// SetCoverage attaches coverage to a CoChange built from cached data.
+func (cc *CoChange) SetCoverage(cov Coverage) {
+	if cc != nil {
+		cc.cov = cov
+	}
+}
+
+// Mine parses history under root and builds churn/co-change from it in one
+// step, so callers get the data and its coverage together.
+func Mine(root string, opts Options, ccOpts CoChangeOptions) (*CoChange, error) {
+	res, err := ParseLogOpts(root, opts)
+	if err != nil {
+		return nil, err
+	}
+	cc := NewCoChangeOpts(res.Commits, ccOpts)
+	cov := res.Coverage
+	cov.CoChangeMaxFiles = cc.cov.CoChangeMaxFiles
+	cov.CommitsOversized = cc.cov.CommitsOversized
+	cc.cov = cov
+	return cc, nil
 }
 
 // AllPairs returns the full co-change pair map.
@@ -32,22 +86,41 @@ func (cc *CoChange) AllChurn() map[string]int {
 	return cc.churn
 }
 
-// NewCoChange builds co-change data from parsed commits.
+// NewCoChange builds co-change data from parsed commits using the defaults.
 func NewCoChange(commits []Commit) *CoChange {
+	return NewCoChangeOpts(commits, CoChangeOptions{})
+}
+
+// NewCoChangeOpts builds co-change data from parsed commits.
+//
+// The per-commit file threshold applies to co-change PAIRS only. Churn counts
+// every commit that touched a file, however large that commit was.
+func NewCoChangeOpts(commits []Commit, opts CoChangeOptions) *CoChange {
+	maxFiles := opts.maxFiles()
+
 	cc := &CoChange{
 		pairs: make(map[string]map[string]int),
 		churn: make(map[string]int),
+		cov:   Coverage{CoChangeMaxFiles: maxFiles},
 	}
 
 	for _, c := range commits {
 		files := c.Files
-		if len(files) > 50 {
-			// Skip very large commits (likely merges/reformats)
+		if len(files) == 0 {
 			continue
 		}
+		cc.cov.CommitsWithFiles++
 
+		// Churn: the file changed, no matter how big the commit was.
 		for _, f := range files {
 			cc.churn[f]++
+		}
+
+		if maxFiles > 0 && len(files) > maxFiles {
+			// Co-change only: a sweeping commit pairs everything with
+			// everything and would drown the real signal.
+			cc.cov.CommitsOversized++
+			continue
 		}
 
 		// Build pairs

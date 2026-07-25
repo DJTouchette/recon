@@ -5,6 +5,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -148,7 +149,7 @@ func testsCmd() *cobra.Command {
 			}
 
 			if flagHuman {
-				printTestsHuman(cmd, tests)
+				printTestsHuman(cmd, tests, r.LastTestStatus())
 				return nil
 			}
 			return outputJSON(cmd, tests)
@@ -182,9 +183,13 @@ func symbolsCmd() *cobra.Command {
 			}
 
 			if flagHuman {
-				printSymbolsHuman(cmd, symbols)
+				printSymbolsHuman(cmd, symbols, r.ParseCoverage())
 				return nil
 			}
+			// The caveat list rides on stderr so stdout stays a single
+			// parseable document, matching how the rest of the CLI reports
+			// things a consumer needs to know but did not ask for.
+			reportParseCoverage(cmd, r.ParseCoverage())
 			return outputJSON(cmd, symbols)
 		},
 	}
@@ -400,6 +405,22 @@ func printOverviewHuman(cmd *cobra.Command, ov *recon.Overview, elapsed time.Dur
 			fmt.Fprintf(w, "  %s (%s) — %s\n", f.Name, f.Language, f.Evidence)
 		}
 		fmt.Fprintln(w)
+	} else if note := statusNote(ov.FrameworkStatus, "frameworks"); note != "" {
+		fmt.Fprintf(w, "Frameworks: %s\n\n", note)
+	}
+
+	if len(ov.Dependencies) > 0 {
+		fmt.Fprintf(w, "Dependencies (%d declared):\n", len(ov.Dependencies))
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		for i, d := range ov.Dependencies {
+			if i >= 10 {
+				fmt.Fprintf(tw, "  ... and %d more\t\t\n", len(ov.Dependencies)-10)
+				break
+			}
+			fmt.Fprintf(tw, "  %s\t%s\t%s\n", d.Name, d.Version, d.Manifest)
+		}
+		tw.Flush()
+		fmt.Fprintln(w)
 	}
 
 	if len(ov.Structure) > 0 {
@@ -420,6 +441,28 @@ func printOverviewHuman(cmd *cobra.Command, ov *recon.Overview, elapsed time.Dur
 			fmt.Fprintf(w, "  %s (%s)\n", e.Path, e.Kind)
 		}
 		fmt.Fprintln(w)
+	} else if note := statusNote(ov.EntrypointStatus, "entrypoints"); note != "" {
+		fmt.Fprintf(w, "Entrypoints: %s\n\n", note)
+	}
+}
+
+// statusNote turns a detector status into something a reader can act on.
+//
+// An omitted section, or a bare JSON null, said "there are none" when the truth
+// was often "nothing here could tell" — a Spring app whose entrypoint doesn't
+// match the hardcoded filenames looked identical to a library with no
+// entrypoint at all.
+func statusNote(status, what string) string {
+	switch status {
+	case "none_matched":
+		return "none matched (no recognised convention for this project)"
+	case "unsupported":
+		return "unknown — no detector for these languages"
+	default:
+		// "found" with an empty list, or a status we don't know, is not
+		// something to editorialise about.
+		_ = what
+		return ""
 	}
 }
 
@@ -437,12 +480,18 @@ func printRelatedHuman(cmd *cobra.Command, results []recon.RelatedFile) {
 	tw.Flush()
 }
 
-func printSymbolsHuman(cmd *cobra.Command, symbols []recon.SymbolInfo) {
+// printSymbolsHuman renders the symbol list, and — when some files could not be
+// read — says so. "No symbols found" used to be the same answer for "this file
+// declares nothing" and "I have no extractor for this language", which is the
+// answer most likely to send a reader down the wrong path.
+func printSymbolsHuman(cmd *cobra.Command, symbols []recon.SymbolInfo, coverage []recon.FileParseInfo) {
 	w := cmd.OutOrStdout()
 	if len(symbols) == 0 {
 		fmt.Fprintln(w, "No symbols found.")
+		printCoverageNote(w, coverage)
 		return
 	}
+	defer func() { printCoverageNote(w, coverage) }()
 	fmt.Fprintf(w, "Symbols (%d):\n", len(symbols))
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, s := range symbols {
@@ -552,10 +601,10 @@ func printHotspotsHuman(cmd *cobra.Command, spots []recon.HotspotInfo) {
 	tw.Flush()
 }
 
-func printTestsHuman(cmd *cobra.Command, tests []recon.TestFile) {
+func printTestsHuman(cmd *cobra.Command, tests []recon.TestFile, status string) {
 	w := cmd.OutOrStdout()
 	if len(tests) == 0 {
-		fmt.Fprintln(w, "No test files found.")
+		fmt.Fprintln(w, testsEmptyMessage(status))
 		return
 	}
 	fmt.Fprintln(w, "Test files:")
@@ -745,5 +794,45 @@ func printChangesHuman(cmd *cobra.Command, changes []recon.ChangeSet) {
 			fmt.Fprintf(w, "      ... and %d more\n", len(c.Files)-3)
 		}
 		fmt.Fprintln(w)
+	}
+}
+
+// printCoverageNote appends a short caveat naming files recon could not fully
+// read. It is capped: the point is to stop an empty or short result reading as
+// authoritative, not to dump every unsupported file in a polyglot repo.
+func printCoverageNote(w io.Writer, coverage []recon.FileParseInfo) {
+	if len(coverage) == 0 {
+		return
+	}
+
+	const showMax = 5
+	fmt.Fprintf(w, "\n%d file(s) could not be fully read:\n", len(coverage))
+	for i, c := range coverage {
+		if i >= showMax {
+			fmt.Fprintf(w, "  ... and %d more\n", len(coverage)-showMax)
+			break
+		}
+		detail := c.Detail
+		if detail == "" {
+			detail = c.Status
+		}
+		fmt.Fprintf(w, "  %s (%s): %s\n", c.File, c.Status, detail)
+	}
+}
+
+// reportParseCoverage writes the same caveat to stderr for JSON consumers.
+func reportParseCoverage(cmd *cobra.Command, coverage []recon.FileParseInfo) {
+	printCoverageNote(cmd.ErrOrStderr(), coverage)
+}
+
+// testsEmptyMessage explains an empty test list. "No test files found" was the
+// same answer for "this file has no tests" and "recon has no mapping rules for
+// this file type", and the second is a false negative dressed as a fact.
+func testsEmptyMessage(status string) string {
+	switch status {
+	case "unsupported":
+		return "No mapping rules for this file type — recon cannot tell whether it has tests."
+	default:
+		return "No test files found."
 	}
 }

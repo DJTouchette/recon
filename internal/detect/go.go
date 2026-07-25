@@ -1,8 +1,6 @@
 package detect
 
 import (
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -10,76 +8,110 @@ import (
 	"github.com/djtouchette/recon/internal/scan"
 )
 
-var goRequireRe = regexp.MustCompile(`^\s+([\w./-]+)\s+v`)
+var (
+	// A require line inside a require ( ... ) block, or after "require ".
+	goRequireRe = regexp.MustCompile(`^([\w.~-]+(?:/[\w.~-]+)*)\s+(v[\w.+-]+)`)
+	// Go declares its entrypoint in the code, not the filename: package main
+	// plus a func main() in the same file.
+	goPackageMainRe = regexp.MustCompile(`(?m)^package\s+main\b`)
+	goFuncMainRe    = regexp.MustCompile(`(?m)^func\s+main\s*\(\s*\)`)
+)
 
 type GoDetector struct{}
 
-func (d *GoDetector) DetectFrameworks(idx *index.FileIndex, root string) []Framework {
+func (d *GoDetector) Key() string         { return "go" }
+func (d *GoDetector) Languages() []string { return []string{"go"} }
+
+func (d *GoDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
+	var res DetectorResult
 	if !hasFile(idx, "go.mod") {
-		return nil
+		// Still worth looking for entrypoints: a repo can vendor Go code or
+		// live inside a parent module.
+		res.Entrypoints = d.entrypoints(idx, root)
+		return res
 	}
 
-	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
-	if err != nil {
-		return nil
-	}
-
-	var frameworks []Framework
-	seen := make(map[string]bool)
-
-	// Parse require blocks from go.mod
-	inRequire := false
-	for _, line := range strings.Split(string(data), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "require (" {
-			inRequire = true
-			continue
-		}
-		if trimmed == ")" {
-			inRequire = false
-			continue
-		}
-		if !inRequire {
-			continue
-		}
-		// Skip indirect dependencies
-		if strings.Contains(trimmed, "// indirect") {
-			continue
-		}
-		if m := goRequireRe.FindStringSubmatch(line); m != nil {
-			dep := m[1]
-			if !seen[dep] {
-				seen[dep] = true
-				frameworks = append(frameworks, Framework{
-					Name:     dep,
+	content, ok := readManifest(root, "go.mod")
+	if ok {
+		for _, dep := range parseGoMod(content) {
+			res.Dependencies = append(res.Dependencies, Dependency{
+				Name:     dep.name,
+				Version:  dep.version,
+				Language: "go",
+				Manifest: "go.mod",
+			})
+			if name, isFramework := goFrameworks.lookup(normalizeGoModule(dep.name)); isFramework {
+				res.Frameworks = append(res.Frameworks, Framework{
+					Name:     name,
 					Language: "go",
-					Evidence: "go.mod",
+					Evidence: "go.mod: require " + dep.name,
 				})
 			}
 		}
 	}
 
-	return frameworks
+	res.Entrypoints = d.entrypoints(idx, root)
+	return res
 }
 
-func (d *GoDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
-	var eps []Entrypoint
+type goDep struct{ name, version string }
 
-	for _, f := range idx.ByLang("go") {
-		if f.Class != scan.ClassSource {
+// parseGoMod extracts direct (non-indirect) requirements from go.mod, handling
+// both the block and single-line forms.
+func parseGoMod(content string) []goDep {
+	var deps []goDep
+	inRequire := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if i := strings.Index(trimmed, "//"); i >= 0 {
+			if strings.Contains(trimmed[i:], "indirect") {
+				continue
+			}
+			trimmed = strings.TrimSpace(trimmed[:i])
+		}
+		switch {
+		case trimmed == "require (":
+			inRequire = true
+			continue
+		case trimmed == ")":
+			inRequire = false
+			continue
+		case strings.HasPrefix(trimmed, "require "):
+			trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "require "))
+		case !inRequire:
 			continue
 		}
-		base := filepath.Base(f.RelPath)
-		dir := filepath.Dir(f.RelPath)
-
-		if base == "main.go" {
-			kind := "main"
-			if strings.HasPrefix(dir, "cmd/") || dir == "cmd" {
-				kind = "cli"
-			}
-			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: kind})
+		if m := goRequireRe.FindStringSubmatch(trimmed); m != nil {
+			deps = append(deps, goDep{name: m[1], version: m[2]})
 		}
 	}
+	return deps
+}
 
+// entrypoints finds every file that declares package main and defines func
+// main(). Filename equality (the old "is it called main.go?" rule) misses
+// cmd/serve.go and friends entirely.
+func (d *GoDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoint {
+	var eps []Entrypoint
+	scanSource(idx, root, []string{"go"}, func(f *scan.FileEntry, content string) {
+		if f.Class != scan.ClassSource {
+			return
+		}
+		if !goPackageMainRe.MatchString(content) || !goFuncMainRe.MatchString(content) {
+			return
+		}
+		eps = append(eps, Entrypoint{Path: f.RelPath, Kind: goEntryKind(f.RelPath)})
+	})
 	return eps
+}
+
+// goEntryKind labels a main package under a cmd/ directory as a CLI, matching
+// the standard Go project layout.
+func goEntryKind(relPath string) string {
+	for _, seg := range strings.Split(relPath, "/") {
+		if seg == "cmd" {
+			return "cli"
+		}
+	}
+	return "main"
 }

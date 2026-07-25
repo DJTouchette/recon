@@ -1,28 +1,86 @@
 package index
 
 import (
-	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
 	"github.com/djtouchette/recon/internal/scan"
 )
 
+// Extractor identifies which extraction path produced a symbol. It is the
+// provenance signal: a tree-sitter symbol came out of a real parse of the
+// language grammar, a regex symbol came out of line-pattern matching and may be
+// wrong in name, kind or line. The empty string means "unknown" — symbols
+// loaded from a cache written before provenance existed.
+const (
+	ExtractorTreeSitter = "tree-sitter"
+	ExtractorRegex      = "regex"
+	ExtractorNone       = "none"
+)
+
+// Parse statuses for FileParse.Status.
+const (
+	// ParseOK: the file was parsed and the symbol list is believed complete.
+	ParseOK = "ok"
+	// ParsePartial: extraction ran but the source did not fully parse (the
+	// tree-sitter tree contains ERROR/MISSING nodes). Symbols reported are
+	// real but the list is incomplete.
+	ParsePartial = "partial"
+	// ParseUnsupported: recon has neither a grammar nor a regex pattern set for
+	// this language, so zero symbols is a gap in recon, not a property of the file.
+	ParseUnsupported = "unsupported"
+	// ParseFailed: the file could not be read or decoded as text.
+	ParseFailed = "failed"
+)
+
 // Symbol represents a named declaration in a source file.
 type Symbol struct {
 	File      string `json:"file"`
 	Name      string `json:"name"`
-	Kind      string `json:"kind"`      // function, method, class, interface, type, struct, enum, constant, module, trait
+	Kind      string `json:"kind"` // function, method, class, interface, type, struct, enum, constant, module, trait
 	Line      int    `json:"line"`
 	Signature string `json:"signature"` // the full declaration line, trimmed
+
+	// Extractor records how this symbol was found: ExtractorTreeSitter (parsed
+	// from the real grammar — name, kind and line are trustworthy) or
+	// ExtractorRegex (matched by a line pattern — approximate, and capable of
+	// inventing a symbol or mislabelling its kind). Empty means unknown
+	// provenance, e.g. a symbol loaded from a cache written before provenance
+	// existed. Whether the symbol's *file* parsed completely is a file-level
+	// fact; see FileParse.
+	Extractor string `json:"extractor,omitempty"`
 }
+
+// FileParse records how one file was processed by the symbol extractor,
+// including — especially — the files that produced nothing.
+//
+// This is the primary trust signal, because the failure modes that matter most
+// yield zero symbols and so cannot be represented per-symbol: a language with
+// no extractor, a file that could not be decoded, a parse that collapsed at the
+// first construct the grammar didn't understand. Without a record for every
+// file, "no symbols found" is ambiguous between "this file declares nothing",
+// "recon has no extractor for this language" and "the parse failed" — and an
+// agent will read the first meaning into all three.
+type FileParse struct {
+	RelPath     string `json:"path"`
+	Lang        string `json:"lang"`
+	Extractor   string `json:"extractor"` // tree-sitter | regex | none
+	Status      string `json:"status"`    // ok | partial | unsupported | failed
+	SymbolCount int    `json:"symbol_count"`
+	// Detail is a human-readable reason for a non-ok status, suitable for
+	// showing verbatim as a caveat.
+	Detail string `json:"detail,omitempty"`
+}
+
+// Clean reports whether the file was fully parsed by a real extractor.
+func (fp FileParse) Clean() bool { return fp.Status == ParseOK }
 
 // FileExtra holds per-file metadata beyond the basic FileEntry.
 type FileExtra struct {
@@ -33,30 +91,49 @@ type FileExtra struct {
 
 // SymbolIndex holds all extracted symbols.
 type SymbolIndex struct {
-	byFile map[string][]Symbol
-	all    []Symbol
+	byFile  map[string][]Symbol
+	all     []Symbol
+	parses  []FileParse
+	parseBy map[string]FileParse
 }
 
-// NewSymbolIndex extracts symbols from all source files in the index.
+// symbolSourceClasses lists the file classes whose symbols are indexed.
+//
+// Test files are included deliberately. They are ordinary declaration sites:
+// this repo's own test tree defines 100+ helpers and fixtures, and excluding
+// them meant `recon symbols TestQueriesCompile` answered "No symbols found" for
+// a function defined three directories away. It compounded with the
+// directory-based test classifier (scan.Classify treats every source file under
+// test/, tests/, spec/, specs/ or __tests__/ as a test), so shared fixture code
+// — `NewFixture`, `type Fixture` — was invisible to symbols, search, callers
+// and doc attachment even though production code imports it. The class of every
+// symbol's file is available via FileIndex.Get(sym.File).Class, so callers that
+// want production-only results can filter; callers that want the truth get it.
+var symbolSourceClasses = []scan.FileClass{
+	scan.ClassSource,
+	scan.ClassTest,
+	// Script files (shell, etc.) define functions worth indexing too.
+	scan.ClassScript,
+}
+
+// NewSymbolIndex extracts symbols from all source, test and script files in the
+// index.
 func NewSymbolIndex(root string, idx *FileIndex) *SymbolIndex {
 	si := &SymbolIndex{
-		byFile: make(map[string][]Symbol),
+		byFile:  make(map[string][]Symbol),
+		parseBy: make(map[string]FileParse),
 	}
 
-	sources := make([]*scan.FileEntry, 0, len(idx.ByClass(scan.ClassSource))+len(idx.ByClass(scan.ClassScript)))
-	sources = append(sources, idx.ByClass(scan.ClassSource)...)
-	// Script files (shell, etc.) define functions worth indexing too.
-	sources = append(sources, idx.ByClass(scan.ClassScript)...)
+	var sources []*scan.FileEntry
+	for _, c := range symbolSourceClasses {
+		sources = append(sources, idx.ByClass(c)...)
+	}
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0)*2)
 
 	for _, f := range sources {
-		if !hasExtractor(f.Lang) {
-			continue
-		}
-
 		f := f
 		wg.Add(1)
 		go func() {
@@ -64,33 +141,119 @@ func NewSymbolIndex(root string, idx *FileIndex) *SymbolIndex {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			syms := extractFileSymbols(root, f)
-			if len(syms) == 0 {
-				return
-			}
+			syms, fp := extractFileSymbols(root, f)
 
 			mu.Lock()
-			si.byFile[f.RelPath] = syms
-			si.all = append(si.all, syms...)
+			si.parses = append(si.parses, fp)
+			si.parseBy[f.RelPath] = fp
+			if len(syms) > 0 {
+				si.byFile[f.RelPath] = syms
+				si.all = append(si.all, syms...)
+			}
 			mu.Unlock()
 		}()
 	}
 
 	wg.Wait()
+
+	// Extraction is concurrent, so append order is goroutine-arrival order.
+	// Sort so every rebuild of the same tree produces byte-identical output.
+	sortSymbols(si.all)
+	for k := range si.byFile {
+		sortSymbols(si.byFile[k])
+	}
+	sort.Slice(si.parses, func(i, j int) bool { return si.parses[i].RelPath < si.parses[j].RelPath })
 	return si
 }
 
-// NewSymbolIndexFromData creates a SymbolIndex from pre-loaded data.
+// sortSymbols orders symbols deterministically by file, then line, then name
+// and kind, so identical inputs always produce identical output.
+func sortSymbols(syms []Symbol) {
+	sort.Slice(syms, func(i, j int) bool {
+		a, b := &syms[i], &syms[j]
+		if a.File != b.File {
+			return a.File < b.File
+		}
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		return a.Kind < b.Kind
+	})
+}
+
+// NewSymbolIndexFromData creates a SymbolIndex from pre-loaded symbols only.
+//
+// The resulting index has no per-file parse records, so Files() and ParseFor()
+// return nothing: it knows which symbols exist but not which files were skipped
+// for lack of an extractor or truncated by a failed parse. Prefer
+// NewSymbolIndexFromCache wherever the parse records are available — a cached
+// read is the common case, and it is exactly the case where a missing trust
+// signal is most misleading.
 func NewSymbolIndexFromData(symbols []Symbol) *SymbolIndex {
+	return NewSymbolIndexFromCache(symbols, nil)
+}
+
+// NewSymbolIndexFromCache creates a SymbolIndex from pre-loaded symbols and
+// their per-file parse records, restoring the full trust signal on a cache hit.
+func NewSymbolIndexFromCache(symbols []Symbol, parses []FileParse) *SymbolIndex {
 	si := &SymbolIndex{
-		byFile: make(map[string][]Symbol),
-		all:    symbols,
+		byFile:  make(map[string][]Symbol),
+		all:     symbols,
+		parses:  parses,
+		parseBy: make(map[string]FileParse, len(parses)),
 	}
-	for i := range symbols {
-		s := &symbols[i]
+	sortSymbols(si.all)
+	for i := range si.all {
+		s := &si.all[i]
 		si.byFile[s.File] = append(si.byFile[s.File], *s)
 	}
+	sort.Slice(si.parses, func(i, j int) bool { return si.parses[i].RelPath < si.parses[j].RelPath })
+	for _, fp := range si.parses {
+		si.parseBy[fp.RelPath] = fp
+	}
 	return si
+}
+
+// Files returns the per-file parse record for every file extraction was
+// attempted on, sorted by path. Use it to distinguish "no symbols" from "no
+// extractor" or "parse failed".
+func (si *SymbolIndex) Files() []FileParse {
+	if si == nil {
+		return nil
+	}
+	return si.parses
+}
+
+// ParseFor returns the parse record for one file, or nil when extraction was
+// never attempted on it (or the index was loaded from cache).
+func (si *SymbolIndex) ParseFor(path string) *FileParse {
+	if si == nil {
+		return nil
+	}
+	fp, ok := si.parseBy[path]
+	if !ok {
+		return nil
+	}
+	return &fp
+}
+
+// Incomplete returns the parse records that did not complete cleanly: files
+// recon could not fully extract. An empty symbol list plus an empty Incomplete
+// means the repo really has no declarations; anything else is a caveat.
+func (si *SymbolIndex) Incomplete() []FileParse {
+	if si == nil {
+		return nil
+	}
+	var out []FileParse
+	for _, fp := range si.parses {
+		if !fp.Clean() {
+			out = append(out, fp)
+		}
+	}
+	return out
 }
 
 // ForFile returns symbols in the given file.
@@ -192,23 +355,33 @@ func ExtractFileExtrasForPaths(root string, files []*scan.FileEntry) []FileExtra
 	return extras
 }
 
+// previewReadLimit caps how much of a file is read to build a preview. The
+// preview only ever uses the first 200 lines, so reading the whole of a
+// multi-megabyte file would be wasted work.
+const previewReadLimit = 128 << 10
+
 func extractPreview(path, lang string) string {
-	file, err := os.Open(path)
+	// readSource rejects binary content. Without this a file with a source
+	// extension but binary contents (a stray blob named .go, a Git LFS
+	// pointer's payload) had its raw bytes stored as the "preview" and emitted
+	// as hundreds of bytes of escapes in `recon context`.
+	data, err := readSource(path, previewReadLimit)
 	if err != nil {
 		return ""
 	}
-	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
 	var lines []string
 	lineNum := 0
 	maxLines := 200 // scan up to 200 lines to find meaningful content
 	collected := 0
 	maxCollect := 5 // collect up to 5 meaningful lines
 
-	for scanner.Scan() && lineNum < maxLines && collected < maxCollect {
+	for _, raw := range splitLines(data) {
+		if lineNum >= maxLines || collected >= maxCollect {
+			break
+		}
 		lineNum++
-		line := strings.TrimSpace(scanner.Text())
+		line := strings.TrimSpace(raw)
 
 		// Skip empty lines, imports, comments at top of file
 		if line == "" {
@@ -221,7 +394,9 @@ func extractPreview(path, lang string) string {
 			continue
 		}
 
-		lines = append(lines, line)
+		// A single minified line can be hundreds of kilobytes; keep previews
+		// bounded the same way signatures are.
+		lines = append(lines, trimSig(line))
 		collected++
 	}
 
@@ -294,107 +469,7 @@ func fileHash(path string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// --- Symbol extraction patterns ---
-
-type symbolPattern struct {
-	regex *regexp.Regexp
-	kind  string
-}
-
-var langPatterns = map[string][]symbolPattern{
-	"go":         goPatterns,
-	"typescript":  tsPatterns,
-	"javascript":  tsPatterns, // shares TS patterns
-	"csharp":      csharpPatterns,
-	"java":        javaPatterns,
-	"kotlin":      javaPatterns, // close enough
-	"python":      pythonPatterns,
-	"rust":        rustPatterns,
-	"ruby":        rubyPatterns,
-	"elixir":      elixirPatterns,
-	"php":         phpPatterns,
-	"swift":       swiftPatterns,
-	"dart":        dartPatterns,
-	"scala":       scalaPatterns,
-}
-
-func patternsForLang(lang string) []symbolPattern {
-	return langPatterns[lang]
-}
-
-// hasExtractor reports whether symbols can be extracted for lang by either the
-// tree-sitter grammar or the regex pattern set.
-func hasExtractor(lang string) bool {
-	return hasTSLang(lang) || len(patternsForLang(lang)) > 0
-}
-
-// extractFileSymbols extracts symbols for one file, preferring the tree-sitter
-// grammar and falling back to the regex patterns when no grammar is registered
-// (or the file can't be read for the tree-sitter path).
-func extractFileSymbols(root string, f *scan.FileEntry) []Symbol {
-	fullPath := filepath.Join(root, f.RelPath)
-
-	if hasTSLang(f.Lang) {
-		if data, err := os.ReadFile(fullPath); err == nil {
-			if syms, ok := extractSymbolsTS(data, f.RelPath, f.Lang); ok {
-				return syms
-			}
-		}
-	}
-
-	patterns := patternsForLang(f.Lang)
-	if len(patterns) == 0 {
-		return nil
-	}
-	return extractSymbols(fullPath, f.RelPath, patterns)
-}
-
-func extractSymbols(fullPath, relPath string, patterns []symbolPattern) []Symbol {
-	file, err := os.Open(fullPath)
-	if err != nil {
-		return nil
-	}
-	defer file.Close()
-
-	var symbols []Symbol
-	scanner := bufio.NewScanner(file)
-	lineNum := 0
-
-	for scanner.Scan() {
-		lineNum++
-		line := scanner.Text()
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-
-		for _, p := range patterns {
-			m := p.regex.FindStringSubmatch(line)
-			if m == nil {
-				continue
-			}
-			if len(m) < 2 {
-				// Pattern matched but has no capture group (e.g. defstruct).
-				continue
-			}
-			name := m[1]
-			// Skip private/underscore names in some languages
-			if name == "_" || name == "" {
-				continue
-			}
-			symbols = append(symbols, Symbol{
-				File:      relPath,
-				Name:      name,
-				Kind:      p.kind,
-				Line:      lineNum,
-				Signature: trimSig(trimmed),
-			})
-			break // one match per line
-		}
-	}
-
-	return symbols
-}
+// --- Symbol extraction dispatch ---
 
 // trimSig truncates long signatures to keep DB compact.
 func trimSig(s string) string {
@@ -404,160 +479,129 @@ func trimSig(s string) string {
 	return s
 }
 
-// --- Compiled patterns per language ---
-
-var goPatterns = compilePatterns([]rawPattern{
-	{`^func\s+(\w+)\s*\(`, "function"},
-	{`^func\s+\([^)]+\)\s+(\w+)\s*\(`, "method"},
-	{`^type\s+(\w+)\s+struct\b`, "struct"},
-	{`^type\s+(\w+)\s+interface\b`, "interface"},
-	{`^type\s+(\w+)\s+`, "type"},
-	{`^var\s+(\w+)\s+`, "var"},
-	{`^const\s+(\w+)\s+`, "constant"},
-})
-
-var tsPatterns = compilePatterns([]rawPattern{
-	{`^export\s+(?:async\s+)?function\s+(\w+)`, "function"},
-	{`^export\s+class\s+(\w+)`, "class"},
-	{`^export\s+abstract\s+class\s+(\w+)`, "class"},
-	{`^export\s+interface\s+(\w+)`, "interface"},
-	{`^export\s+type\s+(\w+)`, "type"},
-	{`^export\s+const\s+(\w+)`, "constant"},
-	{`^export\s+enum\s+(\w+)`, "enum"},
-	{`^export\s+default\s+(?:class|function)\s+(\w+)`, "function"},
-	{`^\s*(?:async\s+)?function\s+(\w+)`, "function"},
-	{`^\s*class\s+(\w+)`, "class"},
-	{`^\s*interface\s+(\w+)`, "interface"},
-	{`^\s*(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(`, "function"},      // arrow fn
-	{`^\s*(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?function`, "function"}, // fn expression
-})
-
-var csharpPatterns = compilePatterns([]rawPattern{
-	{`(?:public|internal|protected|private)\s+(?:static\s+)?(?:partial\s+)?(?:abstract\s+)?class\s+(\w+)`, "class"},
-	{`(?:public|internal|protected|private)\s+(?:static\s+)?interface\s+(\w+)`, "interface"},
-	{`(?:public|internal|protected|private)\s+(?:static\s+)?enum\s+(\w+)`, "enum"},
-	{`(?:public|internal|protected|private)\s+(?:static\s+)?struct\s+(\w+)`, "struct"},
-	{`(?:public|internal|protected|private)\s+(?:static\s+)?record\s+(\w+)`, "class"},
-	// Methods — match return-type + name + paren
-	{`(?:public|internal|protected|private)\s+(?:static\s+)?(?:virtual\s+)?(?:override\s+)?(?:async\s+)?(?:[\w<>\[\],\s]+?)\s+(\w+)\s*\(`, "method"},
-	// Properties
-	{`(?:public|internal|protected|private)\s+(?:static\s+)?(?:[\w<>\[\]?]+)\s+(\w+)\s*\{\s*get`, "property"},
-	// Delegate
-	{`(?:public|internal|protected|private)\s+delegate\s+\S+\s+(\w+)\s*\(`, "delegate"},
-})
-
-var javaPatterns = compilePatterns([]rawPattern{
-	{`(?:public|protected|private)\s+(?:static\s+)?(?:abstract\s+)?(?:final\s+)?class\s+(\w+)`, "class"},
-	{`(?:public|protected|private)\s+interface\s+(\w+)`, "interface"},
-	{`(?:public|protected|private)\s+enum\s+(\w+)`, "enum"},
-	{`(?:public|protected|private)\s+(?:static\s+)?(?:final\s+)?(?:synchronized\s+)?(?:[\w<>\[\]]+)\s+(\w+)\s*\(`, "method"},
-	{`@interface\s+(\w+)`, "annotation"},
-})
-
-var pythonPatterns = compilePatterns([]rawPattern{
-	{`^class\s+(\w+)`, "class"},
-	{`^def\s+(\w+)`, "function"},
-	{`^async\s+def\s+(\w+)`, "function"},
-	{`^\s{4}def\s+(\w+)`, "method"},
-	{`^\s{4}async\s+def\s+(\w+)`, "method"},
-	{`^([A-Z][A-Z_0-9]+)\s*=`, "constant"}, // UPPER_SNAKE constants
-})
-
-var rustPatterns = compilePatterns([]rawPattern{
-	{`^pub(?:\(crate\))?\s+(?:async\s+)?fn\s+(\w+)`, "function"},
-	{`^pub(?:\(crate\))?\s+struct\s+(\w+)`, "struct"},
-	{`^pub(?:\(crate\))?\s+enum\s+(\w+)`, "enum"},
-	{`^pub(?:\(crate\))?\s+trait\s+(\w+)`, "trait"},
-	{`^pub(?:\(crate\))?\s+type\s+(\w+)`, "type"},
-	{`^pub(?:\(crate\))?\s+const\s+(\w+)`, "constant"},
-	{`^pub(?:\(crate\))?\s+static\s+(\w+)`, "constant"},
-	{`^\s+pub(?:\(crate\))?\s+(?:async\s+)?fn\s+(\w+)`, "method"},
-	{`^\s+fn\s+(\w+)`, "method"}, // impl methods
-})
-
-var rubyPatterns = compilePatterns([]rawPattern{
-	{`^class\s+(\w+)`, "class"},
-	{`^module\s+(\w+)`, "module"},
-	{`^\s+def\s+self\.(\w+)`, "function"},
-	{`^\s+def\s+(\w+)`, "method"},
-	{`^\s+attr_(?:reader|writer|accessor)\s+:(\w+)`, "property"},
-	{`([A-Z][A-Z_0-9]+)\s*=`, "constant"},
-})
-
-var elixirPatterns = compilePatterns([]rawPattern{
-	{`^defmodule\s+([\w.]+)`, "module"},
-	{`^\s+def\s+(\w+)`, "function"},
-	{`^\s+defp\s+(\w+)`, "function"},
-	{`^\s+defmacro\s+(\w+)`, "macro"},
-	{`^\s+defstruct\b`, "struct"},
-})
-
-var phpPatterns = compilePatterns([]rawPattern{
-	{`(?:abstract\s+)?class\s+(\w+)`, "class"},
-	{`interface\s+(\w+)`, "interface"},
-	{`trait\s+(\w+)`, "trait"},
-	{`(?:public|protected|private)\s+(?:static\s+)?function\s+(\w+)`, "method"},
-	{`^function\s+(\w+)`, "function"},
-})
-
-var dartPatterns = compilePatterns([]rawPattern{
-	{`^class\s+(\w+)`, "class"},
-	{`^abstract\s+class\s+(\w+)`, "class"},
-	{`^mixin\s+(\w+)`, "class"},
-	{`^enum\s+(\w+)`, "enum"},
-	{`^extension\s+(\w+)`, "type"},
-	{`^typedef\s+(\w+)`, "type"},
-	{`^\s+(?:static\s+)?(?:Future|Stream|void|int|double|bool|String|dynamic|[\w<>]+)\s+(\w+)\s*\(`, "method"},
-	{`^(?:Future|Stream|void|int|double|bool|String|dynamic|[\w<>]+)\s+(\w+)\s*\(`, "function"},
-	{`^const\s+(\w+)\s*=`, "constant"},
-	{`^final\s+(\w+)\s*=`, "constant"},
-})
-
-var scalaPatterns = compilePatterns([]rawPattern{
-	{`(?:abstract\s+)?class\s+(\w+)`, "class"},
-	{`(?:sealed\s+)?trait\s+(\w+)`, "trait"},
-	{`object\s+(\w+)`, "module"},
-	{`case\s+class\s+(\w+)`, "class"},
-	{`case\s+object\s+(\w+)`, "module"},
-	{`def\s+(\w+)`, "function"},
-	{`type\s+(\w+)`, "type"},
-	{`val\s+(\w+)`, "constant"},
-	{`lazy\s+val\s+(\w+)`, "constant"},
-})
-
-var swiftPatterns = compilePatterns([]rawPattern{
-	{`(?:public|open|internal)\s+class\s+(\w+)`, "class"},
-	{`(?:public|open|internal)\s+struct\s+(\w+)`, "struct"},
-	{`(?:public|open|internal)\s+enum\s+(\w+)`, "enum"},
-	{`(?:public|open|internal)\s+protocol\s+(\w+)`, "interface"},
-	{`(?:public|open|internal)\s+func\s+(\w+)`, "function"},
-	{`^\s+func\s+(\w+)`, "method"},
-})
-
-type rawPattern struct {
-	pattern string
-	kind    string
+// hasExtractor reports whether symbols can be extracted for lang by either a
+// tree-sitter grammar or the regex pattern set.
+func hasExtractor(lang string) bool {
+	return hasTSLang(lang) || len(patternsForLang(lang)) > 0
 }
 
-func compilePatterns(raw []rawPattern) []symbolPattern {
-	compiled := make([]symbolPattern, len(raw))
-	for i, r := range raw {
-		compiled[i] = symbolPattern{
-			regex: regexp.MustCompile(r.pattern),
-			kind:  r.kind,
+// extractFileSymbols extracts symbols for one file and reports how it went.
+//
+// The tree-sitter grammar is always preferred; the regex patterns are a
+// fallback for languages with no grammar. The returned FileParse is recorded
+// even when no symbols are found, so an empty result is never mistaken for a
+// clean, complete "this file declares nothing".
+func extractFileSymbols(root string, f *scan.FileEntry) ([]Symbol, FileParse) {
+	fp := FileParse{RelPath: f.RelPath, Lang: f.Lang}
+
+	if !hasExtractor(f.Lang) {
+		fp.Extractor = ExtractorNone
+		fp.Status = ParseUnsupported
+		fp.Detail = "no tree-sitter grammar or pattern set for " + langLabel(f.Lang)
+		return nil, fp
+	}
+
+	fullPath := filepath.Join(root, f.RelPath)
+	data, err := readSource(fullPath, 0)
+	if err != nil {
+		fp.Extractor = ExtractorNone
+		fp.Status = ParseFailed
+		fp.Detail = "could not read as text: " + err.Error()
+		return nil, fp
+	}
+
+	if cands := grammarCandidates(f.Lang, f.RelPath); len(cands) > 0 {
+		if syms, res, ok := extractWithGrammars(data, f.RelPath, cands); ok {
+			fp.Extractor = ExtractorTreeSitter
+			fp.SymbolCount = len(syms)
+			if res.clean {
+				fp.Status = ParseOK
+				if res.key != f.Lang {
+					// e.g. a .h classified as C that parsed better as C++.
+					fp.Detail = "parsed with the " + res.key + " grammar"
+				}
+			} else {
+				fp.Status = ParsePartial
+				fp.Detail = "tree-sitter (" + res.key + ") reported syntax errors; symbol list may be incomplete"
+			}
+			return syms, fp
 		}
 	}
-	return compiled
+
+	patterns := patternsForLang(f.Lang)
+	if len(patterns) == 0 {
+		fp.Extractor = ExtractorNone
+		fp.Status = ParseFailed
+		fp.Detail = "grammar parse failed and no fallback patterns for " + langLabel(f.Lang)
+		return nil, fp
+	}
+
+	syms := extractSymbolsRegex(data, f.RelPath, f.Lang, patterns)
+	fp.Extractor = ExtractorRegex
+	fp.SymbolCount = len(syms)
+	fp.Status = ParseOK
+	fp.Detail = "line-pattern extraction: names, kinds and lines are approximate"
+	return syms, fp
+}
+
+func langLabel(lang string) string {
+	if lang == "" {
+		return "unknown language"
+	}
+	return lang
+}
+
+// grammarCandidates returns the tree-sitter registry keys to try for a file, in
+// preference order.
+//
+// A recon "language" does not always map to one grammar. TypeScript is the
+// clearest case: .ts and .tsx are different languages that share an extension
+// family, and the TSX grammar cannot parse angle-bracket type assertions
+// (`<number>x`), which are legal and common in .ts. Parsing every .ts file as
+// TSX silently truncated files at the first legacy cast. C headers are the
+// other case: .h is claimed by both C and C++, and there is no way to tell from
+// the name.
+func grammarCandidates(lang, relPath string) []string {
+	ext := strings.ToLower(filepath.Ext(relPath))
+	switch {
+	case lang == "typescript" && ext == ".tsx":
+		return []string{tsxLangKey, "typescript"}
+	case lang == "typescript":
+		return []string{"typescript", tsxLangKey}
+	case lang == "c" && ext == ".h":
+		// A .h holding C++ (templates, namespaces, classes) parses badly under
+		// the C grammar; a .h holding C parses fine under both. Try both and
+		// keep the better result rather than guessing from the extension.
+		return []string{"c", "cpp"}
+	}
+	if hasTSLang(lang) {
+		return []string{lang}
+	}
+	return nil
 }
 
 // ScanFileSymbols extracts symbols for specific files (incremental).
 func ScanFileSymbols(root string, files []*scan.FileEntry) []Symbol {
 	var all []Symbol
 	for _, f := range files {
-		if !hasExtractor(f.Lang) {
-			continue
-		}
-		all = append(all, extractFileSymbols(root, f)...)
+		syms, _ := extractFileSymbols(root, f)
+		all = append(all, syms...)
 	}
+	sortSymbols(all)
 	return all
+}
+
+// ScanFileParses extracts symbols and per-file parse records for specific
+// files (incremental), mirroring ScanFileSymbols.
+func ScanFileParses(root string, files []*scan.FileEntry) ([]Symbol, []FileParse) {
+	var all []Symbol
+	parses := make([]FileParse, 0, len(files))
+	for _, f := range files {
+		syms, fp := extractFileSymbols(root, f)
+		all = append(all, syms...)
+		parses = append(parses, fp)
+	}
+	sortSymbols(all)
+	sort.Slice(parses, func(i, j int) bool { return parses[i].RelPath < parses[j].RelPath })
+	return all, parses
 }

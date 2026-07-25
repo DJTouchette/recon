@@ -75,15 +75,15 @@ func TestFindRelated_SameDirectory(t *testing.T) {
 		t.Errorf("expected same-directory signal, got %v", helper.Signals)
 	}
 
-	// models/user.go appears via same-package signal (sibling directory under "pkg"),
+	// models/user.go appears via the adjacent-package signal (sibling directory under "pkg"),
 	// but NOT via same-directory (it's in a different directory).
 	modelsUser, ok := findResult(results, "pkg/models/user.go")
 	if ok {
 		if hasSignal(modelsUser, "same-directory") {
 			t.Error("pkg/models/user.go should not have same-directory signal")
 		}
-		if !hasSignal(modelsUser, "same-package") {
-			t.Error("pkg/models/user.go should have same-package signal if present")
+		if !hasSignal(modelsUser, "adjacent-package") {
+			t.Error("pkg/models/user.go should have adjacent-package signal if present")
 		}
 	}
 	// helper.go and token.go MUST be in results
@@ -226,8 +226,8 @@ func TestFindRelated_ImportedBy(t *testing.T) {
 	)
 	// auth.go and handler.go both import user.go
 	deps := makeDeps(map[string][]string{
-		"pkg/auth/auth.go":    {"pkg/models/user.go"},
-		"pkg/api/handler.go":  {"pkg/models/user.go"},
+		"pkg/auth/auth.go":   {"pkg/models/user.go"},
+		"pkg/api/handler.go": {"pkg/models/user.go"},
 	})
 	tm := makeTestMap(nil, nil)
 
@@ -357,10 +357,10 @@ func TestFindRelated_CoChange_MinCountFilter(t *testing.T) {
 	}
 }
 
-// ─── Signal 5: same-package ───────────────────────────────────────────────────
+// ─── Signal 5: adjacent-package ───────────────────────────────────────────────────
 
 func TestFindRelated_SamePackage(t *testing.T) {
-	// Files in sibling directories under the same parent get same-package signal
+	// Files in sibling directories under the same parent get the adjacent-package signal
 	idx := makeIdx(
 		scan.FileEntry{RelPath: "pkg/auth/auth.go", Lang: "go", Class: scan.ClassSource},
 		scan.FileEntry{RelPath: "pkg/auth/session.go", Lang: "go", Class: scan.ClassSource},
@@ -372,16 +372,16 @@ func TestFindRelated_SamePackage(t *testing.T) {
 
 	results := FindRelated("pkg/auth/auth.go", idx, nil, tm, nil, nil, nil, 20)
 
-	// pkg/models/user.go is a sibling directory under "pkg" → same-package
+	// pkg/models/user.go is a sibling directory under "pkg" → adjacent-package
 	modelsUser, ok := findResult(results, "pkg/models/user.go")
 	if !ok {
 		t.Fatal("expected pkg/models/user.go in results")
 	}
-	if !hasSignal(modelsUser, "same-package") {
-		t.Errorf("expected same-package signal for models/user.go, got %v", modelsUser.Signals)
+	if !hasSignal(modelsUser, "adjacent-package") {
+		t.Errorf("expected adjacent-package signal for models/user.go, got %v", modelsUser.Signals)
 	}
 
-	// cmd/main.go is under a different top-level dir → no same-package
+	// cmd/main.go is under a different top-level dir → no adjacent-package
 	_, ok = findResult(results, "cmd/main.go")
 	if ok {
 		t.Error("cmd/main.go should not be in results (no shared signals)")
@@ -459,9 +459,21 @@ func TestFindRelated_HotspotDep(t *testing.T) {
 	if !hasSignal(core, "hotspot-dep") {
 		t.Errorf("expected hotspot-dep signal, got %v", core.Signals)
 	}
-	// Score should include 0.7 (imports) + 0.3 (hotspot-dep) = 1.0 (capped)
-	if core.Score < 0.9 {
-		t.Errorf("expected high score for hotspot dep, got %f", core.Score)
+
+	// The boost is asserted relatively, against the identical fixture without
+	// hotspot metrics. This used to check `Score >= 0.9`, which encoded the old
+	// hard clamp — 0.7 (imports) + 0.3 (hotspot-dep) landed on exactly 1.0
+	// because everything did. Pinning the magnitude is what made the assertion
+	// pass while the ranking underneath was degenerate, so what matters is that
+	// the boost moves the score, not what number it lands on.
+	plain := FindRelated("src/app.go", idx, deps, tm, nil, nil, nil, 20)
+	base, ok := findResult(plain, "src/core.go")
+	if !ok {
+		t.Fatal("expected src/core.go in the un-boosted results")
+	}
+	if core.Score <= base.Score {
+		t.Errorf("hotspot-dep should raise the score: %f with metrics vs %f without",
+			core.Score, base.Score)
 	}
 }
 
@@ -699,4 +711,76 @@ func TestFindRelated_NilOptionalParams(t *testing.T) {
 	// nilable and must not panic.
 	results := FindRelated("a.go", idx, nil, nil, nil, nil, nil, 5)
 	_ = results
+}
+
+// A hard clamp at 1.0 collapsed every well-connected file onto the same score,
+// and the path tie-break then turned the ranking into a directory listing.
+func TestSoftCapPreservesOrderAndStaysBounded(t *testing.T) {
+	prev := -1.0
+	for _, raw := range []float64{0, 0.3, 0.8, 1.0, 1.5, 2.0, 3.0, 4.15} {
+		got := softCap(raw)
+		if got <= prev {
+			t.Errorf("softCap(%.2f) = %.4f is not greater than the previous %.4f", raw, got, prev)
+		}
+		if got >= 1.0 {
+			t.Errorf("softCap(%.2f) = %.4f must stay below 1.0", raw, got)
+		}
+		prev = got
+	}
+}
+
+// Below the knee the curve is the identity, so ordinary scores keep the
+// magnitudes callers are used to.
+func TestSoftCapIdentityBelowKnee(t *testing.T) {
+	for _, raw := range []float64{0, 0.25, 0.5, relateKnee} {
+		if got := softCap(raw); got != raw {
+			t.Errorf("softCap(%.3f) = %.6f, want identity below the knee", raw, got)
+		}
+	}
+}
+
+// The decay is tuned for the range this scorer actually produces. Two strongly
+// related files whose raw sums differ must still be distinguishable after
+// squashing — that is the entire point of replacing the clamp.
+func TestSoftCapSeparatesHighScores(t *testing.T) {
+	a, b := softCap(2.0), softCap(3.0)
+	if b-a < 0.01 {
+		t.Errorf("scores 2.0 and 3.0 squash to %.4f and %.4f — too close to rank", a, b)
+	}
+}
+
+// "Adjacent package" must mean an immediate sibling directory. It used to call
+// FilesInDir, which is prefix-recursive, so for a target in internal/index it
+// matched every file under internal/ — a constant added to every candidate
+// rather than a signal, and the main driver of saturation.
+func TestAdjacentPackageOnlyMatchesImmediateSiblings(t *testing.T) {
+	idx := makeIdx(
+		scan.FileEntry{RelPath: "internal/index/target.go", Class: scan.ClassSource},
+		scan.FileEntry{RelPath: "internal/scan/sibling.go", Class: scan.ClassSource},
+		scan.FileEntry{RelPath: "internal/detect/deep/nested.go", Class: scan.ClassSource},
+	)
+
+	got := FindRelated("internal/index/target.go", idx, nil, nil, nil, nil, nil, 20)
+
+	signals := map[string][]string{}
+	for _, rf := range got {
+		signals[rf.Path] = rf.Signals
+	}
+
+	hasAdjacent := func(path string) bool {
+		for _, s := range signals[path] {
+			if s == "adjacent-package" {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasAdjacent("internal/scan/sibling.go") {
+		t.Errorf("an immediate sibling directory should score adjacent-package, got %v", signals)
+	}
+	// internal/detect/deep is two levels down — not a sibling of internal/index.
+	if hasAdjacent("internal/detect/deep/nested.go") {
+		t.Errorf("a non-sibling nested directory must not score adjacent-package, got %v", signals)
+	}
 }

@@ -1,6 +1,7 @@
 package relate
 
 import (
+	"math"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -14,6 +15,32 @@ type RelatedFile struct {
 	Path    string
 	Score   float64
 	Signals []string
+}
+
+// Scores are squashed into [0,1) rather than clamped at it.
+//
+// A hard clamp collapsed every well-connected file onto exactly 1.0, and since
+// ties fall through to the alphabetical path tie-break, the ranking became a
+// directory listing: `recon related internal/index/depgraph.go` returned twenty
+// results all scoring 1.00 in a-z order, with genuinely related files pushed out
+// of the result set by the alphabet. The signals were computed correctly and
+// then thrown away at the last step.
+//
+// The knee keeps ordinary scores at face value; above it the curve bends toward
+// 1.0 without reaching it, so more evidence always ranks higher and no two
+// distinct sums ever collide. relateDecay is set for the range this scorer
+// actually produces — signals here sum to ~4 at the top end, far higher than a
+// [0,1] scorer, so a tighter curve would re-saturate everything above ~1.5.
+const (
+	relateKnee  = 0.8
+	relateDecay = 1.5
+)
+
+func softCap(score float64) float64 {
+	if score <= relateKnee {
+		return score
+	}
+	return relateKnee + (1-relateKnee)*(1-math.Exp(-(score-relateKnee)/relateDecay))
 }
 
 // FindRelated returns files related to the given path, ranked by score.
@@ -80,12 +107,24 @@ func FindRelated(path string, idx *index.FileIndex, deps *index.DepGraph, tests 
 		}
 	}
 
-	// Signal 5: Same package/module (weight 0.2)
+	// Signal 5: Adjacent package (weight 0.2)
+	//
+	// Only *immediate sibling* directories count. This used to call
+	// idx.FilesInDir(parentDir), which is prefix-recursive, so for a target in
+	// internal/index it matched every file under internal/ — in a repo where
+	// everything lives under one top-level directory that is not a signal at
+	// all, it is a constant added to every candidate, and it was the main thing
+	// driving every score to the saturation ceiling.
 	parentDir := filepath.Dir(dir)
 	if parentDir != "." && parentDir != "" {
-		for _, f := range idx.FilesInDir(parentDir) {
-			if filepath.Dir(f.RelPath) != dir {
-				addSignal(f.RelPath, 0.2, "same-package")
+		// FilesUnderDir is the explicitly-named recursive form; the filter below
+		// is what narrows it to immediate siblings. FilesDirectlyIn(parentDir)
+		// would return the wrong set — files sitting *in* the parent, not files
+		// in the parent's other child directories.
+		for _, f := range idx.FilesUnderDir(parentDir) {
+			fDir := filepath.Dir(f.RelPath)
+			if fDir != dir && filepath.Dir(fDir) == parentDir {
+				addSignal(f.RelPath, 0.2, "adjacent-package")
 			}
 		}
 	}
@@ -156,9 +195,7 @@ func FindRelated(path string, idx *index.FileIndex, deps *index.DepGraph, tests 
 	// Convert to sorted slice
 	result := make([]RelatedFile, 0, len(scores))
 	for _, rf := range scores {
-		if rf.Score > 1.0 {
-			rf.Score = 1.0
-		}
+		rf.Score = softCap(rf.Score)
 		result = append(result, *rf)
 	}
 

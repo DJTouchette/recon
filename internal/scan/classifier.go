@@ -101,30 +101,34 @@ func LangFromExt(name string) string {
 }
 
 var extToLang = map[string]string{
-	".go":      "go",
-	".js":      "javascript",
-	".jsx":     "javascript",
-	".mjs":     "javascript",
-	".cjs":     "javascript",
-	".ts":      "typescript",
-	".tsx":     "typescript",
-	".mts":     "typescript",
-	".py":      "python",
-	".pyw":     "python",
-	".rs":      "rust",
-	".rb":      "ruby",
-	".ex":      "elixir",
-	".exs":     "elixir",
-	".erl":     "erlang",
-	".cs":      "csharp",
-	".cshtml":  "csharp",
-	".razor":   "csharp",
-	".fs":      "fsharp",
-	".java":    "java",
-	".kt":      "kotlin",
-	".kts":     "kotlin",
-	".swift":   "swift",
-	".c":       "c",
+	".go":     "go",
+	".js":     "javascript",
+	".jsx":    "javascript",
+	".mjs":    "javascript",
+	".cjs":    "javascript",
+	".ts":     "typescript",
+	".tsx":    "typescript",
+	".mts":    "typescript",
+	".py":     "python",
+	".pyw":    "python",
+	".rs":     "rust",
+	".rb":     "ruby",
+	".ex":     "elixir",
+	".exs":    "elixir",
+	".erl":    "erlang",
+	".cs":     "csharp",
+	".cshtml": "csharp",
+	".razor":  "csharp",
+	".fs":     "fsharp",
+	".java":   "java",
+	".kt":     "kotlin",
+	".kts":    "kotlin",
+	".swift":  "swift",
+	".c":      "c",
+	// .h is claimed by both C and C++ and there is no way to tell from the
+	// name, so it is reported as C here and the symbol extractor resolves the
+	// ambiguity by content: see grammarCandidates in internal/index. Do not
+	// "fix" this by flipping it to cpp — that just moves the error onto C.
 	".h":       "c",
 	".cpp":     "cpp",
 	".cc":      "cpp",
@@ -242,10 +246,47 @@ func isTestFile(nameNoExt, ext, dir string) bool {
 			strings.HasSuffix(nameNoExt, "Tests") || strings.HasSuffix(nameNoExt, "Suite") {
 			return true
 		}
+	case ".rs":
+		if strings.HasSuffix(nameNoExt, "_test") || strings.HasSuffix(nameNoExt, "_tests") {
+			return true
+		}
+	case ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp":
+		if strings.HasSuffix(nameNoExt, "_test") || strings.HasPrefix(nameNoExt, "test_") {
+			return true
+		}
+	case ".zig":
+		if strings.HasSuffix(nameNoExt, "_test") {
+			return true
+		}
+	case ".lua":
+		if strings.HasSuffix(nameNoExt, "_spec") || strings.HasSuffix(nameNoExt, "_test") {
+			return true
+		}
+	case ".jl":
+		if strings.HasPrefix(nameNoExt, "test_") || strings.HasSuffix(nameNoExt, "_test") {
+			return true
+		}
+	case ".sh", ".bash":
+		if strings.HasSuffix(nameNoExt, "_test") || strings.HasSuffix(nameNoExt, ".test") ||
+			strings.HasPrefix(nameNoExt, "test_") {
+			return true
+		}
 	}
 
-	// Directory-based test detection (only for source files)
-	if isSourceFile(ext) {
+	// Directory-based test detection (only for source files).
+	//
+	// This is deliberately broad: everything under test/, tests/, spec/,
+	// specs/ or __tests__/ is test-class, including shared fixture and helper
+	// code that declares types other code depends on. That breadth is correct
+	// for "which files are tests" (the tests command, hotspot weighting), but
+	// it must not be read as "these files declare nothing worth indexing" —
+	// the symbol index covers ClassTest precisely because fixture code under
+	// these directories is real API. See symbolSourceClasses in
+	// internal/index/symbols.go.
+	// Scripts count too. Gating this on isSourceFile alone meant a shell script
+	// under tests/ could never be classified as a test, so the test map had
+	// rules for those languages that a real walk could never reach.
+	if isSourceFile(ext) || isScriptFile(ext) {
 		parts := strings.Split(dir, "/")
 		for _, p := range parts {
 			lp := strings.ToLower(p)

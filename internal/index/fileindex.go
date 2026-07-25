@@ -47,8 +47,8 @@ func NewFileIndex(files []scan.FileEntry) *FileIndex {
 	return idx
 }
 
-func (idx *FileIndex) All() []*scan.FileEntry           { return idx.all }
-func (idx *FileIndex) Len() int                          { return len(idx.all) }
+func (idx *FileIndex) All() []*scan.FileEntry             { return idx.all }
+func (idx *FileIndex) Len() int                           { return len(idx.all) }
 func (idx *FileIndex) Get(relPath string) *scan.FileEntry { return idx.byPath[relPath] }
 
 func (idx *FileIndex) ByDir(dir string) []*scan.FileEntry {
@@ -63,7 +63,9 @@ func (idx *FileIndex) ByClass(class scan.FileClass) []*scan.FileEntry {
 	return idx.byClass[class]
 }
 
-// Languages returns a sorted list of languages with counts.
+// Languages returns languages with counts, most files first. Ties break on
+// name: the counts come from ranging a map, so without a total order two runs
+// over an unchanged repo report the same languages in a different order.
 func (idx *FileIndex) Languages() []LangCount {
 	var langs []LangCount
 	total := 0
@@ -80,7 +82,10 @@ func (idx *FileIndex) Languages() []LangCount {
 		}
 	}
 	sort.Slice(langs, func(i, j int) bool {
-		return langs[i].Count > langs[j].Count
+		if langs[i].Count != langs[j].Count {
+			return langs[i].Count > langs[j].Count
+		}
+		return langs[i].Name < langs[j].Name
 	})
 	for i := range langs {
 		if total > 0 {
@@ -137,8 +142,13 @@ func (idx *FileIndex) TopDirs() []DirInfo {
 		})
 	}
 
+	// Same map-iteration hazard as Languages: tie-break on path so the
+	// structure section of an overview is stable run to run.
 	sort.Slice(dirs, func(i, j int) bool {
-		return dirs[i].FileCount > dirs[j].FileCount
+		if dirs[i].FileCount != dirs[j].FileCount {
+			return dirs[i].FileCount > dirs[j].FileCount
+		}
+		return dirs[i].Path < dirs[j].Path
 	})
 	return dirs
 }
@@ -197,14 +207,66 @@ func (idx *FileIndex) Exists(relPath string) bool {
 	return ok
 }
 
-// FilesInDir returns files whose RelPath starts with the given directory prefix.
-func (idx *FileIndex) FilesInDir(dirPrefix string) []*scan.FileEntry {
+// FilesUnderDir returns every file at ANY depth under dir, including files in
+// nested subdirectories.
+//
+// The recursion is the point — "tests under internal/orders" means the whole
+// subtree — but it also means this is the wrong function for any question of
+// the form "is this file a sibling of that one" / "are these in the same
+// package": FilesUnderDir("internal") matches every file in the repo's
+// internal tree, which makes a same-package signal fire on everything. Use
+// FilesDirectlyIn for that.
+//
+// dir is a slash-separated relpath. "" and "." both mean the repo root and
+// return every file.
+func (idx *FileIndex) FilesUnderDir(dir string) []*scan.FileEntry {
+	dir = normalizeDir(dir)
+	if dir == "" {
+		out := make([]*scan.FileEntry, len(idx.all))
+		copy(out, idx.all)
+		return out
+	}
+	prefix := dir + "/"
 	var result []*scan.FileEntry
-	prefix := dirPrefix + "/"
 	for _, f := range idx.all {
-		if strings.HasPrefix(f.RelPath, prefix) || filepath.Dir(f.RelPath) == dirPrefix {
+		if strings.HasPrefix(f.RelPath, prefix) {
 			result = append(result, f)
 		}
 	}
 	return result
+}
+
+// FilesDirectlyIn returns only the files whose immediate parent is dir —
+// siblings, not the subtree. This is the "same package / same directory"
+// question.
+//
+// "" and "." both mean the repo root.
+func (idx *FileIndex) FilesDirectlyIn(dir string) []*scan.FileEntry {
+	return idx.byDir[normalizeDir(dir)]
+}
+
+// FilesInDir is the recursive form.
+//
+// Deprecated: the name does not say whether it recurses, and callers have read
+// it both ways. Use FilesUnderDir (recursive) or FilesDirectlyIn (siblings
+// only).
+func (idx *FileIndex) FilesInDir(dirPrefix string) []*scan.FileEntry {
+	return idx.FilesUnderDir(dirPrefix)
+}
+
+// normalizeDir maps the several spellings of "the repo root" onto the empty
+// string used as the byDir key. Without this, FilesUnderDir(".") builds the
+// prefix "./", which never matches a cleaned relpath, and a query about the
+// whole repo silently returns nothing.
+func normalizeDir(dir string) string {
+	dir = filepath.ToSlash(dir)
+	dir = strings.TrimSuffix(dir, "/")
+	if dir == "." || dir == "/" {
+		return ""
+	}
+	dir = strings.TrimPrefix(dir, "./")
+	if dir == "." {
+		return ""
+	}
+	return dir
 }

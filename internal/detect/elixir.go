@@ -1,70 +1,66 @@
 package detect
 
 import (
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
 	"github.com/djtouchette/recon/internal/index"
+	"github.com/djtouchette/recon/internal/scan"
 )
 
-// Matches {:dep_name, "~> 1.0"} or {:dep_name, ">= 0"} etc. in mix.exs
-var mixDep = regexp.MustCompile(`\{:(\w+),`)
+// {:dep_name, "~> 1.0"} in mix.exs
+var mixDep = regexp.MustCompile(`\{:(\w+),\s*(?:"([^"]+)")?`)
 
 type ElixirDetector struct{}
 
-func (d *ElixirDetector) DetectFrameworks(idx *index.FileIndex, root string) []Framework {
-	if !hasFile(idx, "mix.exs") {
-		return nil
-	}
+func (d *ElixirDetector) Key() string         { return "elixir" }
+func (d *ElixirDetector) Languages() []string { return []string{"elixir"} }
 
-	data, err := os.ReadFile(filepath.Join(root, "mix.exs"))
-	if err != nil {
-		return nil
-	}
+func (d *ElixirDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
+	var res DetectorResult
 
-	var frameworks []Framework
-	seen := make(map[string]bool)
-
-	for _, m := range mixDep.FindAllStringSubmatch(string(data), -1) {
-		dep := m[1]
-		if !seen[dep] {
-			seen[dep] = true
-			frameworks = append(frameworks, Framework{
-				Name:     dep,
+	if content, ok := readManifest(root, "mix.exs"); ok && hasFile(idx, "mix.exs") {
+		for _, m := range mixDep.FindAllStringSubmatch(content, -1) {
+			res.Dependencies = append(res.Dependencies, Dependency{
+				Name:     m[1],
+				Version:  m[2],
 				Language: "elixir",
-				Evidence: "mix.exs",
+				Manifest: "mix.exs",
 			})
+			if fw, ok := hexFrameworks.lookup(m[1]); ok {
+				res.Frameworks = append(res.Frameworks, Framework{
+					Name:     fw,
+					Language: "elixir",
+					Evidence: "mix.exs: :" + m[1],
+				})
+			}
 		}
 	}
 
-	return frameworks
+	res.Entrypoints = d.entrypoints(idx, root)
+	return res
 }
 
-func (d *ElixirDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
+func (d *ElixirDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoint {
 	var eps []Entrypoint
 
-	if hasFile(idx, "lib/application.ex") {
-		eps = append(eps, Entrypoint{Path: "lib/application.ex", Kind: "main"})
-	}
-
-	for _, f := range idx.All() {
+	for _, f := range idx.ByLang("elixir") {
 		base := filepath.Base(f.RelPath)
-		if base == "router.ex" {
+		switch {
+		case base == "router.ex":
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "route"})
-		}
-	}
-
-	// Look for Application modules in lib/<app>/ directories
-	for _, f := range idx.All() {
-		if f.Lang != "elixir" || !strings.HasPrefix(f.RelPath, "lib/") {
-			continue
-		}
-		if filepath.Base(f.RelPath) == "application.ex" && f.RelPath != "lib/application.ex" {
+		case base == "application.ex":
 			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
 		}
 	}
+
+	// `use Application` is the real marker; the filename is only a convention.
+	scanSource(idx, root, []string{"elixir"}, func(f *scan.FileEntry, content string) {
+		if strings.Contains(content, "use Application") {
+			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
+		}
+	})
 
 	return eps
 }

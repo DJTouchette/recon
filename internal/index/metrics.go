@@ -74,8 +74,17 @@ func ComputeMetrics(deps *DepGraph, cochange *gitpkg.CoChange) []FileMetrics {
 		}
 	}
 
+	// Tie-break on path. The slice is built by ranging a map, so without this
+	// two rebuilds of an identical tree produce different orderings — and since
+	// callers take the top N, different *membership* too: files drift in and out
+	// of "the riskiest 20" run to run. Ties are the common case here, because
+	// fan-in is shared across a package and most scores collapse to a handful of
+	// distinct values. internal/relate does the same thing for the same reason.
 	sort.Slice(metrics, func(i, j int) bool {
-		return metrics[i].HotspotScore > metrics[j].HotspotScore
+		if metrics[i].HotspotScore != metrics[j].HotspotScore {
+			return metrics[i].HotspotScore > metrics[j].HotspotScore
+		}
+		return metrics[i].RelPath < metrics[j].RelPath
 	})
 
 	return metrics

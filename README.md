@@ -15,8 +15,8 @@ Recon is the codebase-intelligence layer of the [Rivet](https://github.com/djtou
 - **Hotspot detection** — high fan-in × high churn = the code that's risky to touch
 - **Enriched grep** — full regex matching (RE2) with smart-case, every match classified as a definition, reference, test, or comment
 - **File context** — preview, fan-in/fan-out, churn, ownership (CODEOWNERS), nearby configs
-- **Test mapping** — which tests cover which source files
-- **Project overview** — languages, frameworks, entrypoints, structure
+- **Test mapping** — which tests cover which source files, with "no rules for this language" reported separately from "no test found"
+- **Project overview** — languages, entrypoints, structure, and frameworks that are actually evidenced (a curated rule matching a dependency, a config file, or a source marker) rather than a dump of every manifest entry
 
 ## Quick Start
 
@@ -91,6 +91,8 @@ src/orders/
 ```
 
 Query with `recon docs`, `recon docs file:src/orders/handler.go`, or `recon docs symbol:ProcessPayment`. Docs also appear in `recon context <path>` output. [Rivet](https://github.com/djtouchette/rivet) folds them into its context recommendation engine automatically.
+
+Where a tree-sitter grammar is available the doc scanner reads comments from the parse tree, so a marker inside a string literal is not mistaken for a doc, and a marker in a comment trailing real code is still picked up. Languages on the regex fallback use a line scanner, which can be fooled by a marker inside a multi-line string. An explicit `rivet:context(Name)` is checked against the symbols recon indexed for that same file: if the name is not there, the note is kept as a file-level doc rather than asserting a symbol that `recon symbols` would say does not exist.
 
 ## Language Support
 

@@ -3,6 +3,7 @@ package recon
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,21 +18,30 @@ import (
 
 // Recon is the main entry point for repo intelligence.
 type Recon struct {
-	root      string
-	store     *cache.Store
-	idx       *index.FileIndex
-	deps      *index.DepGraph
-	tests      *index.TestMap
-	symbols    *index.SymbolIndex
-	references *index.ReferenceIndex
+	root        string
+	store       *cache.Store
+	idx         *index.FileIndex
+	deps        *index.DepGraph
+	tests       *index.TestMap
+	symbols     *index.SymbolIndex
+	references  *index.ReferenceIndex
 	contextDocs *index.ContextDocIndex
-	extras     map[string]*index.FileExtra
-	metrics   *index.MetricsIndex
-	nearby    *index.NearbyIndex
-	ownership *index.Ownership
-	cochange  *gitpkg.CoChange
-	isGit     bool
+	extras      map[string]*index.FileExtra
+	metrics     *index.MetricsIndex
+	nearby      *index.NearbyIndex
+	ownership   *index.Ownership
+	cochange    *gitpkg.CoChange
+	isGit       bool
+
+	// lastTestStatus records why the most recent Tests() call returned what it
+	// did, so the CLI can say "no mapping rules for this file type" instead of
+	// "no test files found" — a false negative dressed as a fact.
+	lastTestStatus string
 }
+
+// LastTestStatus reports the outcome of the most recent Tests call:
+// "mapped", "no_match", or "unsupported".
+func (r *Recon) LastTestStatus() string { return r.lastTestStatus }
 
 // Option configures Recon behaviour.
 type Option func(*options)
@@ -79,25 +89,27 @@ func New(root string, opts ...Option) (*Recon, error) {
 
 	reason := cache.CheckStaleness(store)
 
-	switch {
-	case reason == cache.NotStale:
-		// Cache is fresh — load from DB
-		if err := r.loadFromCache(); err != nil {
-			return r, r.Rebuild()
-		}
-		return r, nil
-
-	case reason.NeedsRebuild():
-		// No cache data — full rebuild
+	if reason.NeedsRebuild() {
 		return r, r.Rebuild()
-
-	default:
-		// HEAD or key file changed — refresh
-		if err := r.Refresh(); err != nil {
-			return r, r.Rebuild()
-		}
-		return r, nil
 	}
+
+	// Everything else goes through Refresh, including cache.NotStale.
+	//
+	// CheckStaleness only compares HEAD and the mtimes of a handful of manifest
+	// files, so it cannot see an ordinary source edit. Treating "not stale" as
+	// "serve the cache untouched" meant a file the caller had just edited was
+	// invisible until it was committed: recon would report symbols that had been
+	// deleted, and omit ones that had been added, with no way to tell. For an
+	// agent editing code that is the normal case, not an edge case.
+	//
+	// Refresh walks and diffs the tree itself, which is milliseconds on a repo
+	// this size, and it re-mines git history only when HEAD actually moved. So
+	// the cheap check now decides how much work Refresh does, not whether the
+	// working tree is looked at.
+	if err := r.Refresh(); err != nil {
+		return r, r.Rebuild()
+	}
+	return r, nil
 }
 
 // Close releases the database connection.
@@ -110,7 +122,13 @@ func (r *Recon) Close() error {
 
 // Overview returns a structured summary of the repo.
 func (r *Recon) Overview() (*Overview, error) {
-	languages, frameworks, entrypoints := detect.DetectAll(r.idx, r.root)
+	// Detect (not DetectAll) so the result can say WHY a list is empty.
+	// "frameworks: null" previously meant both "this project uses none" and
+	// "no detector recognised these languages", and the raw manifest dump that
+	// used to be reported as frameworks — including the project's own artifact
+	// id — is now separated into dependencies.
+	res := detect.Detect(r.idx, r.root)
+	languages, frameworks, entrypoints := res.Languages, res.Frameworks, res.Entrypoints
 
 	var langs []Language
 	for _, l := range languages {
@@ -147,14 +165,27 @@ func (r *Recon) Overview() (*Overview, error) {
 		})
 	}
 
+	var deps []Dependency
+	for _, d := range res.Dependencies {
+		deps = append(deps, Dependency{
+			Name:     d.Name,
+			Version:  d.Version,
+			Language: d.Language,
+			Manifest: d.Manifest,
+		})
+	}
+
 	return &Overview{
-		Root:        r.root,
-		Languages:   langs,
-		Frameworks:  fws,
-		Structure:   structure,
-		Entrypoints: eps,
-		FileCount:   r.idx.Len(),
-		TestCount:   len(r.idx.ByClass(scan.ClassTest)),
+		Root:             r.root,
+		Languages:        langs,
+		Frameworks:       fws,
+		Dependencies:     deps,
+		Structure:        structure,
+		Entrypoints:      eps,
+		FileCount:        r.idx.Len(),
+		TestCount:        len(r.idx.ByClass(scan.ClassTest)),
+		FrameworkStatus:  string(res.FrameworkStatus),
+		EntrypointStatus: string(res.EntrypointStatus),
 	}, nil
 }
 
@@ -341,6 +372,7 @@ func (r *Recon) Symbols(query string, maxResults int) ([]SymbolInfo, error) {
 			Kind:      s.Kind,
 			Line:      s.Line,
 			Signature: s.Signature,
+			Extractor: s.Extractor,
 		})
 	}
 	return out, nil
@@ -433,16 +465,27 @@ func (r *Recon) Tests(path string, maxResults int) ([]TestFile, error) {
 	}
 	path = filepath.Clean(path)
 
-	testPaths := r.tests.TestsFor(path)
+	testPaths, status := r.tests.LookupTests(path)
 
-	// If path is a directory, find tests for all source files in it
+	// If path is a directory, find tests for all source files in it. A
+	// directory is not itself a mappable file, so its own status says nothing.
 	if len(testPaths) == 0 {
-		for _, f := range r.idx.FilesInDir(path) {
+		dirFiles := r.idx.FilesUnderDir(path)
+		for _, f := range dirFiles {
 			if f.Class == scan.ClassSource {
-				testPaths = append(testPaths, r.tests.TestsFor(f.RelPath)...)
+				found, st := r.tests.LookupTests(f.RelPath)
+				testPaths = append(testPaths, found...)
+				// A directory counts as supported if any file inside it is.
+				if st != index.TestMapUnsupported {
+					status = st
+				}
 			}
 		}
+		if len(dirFiles) > 0 && len(testPaths) > 0 {
+			status = index.TestMapMapped
+		}
 	}
+	r.lastTestStatus = string(status)
 
 	var out []TestFile
 	seen := make(map[string]bool)
@@ -478,9 +521,9 @@ const (
 
 // GrepOptions configures grep behavior.
 type GrepOptions struct {
-	MaxFiles  int    // max files to return (default 20)
-	TypeFilter string // filter by match type: "definition", "reference", "test", "comment", or ""
-	CaseMode  CaseMode // case handling (default CaseSmart)
+	MaxFiles   int      // max files to return (default 20)
+	TypeFilter string   // filter by match type: "definition", "reference", "test", "comment", or ""
+	CaseMode   CaseMode // case handling (default CaseSmart)
 }
 
 // Grep searches file content for a pattern and returns results grouped by file.
@@ -682,9 +725,13 @@ func (r *Recon) Rebuild() error {
 	r.ownership = index.ParseCodeowners(r.root)
 
 	if r.isGit {
-		commits, err := gitpkg.ParseLog(r.root, 500)
-		if err == nil && len(commits) > 0 {
-			r.cochange = gitpkg.NewCoChange(commits)
+		// Mine carries a Coverage record describing what history was actually
+		// available — shallow clone, subdirectory root, window exhausted. That
+		// is what lets a caller distinguish "nothing changed" from "I could not
+		// read any history", which previously both surfaced as an empty churn
+		// map and a null hotspots list.
+		if cc, err := gitpkg.Mine(r.root, gitpkg.Options{}, gitpkg.CoChangeOptions{}); err == nil {
+			r.cochange = cc
 		}
 	}
 
@@ -714,8 +761,12 @@ func (r *Recon) Refresh() error {
 		return fmt.Errorf("walk: %w", err)
 	}
 
-	// Get stored mtimes from DB
-	storedMtimes, err := r.store.GetFileMtimes()
+	// Compare mtime AND size. Size was already stored and never read, and
+	// mtime alone misses every workflow that preserves it while changing
+	// content: tar -x, rsync -t, cp -p, Docker layer and CI workspace restores.
+	// In those cases recon reported symbols from the previous content, and the
+	// size it already had on disk would have caught it.
+	storedSigs, err := r.store.GetFileSignatures()
 	if err != nil {
 		return r.Rebuild()
 	}
@@ -732,8 +783,8 @@ func (r *Recon) Refresh() error {
 	for i := range walkResult.Files {
 		f := &walkResult.Files[i]
 		currentPaths[f.RelPath] = true
-		storedMtime, exists := storedMtimes[f.RelPath]
-		if !exists || f.ModTime != storedMtime {
+		sig, exists := storedSigs[f.RelPath]
+		if !exists || f.ModTime != sig.ModTime || f.Size != sig.Size {
 			upsert = append(upsert, *f)
 			if f.Class == scan.ClassSource || f.Class == scan.ClassScript {
 				changedSourceFiles = append(changedSourceFiles, f)
@@ -743,7 +794,7 @@ func (r *Recon) Refresh() error {
 			}
 		}
 	}
-	for path := range storedMtimes {
+	for path := range storedSigs {
 		if !currentPaths[path] {
 			remove = append(remove, path)
 		}
@@ -783,18 +834,47 @@ func (r *Recon) Refresh() error {
 	for testPath := range r.tests.TestToSourceMap() {
 		testKinds[testPath] = index.ClassifyTestKind(testPath)
 	}
-	r.store.SaveTests(r.tests.AllMappings(), r.tests.TestToSourceMap(), testKinds)
+	// Every store write below is checked, and any failure falls back to a full
+	// rebuild.
+	//
+	// These returns used to be discarded, which is what turned a transient
+	// SQLite lock into permanent corruption: a busy DELETE was swallowed, the
+	// matching INSERTs ran anyway and appended duplicate rows, and then
+	// saveMeta() at the end of this function stamped the new HEAD so the cache
+	// reported itself current forever after. The store now surfaces those
+	// errors; dropping them here would put the bug straight back.
+	if err := r.store.SaveTests(r.tests.AllMappings(), r.tests.TestToSourceMap(), testKinds); err != nil {
+		return r.Rebuild()
+	}
 
 	// Re-extract symbols and extras for changed/added source files
 	var newSymbols []index.Symbol
 	if len(changedSourceFiles) > 0 {
-		newSymbols = index.ScanFileSymbols(r.root, changedSourceFiles)
-		r.store.UpdateSymbols(newSymbols, changedPaths)
+		// One pass yields both the symbols and the per-file parse record, so a
+		// file that parsed badly — or whose language has no extractor at all —
+		// still leaves a trace even though it contributes zero symbols.
+		var newParses []index.FileParse
+		newSymbols, newParses = index.ScanFileParses(r.root, changedSourceFiles)
+		if err := r.store.UpdateSymbols(newSymbols, changedPaths); err != nil {
+			return r.Rebuild()
+		}
+		if err := r.store.UpdateFileParses(newParses, changedPaths); err != nil {
+			return r.Rebuild()
+		}
 		newExtras := index.ExtractFileExtrasForPaths(r.root, changedSourceFiles)
-		r.store.UpdateFileExtras(newExtras, changedPaths)
+		if err := r.store.UpdateFileExtras(newExtras, changedPaths); err != nil {
+			return r.Rebuild()
+		}
 	} else if len(remove) > 0 {
-		r.store.UpdateSymbols(nil, remove)
-		r.store.UpdateFileExtras(nil, remove)
+		if err := r.store.UpdateSymbols(nil, remove); err != nil {
+			return r.Rebuild()
+		}
+		if err := r.store.UpdateFileParses(nil, remove); err != nil {
+			return r.Rebuild()
+		}
+		if err := r.store.UpdateFileExtras(nil, remove); err != nil {
+			return r.Rebuild()
+		}
 	}
 
 	// Re-extract references for changed/added source+test files
@@ -805,9 +885,13 @@ func (r *Recon) Refresh() error {
 		}
 		refChangedPaths = append(refChangedPaths, remove...)
 		newRefs := index.ScanFileReferences(r.root, changedRefFiles)
-		r.store.UpdateReferences(newRefs, refChangedPaths)
+		if err := r.store.UpdateReferences(newRefs, refChangedPaths); err != nil {
+			return r.Rebuild()
+		}
 	} else if len(remove) > 0 {
-		r.store.UpdateReferences(nil, remove)
+		if err := r.store.UpdateReferences(nil, remove); err != nil {
+			return r.Rebuild()
+		}
 	}
 
 	// Re-extract context docs for any changed file: comment docs from code
@@ -823,17 +907,23 @@ func (r *Recon) Refresh() error {
 		}
 		ctxOrigins = append(ctxOrigins, remove...)
 		newDocs := index.ScanFileContextDocs(r.root, ctxFiles, index.NewSymbolIndexFromData(newSymbols), r.idx)
-		r.store.UpdateContextDocs(newDocs, ctxOrigins)
+		if err := r.store.UpdateContextDocs(newDocs, ctxOrigins); err != nil {
+			return r.Rebuild()
+		}
 	}
 
 	// Re-parse git if HEAD changed
 	storedHead, _ := r.store.GetMeta("head_sha")
 	currentHead := gitpkg.GetHEAD(r.root)
 	if r.isGit && currentHead != storedHead {
-		commits, err := gitpkg.ParseLog(r.root, 500)
-		if err == nil && len(commits) > 0 {
-			r.cochange = gitpkg.NewCoChange(commits)
-			r.store.SaveCoChange(r.cochange.AllPairs(), r.cochange.AllChurn())
+		if cc, err := gitpkg.Mine(r.root, gitpkg.Options{}, gitpkg.CoChangeOptions{}); err == nil {
+			// Mine returns a non-nil empty CoChange where the old len(commits)>0
+			// guard left r.cochange nil, so an unreadable history now overwrites
+			// the previous churn rather than silently keeping stale numbers.
+			r.cochange = cc
+			if err := r.store.SaveCoChange(r.cochange.AllPairs(), r.cochange.AllChurn()); err != nil {
+				return r.Rebuild()
+			}
 		}
 	}
 
@@ -844,16 +934,34 @@ func (r *Recon) Refresh() error {
 	}
 
 	r.deps = index.NewDepGraphFromData(snap.Imports)
-	r.symbols = index.NewSymbolIndexFromData(snap.Symbols)
+	// FromCache, not FromData: the parse records have to come back with the
+	// symbols or every cached read reports "clean" for files that failed to
+	// parse — and recon serves from cache almost always.
+	r.symbols = index.NewSymbolIndexFromCache(snap.Symbols, snap.FileParses)
 	r.references = index.NewReferenceIndexFromData(snap.References)
 	r.contextDocs = index.NewContextDocIndexFromData(snap.ContextDocs)
 	r.buildExtrasMap(snap.FileExtras)
-	r.metrics = index.NewMetricsIndex(snap.Metrics)
-	r.nearby = index.NewNearbyIndex(snap.NearbyConfigs)
-	r.ownership = index.NewOwnershipFromData(snap.OwnerRules)
 	if r.cochange == nil {
 		r.cochange = gitpkg.NewCoChangeFromData(snap.CoChangePairs, snap.Churn)
 	}
+
+	// Metrics, nearby configs and CODEOWNERS are derived from the whole index,
+	// not from any one file, so they cannot be updated per-changed-file the way
+	// symbols and imports are. They used to be written by Rebuild alone, which
+	// left them frozen at the last full rebuild: a file added since had fan-in 0
+	// and hotspot 0 forever, a deleted file kept its row, and a CODEOWNERS file
+	// added after the first build never took effect at all. Recomputing them
+	// here is cheap — they are pure functions of the index plus a couple of file
+	// reads — and it is the only way `hotspots` stops decaying between rebuilds.
+	//
+	// These are deliberately NOT written back to the cache. Since every New()
+	// now goes through Refresh, the persisted copies of these three tables are
+	// written by Rebuild and never read again — recomputing in memory is what
+	// makes them correct, and adding a write path would only create a second
+	// source of truth to keep in sync.
+	r.nearby = index.NewNearbyIndex(index.FindNearbyConfigs(r.root, r.idx))
+	r.ownership = index.ParseCodeowners(r.root)
+	r.metrics = index.NewMetricsIndex(index.ComputeMetrics(r.deps, r.cochange))
 
 	// Update meta
 	r.saveMeta()
@@ -863,27 +971,13 @@ func (r *Recon) Refresh() error {
 
 // --- internal helpers ---
 
-// loadFromCache loads all data from the SQLite cache into memory.
-func (r *Recon) loadFromCache() error {
-	snap, err := r.store.LoadSnapshot()
-	if err != nil {
-		return err
-	}
-
-	r.idx = index.NewFileIndex(snap.Files)
-	r.deps = index.NewDepGraphFromData(snap.Imports)
-	r.tests = index.NewTestMapFromData(snap.SourceToTest, snap.TestToSource)
-	r.cochange = gitpkg.NewCoChangeFromData(snap.CoChangePairs, snap.Churn)
-	r.symbols = index.NewSymbolIndexFromData(snap.Symbols)
-	r.references = index.NewReferenceIndexFromData(snap.References)
-	r.contextDocs = index.NewContextDocIndexFromData(snap.ContextDocs)
-	r.buildExtrasMap(snap.FileExtras)
-	r.metrics = index.NewMetricsIndex(snap.Metrics)
-	r.nearby = index.NewNearbyIndex(snap.NearbyConfigs)
-	r.ownership = index.NewOwnershipFromData(snap.OwnerRules)
-
-	return nil
-}
+// There is deliberately no cache-only load path any more.
+//
+// One used to exist and was taken whenever CheckStaleness said "not stale",
+// which is how an uncommitted edit stayed invisible: the tree was never looked
+// at. Every New() now goes through Refresh, which walks and diffs first and
+// only then reads the cache for the parts that did not change. If a fast path
+// is reintroduced, it must still diff the working tree.
 
 // rebuildNoPersist does a full rebuild without saving to cache (fallback when DB fails).
 func (r *Recon) rebuildNoPersist() error {
@@ -903,9 +997,8 @@ func (r *Recon) rebuildNoPersist() error {
 	r.ownership = index.ParseCodeowners(r.root)
 
 	if r.isGit {
-		commits, err := gitpkg.ParseLog(r.root, 500)
-		if err == nil && len(commits) > 0 {
-			r.cochange = gitpkg.NewCoChange(commits)
+		if cc, err := gitpkg.Mine(r.root, gitpkg.Options{}, gitpkg.CoChangeOptions{}); err == nil {
+			r.cochange = cc
 		}
 	}
 	r.metrics = index.NewMetricsIndex(index.ComputeMetrics(r.deps, r.cochange))
@@ -923,6 +1016,13 @@ func (r *Recon) toSnapshot(files []scan.FileEntry) *cache.Snapshot {
 		CoChangePairs: nil,
 		Churn:         nil,
 		Symbols:       r.symbols.All(),
+		// Per-file parse status. Without this the trust signal would exist only
+		// in memory on the run that built it: a file whose language has no
+		// extractor, or whose parse failed, produces zero symbol rows, so there
+		// is nothing else in the snapshot from which "I could not read this
+		// file" could be reconstructed. Refresh updates these per changed file
+		// but can never backfill, so the full rebuild is what populates them.
+		FileParses:    r.symbols.Files(),
 		References:    r.references.All(),
 		ContextDocs:   r.contextDocs.All(),
 		Metrics:       r.metrics.All(),
@@ -964,4 +1064,62 @@ func (r *Recon) saveMeta() {
 	r.store.SetMeta("file_count", strconv.Itoa(r.idx.Len()))
 	r.store.SetMeta("scan_time", time.Now().Format(time.RFC3339))
 	cache.SaveKeyFileMtimes(r.store)
+}
+
+// ParseCoverage reports every source file recon could not fully read: an
+// unsupported language, a failed or partial parse, or — critically — a file it
+// never examined at all.
+//
+// This exists because the interesting failures are invisible in the symbol list
+// itself. An unsupported language, a broken parse and a file that genuinely
+// declares nothing all produce zero symbols, so "no symbols found" was the same
+// answer for "there are none" and "I could not read this". A caller that wants
+// to trust an empty result should check here first.
+//
+// A file with no parse record is reported as status "unknown", never as clean:
+// records are written per examined file, so an absent one means the file was
+// never accounted for, which is exactly the case that must not read as "fine".
+func (r *Recon) ParseCoverage() []FileParseInfo {
+	if r.symbols == nil || r.idx == nil {
+		return nil
+	}
+
+	out := make([]FileParseInfo, 0)
+	for _, fp := range r.symbols.Incomplete() {
+		out = append(out, FileParseInfo{
+			File:        fp.RelPath,
+			Lang:        fp.Lang,
+			Extractor:   fp.Extractor,
+			Status:      fp.Status,
+			SymbolCount: fp.SymbolCount,
+			Detail:      fp.Detail,
+		})
+	}
+
+	// Files the index knows about but which have no parse record at all. This
+	// is the gap the cache can produce: parse rows are written per examined
+	// file, so anything missed drops out of Incomplete() silently rather than
+	// surfacing as a caveat.
+	recorded := make(map[string]bool)
+	for _, fp := range r.symbols.Files() {
+		recorded[fp.RelPath] = true
+	}
+	for _, f := range r.idx.All() {
+		if f.Class != scan.ClassSource && f.Class != scan.ClassTest && f.Class != scan.ClassScript {
+			continue
+		}
+		if recorded[f.RelPath] {
+			continue
+		}
+		out = append(out, FileParseInfo{
+			File:      f.RelPath,
+			Lang:      f.Lang,
+			Extractor: "none",
+			Status:    "unknown",
+			Detail:    "no parse record — this file was never examined",
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].File < out[j].File })
+	return out
 }

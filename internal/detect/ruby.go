@@ -1,77 +1,81 @@
 package detect
 
 import (
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 
 	"github.com/djtouchette/recon/internal/index"
+	"github.com/djtouchette/recon/internal/scan"
 )
 
-// Matches gem "name" or gem 'name' in Gemfile
-var gemRe = regexp.MustCompile(`^\s*gem\s+['"]([^'"]+)['"]`)
+// gem "name", "~> 1.0"
+var gemRe = regexp.MustCompile(`(?m)^\s*gem\s+['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?`)
 
 type RubyDetector struct{}
 
-func (d *RubyDetector) DetectFrameworks(idx *index.FileIndex, root string) []Framework {
-	if !hasFile(idx, "Gemfile") {
-		return nil
-	}
+func (d *RubyDetector) Key() string         { return "ruby" }
+func (d *RubyDetector) Languages() []string { return []string{"ruby"} }
 
-	data, err := os.ReadFile(filepath.Join(root, "Gemfile"))
-	if err != nil {
-		return nil
-	}
+func (d *RubyDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
+	var res DetectorResult
 
-	var frameworks []Framework
-	seen := make(map[string]bool)
-
-	for _, line := range strings.Split(string(data), "\n") {
-		if m := gemRe.FindStringSubmatch(line); m != nil {
-			dep := m[1]
-			if !seen[dep] {
-				seen[dep] = true
-				frameworks = append(frameworks, Framework{
-					Name:     dep,
+	if content, ok := readManifest(root, "Gemfile"); ok && hasFile(idx, "Gemfile") {
+		for _, m := range gemRe.FindAllStringSubmatch(content, -1) {
+			res.Dependencies = append(res.Dependencies, Dependency{
+				Name:     m[1],
+				Version:  m[2],
+				Language: "ruby",
+				Manifest: "Gemfile",
+			})
+			if fw, ok := rubyGemFrameworks.lookup(m[1]); ok {
+				res.Frameworks = append(res.Frameworks, Framework{
+					Name:     fw,
 					Language: "ruby",
-					Evidence: "Gemfile",
+					Evidence: "Gemfile: gem " + m[1],
 				})
 			}
 		}
 	}
 
-	// Config file markers
-	if hasFile(idx, "config/routes.rb") && !seen["rails"] {
-		seen["rails"] = true
-		frameworks = append(frameworks, Framework{
-			Name:     "rails",
-			Language: "ruby",
-			Evidence: "config/routes.rb",
-		})
+	for _, marker := range []struct{ file, name string }{
+		{"config/routes.rb", "Rails"},
+		{"config/application.rb", "Rails"},
+		{"spec/spec_helper.rb", "RSpec"},
+		{"_config.yml", "Jekyll"},
+	} {
+		if hasFile(idx, marker.file) {
+			res.Frameworks = append(res.Frameworks, Framework{
+				Name: marker.name, Language: "ruby", Evidence: marker.file,
+			})
+		}
 	}
 
-	return frameworks
+	res.Entrypoints = d.entrypoints(idx, root)
+	return res
 }
 
-func (d *RubyDetector) DetectEntrypoints(idx *index.FileIndex) []Entrypoint {
+func (d *RubyDetector) entrypoints(idx *index.FileIndex, root string) []Entrypoint {
 	var eps []Entrypoint
-
-	entryFiles := []struct {
-		path string
-		kind string
-	}{
+	for _, ef := range []struct{ path, kind string }{
 		{"config.ru", "server"},
 		{"config/routes.rb", "route"},
 		{"Rakefile", "cli"},
 		{"bin/rails", "cli"},
-	}
-
-	for _, ef := range entryFiles {
+	} {
 		if hasFile(idx, ef.path) {
 			eps = append(eps, Entrypoint{Path: ef.path, Kind: ef.kind})
 		}
 	}
+
+	// A plain ruby script with the __FILE__ == $0 guard is an entrypoint too.
+	scanSource(idx, root, []string{"ruby"}, func(f *scan.FileEntry, content string) {
+		if f.Class != scan.ClassSource && f.Class != scan.ClassScript {
+			return
+		}
+		if strings.Contains(content, "__FILE__ == $0") || strings.Contains(content, "__FILE__ == $PROGRAM_NAME") {
+			eps = append(eps, Entrypoint{Path: f.RelPath, Kind: "main"})
+		}
+	})
 
 	return eps
 }

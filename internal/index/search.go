@@ -1,8 +1,6 @@
 package index
 
 import (
-	"bufio"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -12,11 +10,11 @@ import (
 
 // SearchResult represents a single match from unified search.
 type SearchResult struct {
-	Path      string   `json:"path"`
-	Score     float64  `json:"score"`
-	MatchType string   `json:"match_type"` // "symbol", "file_path", "preview", "content"
-	Context   string   `json:"context"`    // matched symbol signature, preview line, or path
-	Symbol    *Symbol  `json:"symbol,omitempty"`
+	Path      string  `json:"path"`
+	Score     float64 `json:"score"`
+	MatchType string  `json:"match_type"` // "symbol", "file_path", "preview", "content"
+	Context   string  `json:"context"`    // matched symbol signature, preview line, or path
+	Symbol    *Symbol `json:"symbol,omitempty"`
 }
 
 // Search performs a unified search across symbols, file paths, previews, and file content.
@@ -217,16 +215,18 @@ func Search(query string, root string, idx *FileIndex, symbols *SymbolIndex, ext
 
 // grepFile scans a file line-by-line and returns the first line containing all tokens.
 // Returns empty string if no match or file can't be read.
+//
+// This reads the file rather than using a bufio.Scanner: the default scanner
+// gives up at the first line longer than 64KB and returns an error nobody
+// checked, so everything after a minified line in a bundle was silently
+// unsearchable. readSource also rejects binary content and normalises UTF-16.
 func grepFile(path string, tokens []string) string {
-	f, err := os.Open(path)
+	data, err := readSource(path, maxFileSize)
 	if err != nil {
 		return ""
 	}
-	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
+	for _, line := range splitLines(data) {
 		lineLower := strings.ToLower(line)
 		allMatch := true
 		for _, tok := range tokens {

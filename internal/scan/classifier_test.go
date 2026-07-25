@@ -41,6 +41,56 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// TestDirectoryTestClassificationIsBroad pins the behaviour that any source
+// file under a test directory is test-class, including shared fixture code that
+// declares real API.
+//
+// This is intentional and load-bearing for the tests command and hotspot
+// weighting. It is recorded here because it used to combine with a symbol index
+// that skipped ClassTest entirely, which made every fixture type and helper in
+// such a directory invisible to symbols, search and callers. The fix belongs on
+// the indexing side (internal/index indexes ClassTest and lets callers filter),
+// not here — narrowing this would misclassify genuine tests.
+func TestDirectoryTestClassificationIsBroad(t *testing.T) {
+	fixtures := []struct{ relPath, name string }{
+		{"test/fixtures.go", "fixtures.go"},
+		{"tests/support/builder.go", "builder.go"},
+		{"spec/factories.rb", "factories.rb"},
+		{"specs/helpers.ts", "helpers.ts"},
+		{"__tests__/setup.ts", "setup.ts"},
+		{"src/Foo.UnitTests/Helper.cs", "Helper.cs"},
+	}
+	for _, f := range fixtures {
+		if got := Classify(f.relPath, f.name); got != ClassTest {
+			t.Errorf("Classify(%q) = %v, want ClassTest", f.relPath, got)
+		}
+	}
+
+	// Non-source files under a test directory are classified on their own
+	// merits, not swept into ClassTest.
+	if got := Classify("test/README.md", "README.md"); got != ClassDoc {
+		t.Errorf("Classify(test/README.md) = %v, want ClassDoc", got)
+	}
+	// A directory whose name merely contains "test" is not a test directory.
+	if got := Classify("src/testing/util.go", "util.go"); got != ClassSource {
+		t.Errorf("Classify(src/testing/util.go) = %v, want ClassSource", got)
+	}
+}
+
+// TestHeaderLanguageIsAmbiguous records that .h reports C even for C++ headers.
+// Symbol extraction resolves this by trying both grammars on the content; the
+// classifier cannot, because it only sees the name.
+func TestHeaderLanguageIsAmbiguous(t *testing.T) {
+	for _, name := range []string{"widget.h", "api.h"} {
+		if got := LangFromExt(name); got != "c" {
+			t.Errorf("LangFromExt(%q) = %q, want c", name, got)
+		}
+	}
+	if got := LangFromExt("widget.hpp"); got != "cpp" {
+		t.Errorf("LangFromExt(widget.hpp) = %q, want cpp", got)
+	}
+}
+
 func TestLangFromExt(t *testing.T) {
 	tests := []struct {
 		name string

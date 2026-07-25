@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -88,13 +89,20 @@ func CheckStaleness(s *Store) StaleReason {
 }
 
 // SaveKeyFileMtimes stores the current mtimes of key config files.
-func SaveKeyFileMtimes(s *Store) {
+//
+// It returns the first write failure: a dropped mtime makes the cache look
+// fresh forever after, so callers that care about staleness should surface it.
+// (The return value is new; existing callers that ignore it are unchanged.)
+func SaveKeyFileMtimes(s *Store) error {
+	var firstErr error
 	for _, kf := range keyFiles {
-		info, err := os.Stat(filepath.Join(s.Root, kf))
-		if err != nil {
-			s.SetMeta("mtime:"+kf, "0")
-			continue
+		value := "0"
+		if info, err := os.Stat(filepath.Join(s.Root, kf)); err == nil {
+			value = strconv.FormatInt(info.ModTime().UnixNano(), 10)
 		}
-		s.SetMeta("mtime:"+kf, strconv.FormatInt(info.ModTime().UnixNano(), 10))
+		if err := s.SetMeta("mtime:"+kf, value); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("save mtime for %s: %w", kf, err)
+		}
 	}
+	return firstErr
 }

@@ -2,13 +2,34 @@ package recon
 
 // Overview is the top-level repo summary.
 type Overview struct {
-	Root        string          `json:"root"`
-	Languages   []Language      `json:"languages"`
-	Frameworks  []Framework     `json:"frameworks"`
+	Root       string      `json:"root"`
+	Languages  []Language  `json:"languages"`
+	Frameworks []Framework `json:"frameworks"`
+
+	// Dependencies is what a manifest actually declares. It used to be reported
+	// as Frameworks, which meant a Maven project listed its own artifact id and
+	// its build plugins as frameworks it used. Frameworks is now
+	// evidence-backed only.
+	Dependencies []Dependency `json:"dependencies,omitempty"`
+
 	Structure   []DirectoryInfo `json:"structure"`
 	Entrypoints []Entrypoint    `json:"entrypoints"`
 	FileCount   int             `json:"file_count"`
 	TestCount   int             `json:"test_count"`
+
+	// Status fields distinguish "there are none" from "nothing here could tell".
+	// An empty list on its own served as both answers, and the second one is
+	// the one a reader needs to know about.
+	FrameworkStatus  string `json:"framework_status,omitempty"`  // found | none_matched | unsupported
+	EntrypointStatus string `json:"entrypoint_status,omitempty"` // found | none_matched | unsupported
+}
+
+// Dependency is a declared dependency read from a manifest.
+type Dependency struct {
+	Name     string `json:"name"`
+	Version  string `json:"version,omitempty"`
+	Language string `json:"language,omitempty"`
+	Manifest string `json:"manifest,omitempty"`
 }
 
 type Language struct {
@@ -63,6 +84,29 @@ type SymbolInfo struct {
 	Kind      string `json:"kind"`
 	Line      int    `json:"line"`
 	Signature string `json:"signature"`
+
+	// Extractor names what produced this symbol: "tree-sitter" for a real
+	// grammar, "regex" for the pattern fallback, "" when unknown. The two have
+	// very different error profiles — a regex-derived symbol can come from a
+	// language whose declarations were matched by shape rather than parsed —
+	// and without this they were byte-identical in the output.
+	Extractor string `json:"extractor,omitempty"`
+}
+
+// FileParseInfo reports how a file was read, including files that produced no
+// symbols at all.
+//
+// This is the part that per-symbol provenance cannot express: an unsupported
+// language, a failed parse, and a file that genuinely declares nothing all
+// yield zero symbols, so without a per-file record they are indistinguishable.
+// A file with no record at all means "not examined", never "parsed cleanly".
+type FileParseInfo struct {
+	File        string `json:"file"`
+	Lang        string `json:"lang,omitempty"`
+	Extractor   string `json:"extractor"` // tree-sitter | regex | none
+	Status      string `json:"status"`    // ok | partial | unsupported | failed
+	SymbolCount int    `json:"symbol_count"`
+	Detail      string `json:"detail,omitempty"` // human-readable caveat
 }
 
 // CallersResult is the response for a "find callers/references" query.
@@ -154,7 +198,7 @@ type GrepFileResult struct {
 type GrepLine struct {
 	Line      int    `json:"line"`
 	Text      string `json:"text"`
-	MatchType string `json:"type"` // "definition", "reference", "comment", "test"
+	MatchType string `json:"type"`              // "definition", "reference", "comment", "test"
 	Similar   int    `json:"similar,omitempty"` // count of additional lines with identical text
 }
 
