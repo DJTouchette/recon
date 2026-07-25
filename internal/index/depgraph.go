@@ -179,9 +179,27 @@ func NewDepGraph(root string, idx *FileIndex) *DepGraph {
 	return dg
 }
 
+// NewDepGraphFromCache rebuilds a graph from persisted imports AND their
+// resolution telemetry.
+//
+// NewDepGraphFromData exists for callers that only have edges, but it returns an
+// empty stats map — and since every run serves from cache after the first, using
+// it on the load path made the telemetry invisible in practice. That is the same
+// "signal survives only the first build" failure as symbol parse status: the
+// whole point of recording that recon dropped N imports is that the next reader
+// finds out, and the next reader is almost always reading the cache.
+func NewDepGraphFromCache(imports map[string][]string, stats map[string]ImportStats) *DepGraph {
+	dg := NewDepGraphFromData(imports)
+	if stats != nil {
+		dg.stats = stats
+	}
+	return dg
+}
+
 // NewDepGraphFromData creates a DepGraph from pre-computed import edges.
 // Import telemetry is not part of the edge data, so a graph restored this way
-// reports no ImportStats until a scan recomputes them.
+// reports no ImportStats until a scan recomputes them. Prefer
+// NewDepGraphFromCache on any path that has persisted stats available.
 func NewDepGraphFromData(imports map[string][]string) *DepGraph {
 	dg := &DepGraph{
 		imports:    imports,
@@ -254,15 +272,33 @@ func (dg *DepGraph) ImportCoverage() []LangImportCoverage {
 
 // ScanFileImports extracts imports for specific files. Used during incremental refresh.
 func ScanFileImports(root string, files []*scan.FileEntry, idx *FileIndex) map[string][]string {
+	imports, _ := ScanFileImportsWithStats(root, files, idx)
+	return imports
+}
+
+// ScanFileImportsWithStats is ScanFileImports plus the per-file resolution
+// telemetry.
+//
+// The incremental path needs both: ScanFileImports discarded the stats, so a
+// refresh wrote new edges while leaving the old unresolved counts in place, and
+// a file whose imports had started resolving cleanly kept reporting a stale
+// caveat. Stats are returned for every file scanned, including files that
+// produced no edges at all — that is the case the telemetry exists for, since
+// "no edges" and "could not resolve any edges" are otherwise identical.
+func ScanFileImportsWithStats(root string, files []*scan.FileEntry, idx *FileIndex) (map[string][]string, map[string]ImportStats) {
 	rc := newResolveCtx(root, idx)
-	result := make(map[string][]string)
+	imports := make(map[string][]string)
+	stats := make(map[string]ImportStats)
 	for _, f := range files {
-		imports, _ := extractImports(f, rc)
-		if len(imports) > 0 {
-			result[f.RelPath] = imports
+		found, st := extractImports(f, rc)
+		if len(found) > 0 {
+			imports[f.RelPath] = found
+		}
+		if st.Extracted > 0 {
+			stats[f.RelPath] = st
 		}
 	}
-	return result
+	return imports, stats
 }
 
 // ─── Resolution context ───────────────────────────────────────────────────────

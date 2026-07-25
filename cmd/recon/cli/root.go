@@ -404,13 +404,23 @@ func printOverviewHuman(cmd *cobra.Command, ov *recon.Overview, elapsed time.Dur
 		for _, f := range ov.Frameworks {
 			fmt.Fprintf(w, "  %s (%s) — %s\n", f.Name, f.Language, f.Evidence)
 		}
+		// "incomplete" outranks "found", so a populated list can still be
+		// partial. Annotating it is the whole point — an unqualified list reads
+		// as the complete answer.
+		if ov.FrameworkStatus == "incomplete" {
+			fmt.Fprintln(w, "  (this list may be incomplete — see manifest issues below)")
+		}
 		fmt.Fprintln(w)
 	} else if note := statusNote(ov.FrameworkStatus, "frameworks"); note != "" {
 		fmt.Fprintf(w, "Frameworks: %s\n\n", note)
 	}
 
 	if len(ov.Dependencies) > 0 {
-		fmt.Fprintf(w, "Dependencies (%d declared):\n", len(ov.Dependencies))
+		suffix := ""
+		if ov.DependencyStatus == "incomplete" {
+			suffix = ", list may be incomplete"
+		}
+		fmt.Fprintf(w, "Dependencies (%d declared%s):\n", len(ov.Dependencies), suffix)
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 		for i, d := range ov.Dependencies {
 			if i >= 10 {
@@ -444,6 +454,54 @@ func printOverviewHuman(cmd *cobra.Command, ov *recon.Overview, elapsed time.Dur
 	} else if note := statusNote(ov.EntrypointStatus, "entrypoints"); note != "" {
 		fmt.Fprintf(w, "Entrypoints: %s\n\n", note)
 	}
+
+	printImportCoverage(w, ov.ImportCoverage)
+	printManifestIssues(w, ov.ManifestIssues)
+}
+
+// printManifestIssues names manifests recon could not read. Without this, an
+// unreadable pom.xml produced an empty dependency list indistinguishable from a
+// project that declares none.
+func printManifestIssues(w io.Writer, issues []recon.ManifestIssueInfo) {
+	if len(issues) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "Manifests recon could not read:")
+	for _, i := range issues {
+		fmt.Fprintf(w, "  %s: %s\n", i.Manifest, i.Reason)
+	}
+	fmt.Fprintln(w, "  Dependency and framework results are incomplete as a result.")
+	fmt.Fprintln(w)
+}
+
+// printImportCoverage reports languages whose imports recon could not fully
+// resolve.
+//
+// Only the incomplete ones are shown: a clean language needs no comment, and the
+// point is to stop a caller trusting a dependency graph that is quietly partial.
+// Before this, a language recon had no resolver for produced an empty graph that
+// looked identical to a repo with no internal dependencies.
+func printImportCoverage(w io.Writer, cov []recon.LangImportCoverage) {
+	var partial []recon.LangImportCoverage
+	for _, c := range cov {
+		if c.Unresolved > 0 {
+			partial = append(partial, c)
+		}
+	}
+	if len(partial) == 0 {
+		return
+	}
+
+	fmt.Fprintln(w, "Import resolution (incomplete languages only):")
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "  LANG\tRESOLVED\tUNRESOLVED\tEXTERNAL")
+	for _, c := range partial {
+		fmt.Fprintf(tw, "  %s\t%d\t%d\t%d\n", c.Lang, c.Resolved, c.Unresolved, c.External)
+	}
+	tw.Flush()
+	fmt.Fprintln(w, "  Unresolved imports are edges recon dropped — fan-in/fan-out for these")
+	fmt.Fprintln(w, "  languages understates the real dependency graph.")
+	fmt.Fprintln(w)
 }
 
 // statusNote turns a detector status into something a reader can act on.
@@ -458,6 +516,10 @@ func statusNote(status, what string) string {
 		return "none matched (no recognised convention for this project)"
 	case "unsupported":
 		return "unknown — no detector for these languages"
+	case "incomplete":
+		// The list may be non-empty and still incomplete, which is why this
+		// value takes precedence over "found" upstream.
+		return "incomplete — a manifest could not be read (see manifest issues below)"
 	default:
 		// "found" with an empty list, or a status we don't know, is not
 		// something to editorialise about.
@@ -577,6 +639,22 @@ func printContextHuman(cmd *cobra.Command, ctx *recon.FileContext) {
 
 	fmt.Fprintf(w, "Fan-in: %d  Fan-out: %d  Churn: %d  Hotspot: %.2f\n",
 		ctx.FanIn, ctx.FanOut, ctx.Churn, ctx.HotspotScore)
+
+	// Qualify fan-out when recon dropped imports it could not resolve. A zero
+	// fan-out with unresolved specifiers is not "imports nothing" — it is
+	// "could not work out what this imports", and only one of those is
+	// actionable.
+	if st := ctx.ImportStats; st != nil && st.Unresolved > 0 {
+		fmt.Fprintf(w, "  %d of %d imports unresolved (%s) — fan-out is incomplete\n",
+			st.Unresolved, st.Extracted, st.Lang)
+		for i, spec := range st.UnresolvedSpecs {
+			if i >= 3 {
+				fmt.Fprintf(w, "    ... and %d more\n", len(st.UnresolvedSpecs)-3)
+				break
+			}
+			fmt.Fprintf(w, "    %s\n", spec)
+		}
+	}
 
 	if len(ctx.NearbyConfigs) > 0 {
 		fmt.Fprintln(w, "\nNearby configs:")

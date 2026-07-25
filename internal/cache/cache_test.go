@@ -2,6 +2,7 @@ package cache
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -306,6 +307,12 @@ func TestSaveLoadSnapshotRoundTrip(t *testing.T) {
 			{RelPath: "a/b.go", Lang: "go", Extractor: index.ExtractorTreeSitter, Status: index.ParseOK, SymbolCount: 2},
 			{RelPath: "top.go", Lang: "go", Extractor: index.ExtractorNone, Status: index.ParseUnsupported, SymbolCount: 0, Detail: "no grammar"},
 		},
+		ImportStats: map[string]index.ImportStats{
+			"a/b.go": {Lang: "go", Extracted: 3, Resolved: 1, External: 2},
+			// The interesting row: every specifier dropped, no edges, so it
+			// appears in no other table.
+			"top.go": {Lang: "go", Extracted: 2, Unresolved: 2, UnresolvedSpecs: []string{"example.com/gone", "example.com/also-gone"}},
+		},
 		References:    []index.Reference{{Name: "F", File: "top.go", Line: 2}},
 		ContextDocs:   []index.ContextDoc{{File: "a/b.go", Symbol: "F", Line: 1, Source: "comment", Origin: "a/b.go", Body: "does F"}},
 		FileExtras:    []index.FileExtra{{RelPath: "a/b.go", Preview: "package a", ContentHash: "deadbeef"}},
@@ -376,6 +383,27 @@ func TestSaveLoadSnapshotRoundTrip(t *testing.T) {
 	if p := byPath["top.go"]; p.Status != index.ParseUnsupported || p.SymbolCount != 0 || p.Detail != "no grammar" {
 		t.Errorf("top.go parse = %+v", p)
 	}
+
+	// Import telemetry must survive the cache for the same reason: it is computed
+	// at scan time, and every run after the first is served from here.
+	if len(got.ImportStats) != 2 {
+		t.Fatalf("ImportStats = %d, want 2: %+v", len(got.ImportStats), got.ImportStats)
+	}
+	if st := got.ImportStats["a/b.go"]; st.Lang != "go" || st.Extracted != 3 || st.Resolved != 1 || st.External != 2 || st.Unresolved != 0 {
+		t.Errorf("a/b.go import stats = %+v", st)
+	}
+	// top.go has no import edges at all, so this row is the only thing that can
+	// distinguish "imports nothing" from "recon dropped both of its imports".
+	st := got.ImportStats["top.go"]
+	if st.Extracted != 2 || st.Unresolved != 2 || st.Resolved != 0 {
+		t.Errorf("top.go import stats = %+v", st)
+	}
+	if len(st.UnresolvedSpecs) != 2 || st.UnresolvedSpecs[0] != "example.com/gone" || st.UnresolvedSpecs[1] != "example.com/also-gone" {
+		t.Errorf("unresolved specs = %v, want both in order", st.UnresolvedSpecs)
+	}
+	if _, ok := got.Imports["top.go"]; ok {
+		t.Error("test premise broken: top.go should have no import edges")
+	}
 }
 
 func TestFileParseUpsertAndRemoval(t *testing.T) {
@@ -443,6 +471,266 @@ func TestGetFileParsesEmpty(t *testing.T) {
 	}
 	if len(parses) != 0 {
 		t.Errorf("parses = %d, want 0", len(parses))
+	}
+}
+
+func TestImportStatsUpsertAndRemoval(t *testing.T) {
+	s := newStore(t)
+
+	if err := s.UpdateImportStats(map[string]index.ImportStats{
+		"a.ts":  {Lang: "typescript", Extracted: 4, Resolved: 3, External: 1},
+		"b.ex":  {Lang: "elixir", Extracted: 2, Unresolved: 2, UnresolvedSpecs: []string{"MyApp.Nowhere", "MyApp.AlsoGone"}},
+		"c.jl":  {Lang: "julia", Extracted: 1, External: 1},
+		"d.sh":  {Lang: "shell"}, // extracted nothing at all
+		"e.kt":  {Lang: "kotlin", Extracted: 3, Resolved: 1, External: 1, Unresolved: 1, UnresolvedSpecs: []string{"com.ex.Missing"}},
+		"f.rho": {Lang: "unknown"},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := s.GetImportStats()
+	if err != nil {
+		t.Fatalf("GetImportStats: %v", err)
+	}
+	if len(stats) != 6 {
+		t.Fatalf("stats = %d, want 6", len(stats))
+	}
+	if got := stats["a.ts"]; got.Resolved != 3 || got.External != 1 || got.Unresolved != 0 {
+		t.Errorf("a.ts = %+v", got)
+	}
+	if got := stats["b.ex"]; len(got.UnresolvedSpecs) != 2 || got.UnresolvedSpecs[0] != "MyApp.Nowhere" {
+		t.Errorf("b.ex specs = %v", got.UnresolvedSpecs)
+	}
+	// A file whose extractor produced nothing still gets a row: an absent row and
+	// a zeroed row mean different things to the reader.
+	if got, ok := stats["d.sh"]; !ok || got.Lang != "shell" || got.Extracted != 0 {
+		t.Errorf("d.sh = %+v, present=%v", got, ok)
+	}
+	// No specs stored means no specs read back — not an empty-string artefact.
+	if got := stats["c.jl"]; got.UnresolvedSpecs != nil {
+		t.Errorf("c.jl specs = %v, want nil", got.UnresolvedSpecs)
+	}
+
+	// Re-scan: rel_path is the primary key, so this replaces in place. Repeated
+	// writes cannot accumulate duplicate rows the way keyless tables can.
+	for i := 0; i < 3; i++ {
+		if err := s.UpdateImportStats(map[string]index.ImportStats{
+			"b.ex": {Lang: "elixir", Extracted: 2, Resolved: 2},
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := count(t, s, "SELECT COUNT(*) FROM import_stats"); got != 6 {
+		t.Errorf("import_stats rows = %d, want 6", got)
+	}
+	stats, _ = s.GetImportStats()
+	if got := stats["b.ex"]; got.Resolved != 2 || got.Unresolved != 0 || len(got.UnresolvedSpecs) != 0 {
+		t.Errorf("re-scan did not replace: %+v", got)
+	}
+
+	// Deleted files must not keep a stale row claiming their imports resolved.
+	if err := s.UpdateImportStats(nil, []string{"c.jl", "e.kt"}); err != nil {
+		t.Fatal(err)
+	}
+	stats, _ = s.GetImportStats()
+	if _, ok := stats["c.jl"]; ok {
+		t.Error("import_stats row survived file removal")
+	}
+	if _, ok := stats["e.kt"]; ok {
+		t.Error("import_stats row survived file removal")
+	}
+	if len(stats) != 4 {
+		t.Errorf("stats after removal = %d, want 4", len(stats))
+	}
+
+	// A file both rewritten and listed as removed in the same call must end up
+	// with the fresh row: the delete runs first, exactly as in UpdateFileParses.
+	if err := s.UpdateImportStats(map[string]index.ImportStats{
+		"a.ts": {Lang: "typescript", Extracted: 9, Resolved: 9},
+	}, []string{"a.ts"}); err != nil {
+		t.Fatal(err)
+	}
+	stats, _ = s.GetImportStats()
+	if got := stats["a.ts"]; got.Resolved != 9 {
+		t.Errorf("a.ts after delete+insert = %+v, want the fresh row", got)
+	}
+
+	// No-op call is cheap and harmless.
+	if err := s.UpdateImportStats(nil, nil); err != nil {
+		t.Errorf("empty UpdateImportStats: %v", err)
+	}
+}
+
+func TestGetImportStatsEmpty(t *testing.T) {
+	s := newStore(t)
+	stats, err := s.GetImportStats()
+	if err != nil {
+		t.Fatalf("GetImportStats on empty cache: %v", err)
+	}
+	if len(stats) != 0 {
+		t.Errorf("stats = %d, want 0", len(stats))
+	}
+}
+
+// TestUnresolvedSpecsAreBoundedAndJSON pins the storage decision: the sample
+// lives in one JSON TEXT column, and the write is bounded regardless of what the
+// producer hands over, so no single row can grow without limit.
+func TestUnresolvedSpecsAreBoundedAndJSON(t *testing.T) {
+	s := newStore(t)
+
+	many := make([]string, 0, 50)
+	for i := 0; i < 50; i++ {
+		many = append(many, fmt.Sprintf("pkg/spec%02d", i))
+	}
+	if err := s.UpdateImportStats(map[string]index.ImportStats{
+		"big.go": {Lang: "go", Extracted: 50, Unresolved: 50, UnresolvedSpecs: many},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, _ := s.GetImportStats()
+	got := stats["big.go"]
+	if len(got.UnresolvedSpecs) != maxStoredUnresolvedSpecs {
+		t.Errorf("stored specs = %d, want %d", len(got.UnresolvedSpecs), maxStoredUnresolvedSpecs)
+	}
+	// Truncation keeps the head, and the count is untouched: the sample shrinks,
+	// the number that drives the warning does not.
+	if got.UnresolvedSpecs[0] != "pkg/spec00" {
+		t.Errorf("first spec = %q", got.UnresolvedSpecs[0])
+	}
+	if got.Unresolved != 50 {
+		t.Errorf("unresolved count = %d, want 50 — the count must not be truncated with the sample", got.Unresolved)
+	}
+
+	// It really is JSON on disk, not a delimiter-joined string that a specifier
+	// containing the delimiter could corrupt.
+	var raw string
+	if err := s.db.QueryRow("SELECT unresolved_specs FROM import_stats WHERE rel_path='big.go'").Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var decoded []string
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		t.Fatalf("unresolved_specs is not valid JSON (%q): %v", raw, err)
+	}
+
+	// Specifiers with quotes, commas and spaces survive verbatim.
+	odd := []string{`weird,"spec" one`, "with space", `back\slash`}
+	if err := s.UpdateImportStats(map[string]index.ImportStats{
+		"odd.go": {Lang: "go", Extracted: 3, Unresolved: 3, UnresolvedSpecs: odd},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	stats, _ = s.GetImportStats()
+	for i, want := range odd {
+		if stats["odd.go"].UnresolvedSpecs[i] != want {
+			t.Errorf("spec %d = %q, want %q", i, stats["odd.go"].UnresolvedSpecs[i], want)
+		}
+	}
+
+	// A corrupt sample loses the breadcrumbs but must not fail the load: the
+	// counts in the same row are the signal, and refusing to serve the cache
+	// would be a far worse outcome than a missing example.
+	if _, err := s.db.Exec("UPDATE import_stats SET unresolved_specs='{not json' WHERE rel_path='odd.go'"); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := s.GetImportStats()
+	if err != nil {
+		t.Fatalf("GetImportStats with a corrupt sample: %v", err)
+	}
+	if got := stats["odd.go"]; got.Unresolved != 3 || got.UnresolvedSpecs != nil {
+		t.Errorf("corrupt sample = %+v, want counts kept and specs dropped", got)
+	}
+	snap, err := s.LoadSnapshot()
+	if err != nil {
+		t.Fatalf("LoadSnapshot with a corrupt sample: %v", err)
+	}
+	if snap.ImportStats["odd.go"].Unresolved != 3 {
+		t.Errorf("snapshot lost the counts: %+v", snap.ImportStats["odd.go"])
+	}
+}
+
+// TestImportStatsSurviveConcurrentWriters is the primary-key guarantee: the
+// keyless symbols table is what let concurrent runs duplicate rows, so this
+// table has rel_path as its PRIMARY KEY and cannot.
+func TestImportStatsSurviveConcurrentWriters(t *testing.T) {
+	s := newStore(t)
+
+	stats := make(map[string]index.ImportStats, 20)
+	for i := 0; i < 20; i++ {
+		stats[fmt.Sprintf("f%d.go", i)] = index.ImportStats{
+			Lang: "go", Extracted: 2, Resolved: 1, Unresolved: 1,
+			UnresolvedSpecs: []string{"example.com/missing"},
+		}
+	}
+
+	const writers = 8
+	stores := make([]*Store, writers)
+	stores[0] = s
+	for i := 1; i < writers; i++ {
+		stores[i] = openSecond(t, s)
+	}
+
+	errs := make([]error, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = stores[i].UpdateImportStats(stats, nil)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("writer %d: %v", i, err)
+		}
+	}
+	if got := count(t, s, "SELECT COUNT(*) FROM import_stats"); got != 20 {
+		t.Errorf("import_stats rows = %d, want 20 — concurrent writers duplicated rows", got)
+	}
+}
+
+// TestImportStatsDroppedOnSchemaBump guards the recreate-on-mismatch upgrade
+// path for the new table: a cache written by an older recon has no import_stats
+// table at all, so the schema must be rebuilt rather than queried into an error.
+func TestImportStatsDroppedOnSchemaBump(t *testing.T) {
+	root := t.TempDir()
+	s, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateImportStats(map[string]index.ImportStats{
+		"a.go": {Lang: "go", Extracted: 1, Unresolved: 1, UnresolvedSpecs: []string{"gone"}},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the previous schema version, the one with no import_stats table.
+	if err := s.SetMeta("schema_version", strconv.Itoa(schemaVer-1)); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s2, err := Open(root)
+	if err != nil {
+		t.Fatalf("reopen across the schema bump: %v", err)
+	}
+	defer s2.Close()
+	if v, _ := s2.GetMeta("schema_version"); v != strconv.Itoa(schemaVer) {
+		t.Errorf("schema_version = %q, want %d", v, schemaVer)
+	}
+	// Table exists and is empty; a stale row would be telemetry for a scan that
+	// this build's resolvers never performed.
+	stats, err := s2.GetImportStats()
+	if err != nil {
+		t.Fatalf("GetImportStats after bump: %v", err)
+	}
+	if len(stats) != 0 {
+		t.Errorf("stats survived the schema bump: %+v", stats)
+	}
+	if err := s2.UpdateImportStats(map[string]index.ImportStats{
+		"a.go": {Lang: "go", Extracted: 1, Resolved: 1},
+	}, nil); err != nil {
+		t.Errorf("post-bump write failed: %v", err)
 	}
 }
 
@@ -839,6 +1127,9 @@ func TestWriteErrorsAreReportedNotSwallowed(t *testing.T) {
 		{"UpdateFileParses", func() error {
 			return impatient.UpdateFileParses([]index.FileParse{{RelPath: "a.go", Status: index.ParseOK}}, nil)
 		}},
+		{"UpdateImportStats", func() error {
+			return impatient.UpdateImportStats(map[string]index.ImportStats{"a.go": {Lang: "go", Extracted: 1}}, nil)
+		}},
 		{"SaveSnapshot", func() error {
 			return impatient.SaveSnapshot(&Snapshot{Symbols: []index.Symbol{sym("a.go", "New", 3)}})
 		}},
@@ -1025,7 +1316,7 @@ func TestLoadSnapshotOnEmptyDB(t *testing.T) {
 	if len(snap.Files) != 0 || len(snap.Symbols) != 0 {
 		t.Errorf("expected empty snapshot, got %+v", snap)
 	}
-	if snap.Imports == nil || snap.Churn == nil || snap.CoChangePairs == nil {
+	if snap.Imports == nil || snap.Churn == nil || snap.CoChangePairs == nil || snap.ImportStats == nil {
 		t.Error("maps must be initialised even when empty")
 	}
 }

@@ -24,11 +24,13 @@ func (d *ScalaDetector) Languages() []string { return []string{"scala"} }
 func (d *ScalaDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
 	var res DetectorResult
 
+	mr := newManifestReader(root, "scala")
+
 	for _, manifest := range []string{"build.sbt", "build.sc"} {
 		if !hasFile(idx, manifest) {
 			continue
 		}
-		content, ok := readManifest(root, manifest)
+		content, ok := mr.read(manifest)
 		if !ok {
 			continue
 		}
@@ -57,6 +59,7 @@ func (d *ScalaDetector) Detect(idx *index.FileIndex, root string) DetectorResult
 	}
 
 	res.Entrypoints = append(res.Entrypoints, d.entrypoints(idx, root)...)
+	res.ManifestIssues = mr.issues
 	return res
 }
 

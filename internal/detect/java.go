@@ -32,12 +32,19 @@ func (d *JavaDetector) Detect(idx *index.FileIndex, root string) DetectorResult 
 	}
 
 	lang := jvmLang(idx)
+	mr := newManifestReader(root, lang)
 
 	// pom.xml: parse the XML rather than grepping <artifactId>. A regex over
 	// artifactIds also matches the project's own coordinates, its parent POM,
 	// and every build plugin — none of which the project depends on.
-	if content, ok := readManifest(root, "pom.xml"); ok {
-		for _, dep := range parsePomDependencies(content) {
+	if content, ok := mr.read("pom.xml"); ok {
+		deps, err := parsePomDependencies(content)
+		if err != nil {
+			// Malformed XML loses the whole dependency list, so it is an
+			// unusable manifest, not a manifest that declares nothing.
+			mr.unusable("pom.xml", err)
+		}
+		for _, dep := range deps {
 			res.Dependencies = append(res.Dependencies, Dependency{
 				Name:     dep.ArtifactID,
 				Version:  dep.Version,
@@ -55,7 +62,7 @@ func (d *JavaDetector) Detect(idx *index.FileIndex, root string) DetectorResult 
 	}
 
 	for _, manifest := range []string{"build.gradle", "build.gradle.kts"} {
-		content, ok := readManifest(root, manifest)
+		content, ok := mr.read(manifest)
 		if !ok {
 			continue
 		}
@@ -92,6 +99,7 @@ func (d *JavaDetector) Detect(idx *index.FileIndex, root string) DetectorResult 
 	fw, eps := d.scanSources(idx, root, lang)
 	res.Frameworks = dropSubsumed(append(res.Frameworks, fw...))
 	res.Entrypoints = eps
+	res.ManifestIssues = mr.issues
 	return res
 }
 
@@ -148,10 +156,13 @@ type mavenProject struct {
 	} `xml:"profiles>profile"`
 }
 
-func parsePomDependencies(content string) []mavenDependency {
+// parsePomDependencies returns the declared dependencies, or the parse error:
+// "no dependencies" and "this file could not be understood" are different
+// answers and the caller reports them differently.
+func parsePomDependencies(content string) ([]mavenDependency, error) {
 	var p mavenProject
 	if err := xml.Unmarshal([]byte(content), &p); err != nil {
-		return nil
+		return nil, err
 	}
 	deps := make([]mavenDependency, 0, len(p.Dependencies)+len(p.Managed))
 	deps = append(deps, p.Dependencies...)
@@ -167,7 +178,7 @@ func parsePomDependencies(content string) []mavenDependency {
 			out = append(out, d)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // splitGradleCoord turns "group:artifact:version" into its artifact and

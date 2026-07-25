@@ -34,7 +34,12 @@ type packageJSON struct {
 func (d *NodeDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
 	var res DetectorResult
 
-	pkg, hasPkg := readPackageJSON(root)
+	// package.json is the one manifest here that also declares entrypoints
+	// ("main", "bin"), so losing it costs all three answers.
+	mr := newManifestReader(root, nodeLang,
+		FeatureFrameworks, FeatureDependencies, FeatureEntrypoints)
+
+	pkg, hasPkg := readPackageJSON(mr)
 	if hasPkg {
 		for _, group := range []struct {
 			field string
@@ -80,16 +85,21 @@ func (d *NodeDetector) Detect(idx *index.FileIndex, root string) DetectorResult 
 	}
 
 	res.Entrypoints = d.entrypoints(idx, pkg, hasPkg)
+	res.ManifestIssues = mr.issues
 	return res
 }
 
-func readPackageJSON(root string) (packageJSON, bool) {
+func readPackageJSON(mr *manifestReader) (packageJSON, bool) {
 	var pkg packageJSON
-	content, ok := readManifest(root, "package.json")
+	content, ok := mr.read("package.json")
 	if !ok {
 		return pkg, false
 	}
-	if json.Unmarshal([]byte(content), &pkg) != nil {
+	if err := json.Unmarshal([]byte(content), &pkg); err != nil {
+		// A package.json that will not parse is not the same thing as a repo
+		// without one: its dependencies and its declared entrypoints are
+		// unknown, so record it rather than falling through to "none".
+		mr.unusable("package.json", err)
 		return pkg, false
 	}
 	return pkg, true

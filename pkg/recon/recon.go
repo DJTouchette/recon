@@ -165,6 +165,20 @@ func (r *Recon) Overview() (*Overview, error) {
 		})
 	}
 
+	var issues []ManifestIssueInfo
+	for _, mi := range res.ManifestIssues {
+		affects := make([]string, 0, len(mi.Affects))
+		for _, f := range mi.Affects {
+			affects = append(affects, string(f))
+		}
+		issues = append(issues, ManifestIssueInfo{
+			Manifest: mi.Manifest,
+			Language: mi.Language,
+			Reason:   mi.Reason,
+			Affects:  affects,
+		})
+	}
+
 	var deps []Dependency
 	for _, d := range res.Dependencies {
 		deps = append(deps, Dependency{
@@ -186,6 +200,9 @@ func (r *Recon) Overview() (*Overview, error) {
 		TestCount:        len(r.idx.ByClass(scan.ClassTest)),
 		FrameworkStatus:  string(res.FrameworkStatus),
 		EntrypointStatus: string(res.EntrypointStatus),
+		DependencyStatus: string(res.DependencyStatus),
+		ImportCoverage:   r.ImportCoverage(),
+		ManifestIssues:   issues,
 	}, nil
 }
 
@@ -239,6 +256,7 @@ func (r *Recon) Context(path string) (*FileContext, error) {
 	}
 
 	ctx.Docs = toContextDocInfos(r.contextDocs.ForFile(path))
+	ctx.ImportStats = r.ImportStatsFor(path)
 
 	return ctx, nil
 }
@@ -817,13 +835,23 @@ func (r *Recon) Refresh() error {
 	}
 	changedPaths = append(changedPaths, remove...)
 
+	//
+	// Telemetry is written alongside the edges it describes. Scanning without it
+	// meant a refresh wrote new edges over old unresolved counts, so a file
+	// whose imports had started resolving cleanly kept reporting a stale caveat.
 	if len(changedSourceFiles) > 0 {
-		newImports := index.ScanFileImports(r.root, changedSourceFiles, r.idx)
+		newImports, newStats := index.ScanFileImportsWithStats(r.root, changedSourceFiles, r.idx)
 		if err := r.store.UpdateImports(newImports, changedPaths); err != nil {
+			return r.Rebuild()
+		}
+		if err := r.store.UpdateImportStats(newStats, changedPaths); err != nil {
 			return r.Rebuild()
 		}
 	} else if len(remove) > 0 {
 		if err := r.store.UpdateImports(nil, remove); err != nil {
+			return r.Rebuild()
+		}
+		if err := r.store.UpdateImportStats(nil, remove); err != nil {
 			return r.Rebuild()
 		}
 	}
@@ -933,7 +961,9 @@ func (r *Recon) Refresh() error {
 		return r.Rebuild()
 	}
 
-	r.deps = index.NewDepGraphFromData(snap.Imports)
+	// FromCache, not FromData: the telemetry has to survive the round trip or
+	// it only ever describes the run that built the cache.
+	r.deps = index.NewDepGraphFromCache(snap.Imports, snap.ImportStats)
 	// FromCache, not FromData: the parse records have to come back with the
 	// symbols or every cached read reports "clean" for files that failed to
 	// parse — and recon serves from cache almost always.
@@ -1016,6 +1046,7 @@ func (r *Recon) toSnapshot(files []scan.FileEntry) *cache.Snapshot {
 		CoChangePairs: nil,
 		Churn:         nil,
 		Symbols:       r.symbols.All(),
+		ImportStats:   r.deps.AllImportStats(),
 		// Per-file parse status. Without this the trust signal would exist only
 		// in memory on the run that built it: a file whose language has no
 		// extractor, or whose parse failed, produces zero symbol rows, so there
@@ -1122,4 +1153,52 @@ func (r *Recon) ParseCoverage() []FileParseInfo {
 
 	sort.Slice(out, func(i, j int) bool { return out[i].File < out[j].File })
 	return out
+}
+
+// ImportCoverage reports, per language, how many import specifiers recon
+// extracted and how many it could actually resolve to a file in this repo.
+//
+// This is what makes an empty dependency answer interpretable. "fan_in: 0" had
+// two very different meanings — nothing imports this file, or recon does not
+// understand this language's import style — and they were indistinguishable.
+// Unresolved is the number that matters: those are edges recon knows it dropped.
+// External is expected and fine, being stdlib and third-party imports that
+// correctly have no in-repo target.
+func (r *Recon) ImportCoverage() []LangImportCoverage {
+	if r.deps == nil {
+		return nil
+	}
+	cov := r.deps.ImportCoverage()
+	out := make([]LangImportCoverage, 0, len(cov))
+	for _, c := range cov {
+		out = append(out, LangImportCoverage{
+			Lang:       c.Lang,
+			Files:      c.Files,
+			Extracted:  c.Extracted,
+			Resolved:   c.Resolved,
+			External:   c.External,
+			Unresolved: c.Unresolved,
+		})
+	}
+	return out
+}
+
+// ImportStatsFor returns the import resolution record for a single file, or nil
+// when the file had no import specifiers at all.
+func (r *Recon) ImportStatsFor(path string) *ImportStatsInfo {
+	if r.deps == nil {
+		return nil
+	}
+	st, ok := r.deps.ImportStatsOf(filepath.Clean(path))
+	if !ok {
+		return nil
+	}
+	return &ImportStatsInfo{
+		Lang:            st.Lang,
+		Extracted:       st.Extracted,
+		Resolved:        st.Resolved,
+		External:        st.External,
+		Unresolved:      st.Unresolved,
+		UnresolvedSpecs: st.UnresolvedSpecs,
+	}
 }

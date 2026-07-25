@@ -24,7 +24,9 @@ func (d *DartDetector) Languages() []string { return []string{"dart"} }
 func (d *DartDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
 	var res DetectorResult
 
-	if content, ok := readManifest(root, "pubspec.yaml"); ok && hasFile(idx, "pubspec.yaml") {
+	mr := newManifestReader(root, "dart")
+
+	if content, ok := mr.read("pubspec.yaml"); ok && hasFile(idx, "pubspec.yaml") {
 		for _, dep := range parsePubspecDeps(content) {
 			res.Dependencies = append(res.Dependencies, Dependency{
 				Name:     dep.name,
@@ -43,6 +45,7 @@ func (d *DartDetector) Detect(idx *index.FileIndex, root string) DetectorResult 
 	}
 
 	res.Entrypoints = d.entrypoints(idx, root)
+	res.ManifestIssues = mr.issues
 	return res
 }
 

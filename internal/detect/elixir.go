@@ -20,7 +20,9 @@ func (d *ElixirDetector) Languages() []string { return []string{"elixir"} }
 func (d *ElixirDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
 	var res DetectorResult
 
-	if content, ok := readManifest(root, "mix.exs"); ok && hasFile(idx, "mix.exs") {
+	mr := newManifestReader(root, "elixir")
+
+	if content, ok := mr.read("mix.exs"); ok && hasFile(idx, "mix.exs") {
 		for _, m := range mixDep.FindAllStringSubmatch(content, -1) {
 			res.Dependencies = append(res.Dependencies, Dependency{
 				Name:     m[1],
@@ -39,6 +41,7 @@ func (d *ElixirDetector) Detect(idx *index.FileIndex, root string) DetectorResul
 	}
 
 	res.Entrypoints = d.entrypoints(idx, root)
+	res.ManifestIssues = mr.issues
 	return res
 }
 

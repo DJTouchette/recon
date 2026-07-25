@@ -47,12 +47,14 @@ func (d *DotNetDetector) Detect(idx *index.FileIndex, root string) DetectorResul
 		}
 	}
 
+	mr := newManifestReader(root, "csharp")
+
 	for _, f := range idx.ByClass(scan.ClassConfig) {
 		ext := strings.ToLower(filepath.Ext(f.RelPath))
 		if ext != ".csproj" && ext != ".fsproj" {
 			continue
 		}
-		content, ok := readManifest(root, f.RelPath)
+		content, ok := mr.read(f.RelPath)
 		if !ok {
 			continue
 		}
@@ -75,7 +77,7 @@ func (d *DotNetDetector) Detect(idx *index.FileIndex, root string) DetectorResul
 		"Directory.Packages.props",
 		"Directory.Build.targets",
 	} {
-		content, ok := readManifest(root, propsFile)
+		content, ok := mr.read(propsFile)
 		if !ok {
 			continue
 		}
@@ -88,6 +90,7 @@ func (d *DotNetDetector) Detect(idx *index.FileIndex, root string) DetectorResul
 	}
 
 	res.Entrypoints = d.entrypoints(idx, root)
+	res.ManifestIssues = mr.issues
 	return res
 }
 

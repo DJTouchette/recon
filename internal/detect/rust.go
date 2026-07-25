@@ -20,7 +20,9 @@ func (d *RustDetector) Languages() []string { return []string{"rust"} }
 func (d *RustDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
 	var res DetectorResult
 
-	if content, ok := readManifest(root, "Cargo.toml"); ok && hasFile(idx, "Cargo.toml") {
+	mr := newManifestReader(root, "rust")
+
+	if content, ok := mr.read("Cargo.toml"); ok && hasFile(idx, "Cargo.toml") {
 		for _, dep := range parseCargoDeps(content) {
 			res.Dependencies = append(res.Dependencies, Dependency{
 				Name:     dep.name,
@@ -39,6 +41,7 @@ func (d *RustDetector) Detect(idx *index.FileIndex, root string) DetectorResult 
 	}
 
 	res.Entrypoints = d.entrypoints(idx)
+	res.ManifestIssues = mr.issues
 	return res
 }
 

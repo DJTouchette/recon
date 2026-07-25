@@ -2,6 +2,7 @@ package cache
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -19,7 +20,7 @@ import (
 const (
 	cacheDir  = ".recon"
 	dbFile    = "recon.db"
-	schemaVer = 6
+	schemaVer = 7
 
 	// busyTimeoutMS is how long a writer waits for a competing writer's lock
 	// before giving up with SQLITE_BUSY. Several recon processes routinely run
@@ -43,8 +44,13 @@ var connPragmas = []string{
 
 // Snapshot holds all indexed data for save/load.
 type Snapshot struct {
-	Files         []scan.FileEntry
-	Imports       map[string][]string // source → targets
+	Files   []scan.FileEntry
+	Imports map[string][]string // source → targets
+	// ImportStats is per-file import-resolution telemetry, keyed by rel_path.
+	// It is not derivable from Imports: a file with no edges may have had every
+	// specifier resolved to nothing (dropped edges) or none at all, and only
+	// these counts tell the two apart. Present for files with zero edges too.
+	ImportStats   map[string]index.ImportStats
 	SourceToTest  map[string][]string // source → test paths
 	TestToSource  map[string]string   // test → source path
 	TestKinds     map[string]string   // test → kind
@@ -177,7 +183,7 @@ func (s *Store) Close() error {
 }
 
 // allTables lists every table the schema owns, in drop order.
-var allTables = []string{"meta", "files", "imports", "tests", "cochange", "churn", "symbols", "file_parse", "references_", "file_extras", "file_metrics", "nearby_configs", "codeowners", "context_docs"}
+var allTables = []string{"meta", "files", "imports", "tests", "cochange", "churn", "symbols", "file_parse", "import_stats", "references_", "file_extras", "file_metrics", "nearby_configs", "codeowners", "context_docs"}
 
 // dataTables is allTables minus meta — the tables a rebuild clears.
 var dataTables = allTables[1:]
@@ -296,6 +302,28 @@ CREATE TABLE file_parse (
 	detail TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX idx_file_parse_status ON file_parse(status);
+-- Import resolution has the same shape of blind spot as symbol extraction, and
+-- the same fix. A bare fan_in of 0 cannot distinguish "nothing imports this"
+-- from "recon does not understand this language's import syntax", so every
+-- specifier an extractor produced is bucketed here: resolved (made an edge),
+-- external (stdlib/third-party, correctly no edge), unresolved (a real edge was
+-- dropped). Rows exist for files whose imports produced zero edges — those are
+-- precisely the files the signal is for, so an edge table cannot carry it.
+--
+-- rel_path is the PRIMARY KEY. symbols has no key on its file column, which is
+-- why concurrent runs there could duplicate rows; an upsert here cannot.
+CREATE TABLE import_stats (
+	rel_path TEXT PRIMARY KEY,
+	lang TEXT NOT NULL DEFAULT '',
+	extracted INTEGER NOT NULL DEFAULT 0,
+	resolved INTEGER NOT NULL DEFAULT 0,
+	external INTEGER NOT NULL DEFAULT 0,
+	unresolved INTEGER NOT NULL DEFAULT 0,
+	-- JSON array of the bounded specifier sample (see encodeUnresolvedSpecs).
+	unresolved_specs TEXT NOT NULL DEFAULT ''
+);
+-- Serves "which files dropped edges", the query that drives the trust warning.
+CREATE INDEX idx_import_stats_unresolved ON import_stats(unresolved);
 -- No uniqueness constraint here, deliberately: (name, file_path, line) is not
 -- a key. Two calls to the same function on one line -- f(g(x)) + f(y) -- are
 -- two distinct, legitimate references that share all three columns, and
@@ -523,6 +551,21 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 		}
 	}
 
+	// --- Import stats ---
+	if len(snap.ImportStats) > 0 {
+		isStmt, err := tx.Prepare(insertImportStatsSQL)
+		if err != nil {
+			return fmt.Errorf("prepare import_stats: %w", err)
+		}
+		defer isStmt.Close()
+
+		for path, st := range snap.ImportStats {
+			if err := execImportStats(isStmt, path, st); err != nil {
+				return err
+			}
+		}
+	}
+
 	// --- References ---
 	if len(snap.References) > 0 {
 		refStmt, err := tx.Prepare("INSERT INTO references_ (name, file_path, line) VALUES (?, ?, ?)")
@@ -625,6 +668,7 @@ func (s *Store) SaveSnapshot(snap *Snapshot) error {
 func (s *Store) LoadSnapshot() (*Snapshot, error) {
 	snap := &Snapshot{
 		Imports:       make(map[string][]string),
+		ImportStats:   make(map[string]index.ImportStats),
 		SourceToTest:  make(map[string][]string),
 		TestToSource:  make(map[string]string),
 		TestKinds:     make(map[string]string),
@@ -765,6 +809,24 @@ func (s *Store) LoadSnapshot() (*Snapshot, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("file_parse rows: %w", err)
+	}
+
+	// --- Import stats ---
+	rows, err = s.db.Query("SELECT " + importStatsCols + " FROM import_stats")
+	if err != nil {
+		return nil, fmt.Errorf("query import_stats: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		path, st, err := scanImportStats(rows)
+		if err != nil {
+			return nil, err
+		}
+		snap.ImportStats[path] = st
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("import_stats rows: %w", err)
 	}
 
 	// --- References ---
@@ -1241,6 +1303,150 @@ func (s *Store) GetFileParses() (map[string]index.FileParse, error) {
 			return nil, err
 		}
 		out[p.RelPath] = p
+	}
+	return out, rows.Err()
+}
+
+const (
+	insertImportStatsSQL = "INSERT OR REPLACE INTO import_stats (rel_path, lang, extracted, resolved, external, unresolved, unresolved_specs) VALUES (?, ?, ?, ?, ?, ?, ?)"
+	importStatsCols      = "rel_path, lang, extracted, resolved, external, unresolved, unresolved_specs"
+
+	// maxStoredUnresolvedSpecs bounds the sample actually written, independent of
+	// whatever bound the producer applied. The samples are diagnostic breadcrumbs
+	// for a human, not data anything computes on, so a defect or a future change
+	// upstream must not be able to grow one row into an unbounded blob. Matches
+	// the current producer's cap, so in practice nothing is ever dropped here.
+	maxStoredUnresolvedSpecs = 20
+)
+
+// encodeUnresolvedSpecs renders the specifier sample as a JSON array.
+//
+// JSON in one TEXT column rather than a child table: the samples are a bounded,
+// ordered, read-as-a-whole blob with no independent identity, so a second table
+// would buy a join and a second delete path for nothing. Empty stays the empty
+// string so the common case (nothing unresolved) costs no bytes and no parse.
+func encodeUnresolvedSpecs(specs []string) (string, error) {
+	if len(specs) == 0 {
+		return "", nil
+	}
+	if len(specs) > maxStoredUnresolvedSpecs {
+		specs = specs[:maxStoredUnresolvedSpecs]
+	}
+	b, err := json.Marshal(specs)
+	if err != nil {
+		return "", fmt.Errorf("encode unresolved specs: %w", err)
+	}
+	return string(b), nil
+}
+
+// decodeUnresolvedSpecs is the inverse. Malformed JSON is not fatal: the counts
+// in the same row are the load-bearing signal, and losing a diagnostic sample is
+// a far better outcome than refusing to load the cache.
+func decodeUnresolvedSpecs(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var specs []string
+	if err := json.Unmarshal([]byte(raw), &specs); err != nil {
+		return nil
+	}
+	return specs
+}
+
+// execImportStats writes one row through an already-prepared statement.
+func execImportStats(stmt *sql.Stmt, path string, st index.ImportStats) error {
+	specs, err := encodeUnresolvedSpecs(st.UnresolvedSpecs)
+	if err != nil {
+		return fmt.Errorf("import_stats %s: %w", path, err)
+	}
+	if _, err := stmt.Exec(path, st.Lang, st.Extracted, st.Resolved, st.External, st.Unresolved, specs); err != nil {
+		return fmt.Errorf("upsert import_stats %s: %w", path, err)
+	}
+	return nil
+}
+
+func scanImportStats(rows *sql.Rows) (string, index.ImportStats, error) {
+	var path, specs string
+	var st index.ImportStats
+	if err := rows.Scan(&path, &st.Lang, &st.Extracted, &st.Resolved, &st.External, &st.Unresolved, &specs); err != nil {
+		return "", st, fmt.Errorf("scan import_stats row: %w", err)
+	}
+	st.UnresolvedSpecs = decodeUnresolvedSpecs(specs)
+	return path, st, nil
+}
+
+// UpdateImportStats upserts per-file import telemetry and drops the rows for
+// deleted files.
+//
+// This is the incremental counterpart to the import_stats rows written by
+// SaveSnapshot, and it must be called from the refresh path too. Every run after
+// the first is served from cache, so telemetry that only the full-rebuild path
+// writes is telemetry nobody ever sees — the same way parse status was invisible
+// before file_parse got its own incremental writer.
+//
+// removedFiles must be the same list passed to UpdateSymbols/UpdateFileParses;
+// otherwise a deleted file keeps a row claiming its imports were resolved.
+//
+// rel_path is the primary key, so a re-scan replaces in place and a repeated
+// write cannot accumulate duplicates.
+func (s *Store) UpdateImportStats(stats map[string]index.ImportStats, removedFiles []string) error {
+	if len(stats) == 0 && len(removedFiles) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if len(removedFiles) > 0 {
+		delStmt, err := tx.Prepare("DELETE FROM import_stats WHERE rel_path=?")
+		if err != nil {
+			return err
+		}
+		defer delStmt.Close()
+		for _, f := range removedFiles {
+			if _, err := delStmt.Exec(f); err != nil {
+				return fmt.Errorf("delete import_stats for %s: %w", f, err)
+			}
+		}
+	}
+
+	if len(stats) > 0 {
+		insStmt, err := tx.Prepare(insertImportStatsSQL)
+		if err != nil {
+			return err
+		}
+		defer insStmt.Close()
+		for path, st := range stats {
+			if err := execImportStats(insStmt, path, st); err != nil {
+				return err
+			}
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetImportStats returns the stored import telemetry for every file that had
+// import specifiers extracted, keyed by path. Files whose specifiers produced no
+// edges are present too — that is the point: "imports nothing" must be
+// distinguishable from "imports were not understood".
+func (s *Store) GetImportStats() (map[string]index.ImportStats, error) {
+	rows, err := s.db.Query("SELECT " + importStatsCols + " FROM import_stats")
+	if err != nil {
+		return nil, fmt.Errorf("query import_stats: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]index.ImportStats, 4096)
+	for rows.Next() {
+		path, st, err := scanImportStats(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[path] = st
 	}
 	return out, rows.Err()
 }

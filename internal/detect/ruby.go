@@ -19,7 +19,9 @@ func (d *RubyDetector) Languages() []string { return []string{"ruby"} }
 func (d *RubyDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
 	var res DetectorResult
 
-	if content, ok := readManifest(root, "Gemfile"); ok && hasFile(idx, "Gemfile") {
+	mr := newManifestReader(root, "ruby")
+
+	if content, ok := mr.read("Gemfile"); ok && hasFile(idx, "Gemfile") {
 		for _, m := range gemRe.FindAllStringSubmatch(content, -1) {
 			res.Dependencies = append(res.Dependencies, Dependency{
 				Name:     m[1],
@@ -51,6 +53,7 @@ func (d *RubyDetector) Detect(idx *index.FileIndex, root string) DetectorResult 
 	}
 
 	res.Entrypoints = d.entrypoints(idx, root)
+	res.ManifestIssues = mr.issues
 	return res
 }
 

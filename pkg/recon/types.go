@@ -20,8 +20,35 @@ type Overview struct {
 	// Status fields distinguish "there are none" from "nothing here could tell".
 	// An empty list on its own served as both answers, and the second one is
 	// the one a reader needs to know about.
-	FrameworkStatus  string `json:"framework_status,omitempty"`  // found | none_matched | unsupported
-	EntrypointStatus string `json:"entrypoint_status,omitempty"` // found | none_matched | unsupported
+	// Statuses: found | none_matched | unsupported | incomplete.
+	//
+	// "incomplete" outranks the others, "found" included — a list assembled from
+	// a partial reading of the repo is not the whole answer, so a non-empty list
+	// can still be incomplete. ManifestIssues says what failed.
+	FrameworkStatus  string `json:"framework_status,omitempty"`
+	EntrypointStatus string `json:"entrypoint_status,omitempty"`
+	DependencyStatus string `json:"dependency_status,omitempty"`
+
+	// ImportCoverage says how complete the dependency graph actually is, per
+	// language. An empty graph and an unresolvable one look the same without it.
+	ImportCoverage []LangImportCoverage `json:"import_coverage,omitempty"`
+
+	// ManifestIssues name manifests recon tried to read and could not. They are
+	// why a status can be "incomplete": the list that was produced came from a
+	// partial reading of the repo, which is not the same as being complete.
+	ManifestIssues []ManifestIssueInfo `json:"manifest_issues,omitempty"`
+}
+
+// ManifestIssueInfo is a manifest recon could not use, and why.
+type ManifestIssueInfo struct {
+	Manifest string `json:"manifest"`
+	Language string `json:"language,omitempty"`
+	Reason   string `json:"reason"`
+	// Affects names which lists are incomplete because of this. An unreadable
+	// pom.xml costs frameworks and dependencies but no entrypoints, since JVM
+	// entrypoints come from source — saying so keeps the caveat off lists that
+	// really are complete.
+	Affects []string `json:"affects,omitempty"`
 }
 
 // Dependency is a declared dependency read from a manifest.
@@ -140,6 +167,11 @@ type FileContext struct {
 	HotspotScore  float64           `json:"hotspot_score"`
 	NearbyConfigs map[string]string `json:"nearby_configs,omitempty"` // type → path
 	Docs          []ContextDocInfo  `json:"docs,omitempty"`           // context docs attached to this file
+
+	// ImportStats qualifies FanOut. Without it, "fan_out: 0" means both "this
+	// file imports nothing local" and "recon could not resolve this file's
+	// imports at all", which are very different facts to act on.
+	ImportStats *ImportStatsInfo `json:"import_stats,omitempty"`
 }
 
 // ContextDocInfo is a context doc extracted from a rivet:context code comment
@@ -218,4 +250,30 @@ func WithMaxResults(n int) RelatedOption {
 	return func(c *relatedConfig) {
 		c.maxResults = n
 	}
+}
+
+// ImportStatsInfo is how one file's import specifiers resolved.
+//
+// Every specifier lands in exactly one bucket. External is an expected
+// non-edge — stdlib and third-party imports have no in-repo target — while
+// Unresolved counts edges recon knows it failed to resolve. A high Unresolved
+// is the signal that this file's dependency picture is incomplete, which is
+// otherwise invisible: a dropped edge looks exactly like an absent one.
+type ImportStatsInfo struct {
+	Lang            string   `json:"lang"`
+	Extracted       int      `json:"extracted"`
+	Resolved        int      `json:"resolved"`
+	External        int      `json:"external"`
+	Unresolved      int      `json:"unresolved"`
+	UnresolvedSpecs []string `json:"unresolved_specs,omitempty"` // bounded sample
+}
+
+// LangImportCoverage aggregates import resolution over one language.
+type LangImportCoverage struct {
+	Lang       string `json:"lang"`
+	Files      int    `json:"files"`
+	Extracted  int    `json:"extracted"`
+	Resolved   int    `json:"resolved"`
+	External   int    `json:"external"`
+	Unresolved int    `json:"unresolved"`
 }

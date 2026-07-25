@@ -47,8 +47,10 @@ func (d *PythonDetector) Detect(idx *index.FileIndex, root string) DetectorResul
 		}
 	}
 
+	mr := newManifestReader(root, "python")
+
 	for _, rf := range []string{"requirements.txt", "requirements.in", "requirements-dev.txt", "dev-requirements.txt"} {
-		content, ok := readManifest(root, rf)
+		content, ok := mr.read(rf)
 		if !ok {
 			continue
 		}
@@ -63,10 +65,10 @@ func (d *PythonDetector) Detect(idx *index.FileIndex, root string) DetectorResul
 		}
 	}
 
-	if content, ok := readManifest(root, "pyproject.toml"); ok {
+	if content, ok := mr.read("pyproject.toml"); ok {
 		parsePyprojectDeps(content, "pyproject.toml", addDep)
 	}
-	if content, ok := readManifest(root, "Pipfile"); ok {
+	if content, ok := mr.read("Pipfile"); ok {
 		parsePipfileDeps(content, "Pipfile", addDep)
 	}
 
@@ -79,6 +81,7 @@ func (d *PythonDetector) Detect(idx *index.FileIndex, root string) DetectorResul
 	fw, eps := d.scanSources(idx, root)
 	res.Frameworks = append(res.Frameworks, fw...)
 	res.Entrypoints = append(res.Entrypoints, eps...)
+	res.ManifestIssues = mr.issues
 	return res
 }
 

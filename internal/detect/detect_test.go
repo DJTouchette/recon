@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/djtouchette/recon/internal/index"
@@ -15,6 +16,13 @@ import (
 // does.
 func buildRepo(t *testing.T, files map[string]string) (string, *index.FileIndex) {
 	t.Helper()
+	return buildRepoWith(t, files, nil)
+}
+
+// buildRepoWith writes files, lets prep tamper with the tree, and only then
+// walks it — so whatever prep created is part of the index the detectors see.
+func buildRepoWith(t *testing.T, files map[string]string, prep func(t *testing.T, root string)) (string, *index.FileIndex) {
+	t.Helper()
 	root := t.TempDir()
 	for rel, content := range files {
 		full := filepath.Join(root, filepath.FromSlash(rel))
@@ -24,6 +32,9 @@ func buildRepo(t *testing.T, files map[string]string) (string, *index.FileIndex)
 		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if prep != nil {
+		prep(t, root)
 	}
 	walk, err := scan.Walk(root)
 	if err != nil {
@@ -35,6 +46,12 @@ func buildRepo(t *testing.T, files map[string]string) (string, *index.FileIndex)
 func detectRepo(t *testing.T, files map[string]string) *Result {
 	t.Helper()
 	root, idx := buildRepo(t, files)
+	return Detect(idx, root)
+}
+
+func detectRepoWith(t *testing.T, files map[string]string, prep func(t *testing.T, root string)) *Result {
+	t.Helper()
+	root, idx := buildRepoWith(t, files, prep)
 	return Detect(idx, root)
 }
 
@@ -580,6 +597,335 @@ func TestStatusFound(t *testing.T) {
 	}
 }
 
+// --- Unreadable is not absent ---
+//
+// An absent manifest is evidence: a repo with no Gemfile has no gems. A
+// manifest that is there and cannot be read is evidence of nothing, and the
+// two used to produce byte-identical output — zero dependencies and a status
+// that reads as "there are none".
+
+// blockManifest puts a directory at root/rel. The path then exists and its
+// contents can never be read, which is the one way to express "present but
+// unreadable" that behaves identically for uid 0 and for everyone else: root
+// ignores permission bits, so chmod 000 proves nothing in a CI container that
+// runs as root.
+func blockManifest(t *testing.T, root, rel string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(rel)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// makeUnreadable creates a real, regular, indexed file that cannot be read.
+// The walk only stats files, so unlike blockManifest this fixture is visible to
+// the detectors that consult the index before reading (go.mod, build.sbt).
+// Permission bits are the only mechanism for that, and they do not constrain
+// root, so as uid 0 the case is inexpressible and the test skips rather than
+// passing vacuously.
+func makeUnreadable(t *testing.T, root, rel string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: mode 000 is still readable, so this case cannot be staged")
+	}
+	full := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.WriteFile(full, []byte("unreadable"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func issueFor(r *Result, manifest string) (ManifestIssue, bool) {
+	for _, is := range r.ManifestIssues {
+		if is.Manifest == manifest {
+			return is, true
+		}
+	}
+	return ManifestIssue{}, false
+}
+
+func affects(is ManifestIssue, f Feature) bool {
+	for _, a := range is.Affects {
+		if a == f {
+			return true
+		}
+	}
+	return false
+}
+
+// TestUnreadableManifestIsDistinguishableFromAnAbsentOne runs the same repo
+// twice per ecosystem: once with the manifest missing, once with it present and
+// unreadable. Those are different answers and must not be reported the same.
+func TestUnreadableManifestIsDistinguishableFromAnAbsentOne(t *testing.T) {
+	cases := []struct {
+		name     string
+		manifest string
+		lang     string
+		files    map[string]string
+	}{
+		{"node", "package.json", "javascript", map[string]string{"src/lib.js": "export const a = 1;\n"}},
+		{"python", "pyproject.toml", "python", map[string]string{"app.py": "x = 1\n"}},
+		{"jvm", "pom.xml", "java", map[string]string{"src/main/java/A.java": "package a;\nclass A {}\n"}},
+		{"rust", "Cargo.toml", "rust", map[string]string{"src/lib.rs": "pub fn f() {}\n"}},
+		{"ruby", "Gemfile", "ruby", map[string]string{"app/model.rb": "class M; end\n"}},
+		{"elixir", "mix.exs", "elixir", map[string]string{"lib/app.ex": "defmodule App do\nend\n"}},
+		{"dart", "pubspec.yaml", "dart", map[string]string{"lib/app.dart": "class A {}\n"}},
+		{"dotnet", "Directory.Packages.props", "csharp", map[string]string{"src/App/Widget.cs": "class Widget { }\n"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Absent: recon looked, there was nothing there, and saying so is
+			// an honest answer.
+			absent := detectRepo(t, tc.files)
+			if len(absent.ManifestIssues) != 0 {
+				t.Fatalf("absent manifest produced issues: %+v", absent.ManifestIssues)
+			}
+			if absent.DependencyStatus != StatusNoneMatched {
+				t.Errorf("absent: dependency status = %q, want none_matched", absent.DependencyStatus)
+			}
+			if absent.FrameworkStatus != StatusNoneMatched {
+				t.Errorf("absent: framework status = %q, want none_matched", absent.FrameworkStatus)
+			}
+
+			// Present but unreadable: recon could not tell, and must not
+			// answer as if it had.
+			broken := detectRepoWith(t, tc.files, func(t *testing.T, root string) {
+				blockManifest(t, root, tc.manifest)
+			})
+			is, ok := issueFor(broken, tc.manifest)
+			if !ok {
+				t.Fatalf("no issue naming %s; issues = %+v", tc.manifest, broken.ManifestIssues)
+			}
+			if is.Reason == "" {
+				t.Error("issue has no reason")
+			}
+			if is.Language != tc.lang {
+				t.Errorf("issue language = %q, want %q", is.Language, tc.lang)
+			}
+			if !affects(is, FeatureDependencies) || !affects(is, FeatureFrameworks) {
+				t.Errorf("issue affects = %v, want frameworks and dependencies", is.Affects)
+			}
+			if broken.DependencyStatus != StatusIncomplete {
+				t.Errorf("unreadable: dependency status = %q, want incomplete", broken.DependencyStatus)
+			}
+			if broken.FrameworkStatus != StatusIncomplete {
+				t.Errorf("unreadable: framework status = %q, want incomplete", broken.FrameworkStatus)
+			}
+		})
+	}
+}
+
+func TestUnreadableManifestIssueNamesTheArtifactAndTheCause(t *testing.T) {
+	r := detectRepoWith(t, map[string]string{
+		"src/main/java/A.java": "package a;\nclass A {}\n",
+	}, func(t *testing.T, root string) {
+		blockManifest(t, root, "pom.xml")
+	})
+
+	is, ok := issueFor(r, "pom.xml")
+	if !ok {
+		t.Fatalf("issues = %+v", r.ManifestIssues)
+	}
+	// "error" alone would leave the reader no better off than the silence it
+	// replaces: the file and the cause are the whole point.
+	if !strings.Contains(is.Reason, "directory") {
+		t.Errorf("reason = %q, want the underlying cause", is.Reason)
+	}
+	// The absolute temp path must not leak in: it would make output
+	// machine-specific and break byte-identical reruns.
+	if strings.Contains(is.Reason, string(filepath.Separator)) {
+		t.Errorf("reason = %q, want no path in it", is.Reason)
+	}
+}
+
+func TestPermissionDeniedManifestIsReportedNotSwallowed(t *testing.T) {
+	r := detectRepoWith(t, map[string]string{
+		"main.go": "package main\n\nfunc main() {}\n",
+	}, func(t *testing.T, root string) {
+		makeUnreadable(t, root, "go.mod")
+	})
+
+	is, ok := issueFor(r, "go.mod")
+	if !ok {
+		t.Fatalf("issues = %+v", r.ManifestIssues)
+	}
+	if !strings.Contains(is.Reason, "permission denied") {
+		t.Errorf("reason = %q, want permission denied", is.Reason)
+	}
+	if r.DependencyStatus != StatusIncomplete {
+		t.Errorf("dependency status = %q, want incomplete", r.DependencyStatus)
+	}
+}
+
+func TestUnreadableBuildSbtIsReported(t *testing.T) {
+	r := detectRepoWith(t, map[string]string{
+		"src/main/scala/Lib.scala": "object Lib\n",
+	}, func(t *testing.T, root string) {
+		makeUnreadable(t, root, "build.sbt")
+	})
+	if _, ok := issueFor(r, "build.sbt"); !ok {
+		t.Fatalf("issues = %+v", r.ManifestIssues)
+	}
+}
+
+func TestDanglingSymlinkManifestIsUnreadableNotAbsent(t *testing.T) {
+	// os.ReadFile reports a dangling symlink as ErrNotExist, which is exactly
+	// the error that means "absent" — so this case has to be settled by Lstat,
+	// or a broken symlink silently becomes "no gems".
+	r := detectRepoWith(t, map[string]string{
+		"app/model.rb": "class M; end\n",
+	}, func(t *testing.T, root string) {
+		if err := os.Symlink(filepath.Join(root, "nowhere"), filepath.Join(root, "Gemfile")); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if _, ok := issueFor(r, "Gemfile"); !ok {
+		t.Fatalf("dangling symlink read as absent; issues = %+v", r.ManifestIssues)
+	}
+	if r.DependencyStatus != StatusIncomplete {
+		t.Errorf("dependency status = %q, want incomplete", r.DependencyStatus)
+	}
+}
+
+func TestMalformedPackageJSONIsUnusableNotEmpty(t *testing.T) {
+	// A truncated manifest parses no dependencies for the same reason an
+	// unreadable one reads none. Reporting "no dependencies" is the same lie.
+	r := detectRepo(t, map[string]string{
+		"package.json": `{"dependencies": {"express": "^4`,
+		"src/lib.js":   "export const a = 1;\n",
+	})
+	is, ok := issueFor(r, "package.json")
+	if !ok {
+		t.Fatalf("issues = %+v", r.ManifestIssues)
+	}
+	if is.Reason == "" {
+		t.Error("issue has no reason")
+	}
+	if r.DependencyStatus != StatusIncomplete || r.FrameworkStatus != StatusIncomplete {
+		t.Errorf("statuses = %q/%q, want incomplete", r.DependencyStatus, r.FrameworkStatus)
+	}
+}
+
+func TestMalformedPomIsUnusableNotEmpty(t *testing.T) {
+	r := detectRepo(t, map[string]string{
+		"pom.xml":              "<project><dependencies><dependency>",
+		"src/main/java/A.java": "package a;\nclass A {}\n",
+	})
+	if _, ok := issueFor(r, "pom.xml"); !ok {
+		t.Fatalf("issues = %+v", r.ManifestIssues)
+	}
+}
+
+// --- StatusIncomplete lands only on the answers the manifest fed ---
+
+func TestUnreadablePackageJSONAlsoCastsDoubtOnEntrypoints(t *testing.T) {
+	// npm's "main"/"bin" are entrypoint declarations, so losing package.json
+	// loses entrypoints too — the conventional fallbacks are not the whole set.
+	r := detectRepoWith(t, map[string]string{
+		"src/lib.js": "export const a = 1;\n",
+	}, func(t *testing.T, root string) {
+		blockManifest(t, root, "package.json")
+	})
+	if r.EntrypointStatus != StatusIncomplete {
+		t.Errorf("entrypoint status = %q, want incomplete", r.EntrypointStatus)
+	}
+}
+
+func TestUnreadablePomLeavesEntrypointStatusAlone(t *testing.T) {
+	// pom.xml never declares an entrypoint: JVM entrypoints come from source,
+	// which was read fine. Marking them incomplete would be noise.
+	r := detectRepoWith(t, map[string]string{
+		"src/main/java/com/ex/Tool.java": `package com.ex;
+public class Tool {
+    public static void main(String[] args) { System.out.println("x"); }
+}
+`,
+	}, func(t *testing.T, root string) {
+		blockManifest(t, root, "pom.xml")
+	})
+	if r.FrameworkStatus != StatusIncomplete {
+		t.Errorf("framework status = %q, want incomplete", r.FrameworkStatus)
+	}
+	if r.EntrypointStatus != StatusFound {
+		t.Errorf("entrypoint status = %q, want found", r.EntrypointStatus)
+	}
+	assertHas(t, entrypointPaths(r), "src/main/java/com/ex/Tool.java")
+}
+
+func TestIncompleteOutranksFoundBecauseTheListMayBeShort(t *testing.T) {
+	// go.mod read fine and proved Gin; the unreadable package.json means there
+	// may be more. A non-empty list is still not the whole answer.
+	r := detectRepoWith(t, map[string]string{
+		"go.mod":     "module x\n\ngo 1.22\n\nrequire github.com/gin-gonic/gin v1.9.1\n",
+		"main.go":    "package main\n\nfunc main() {}\n",
+		"src/lib.js": "export const a = 1;\n",
+	}, func(t *testing.T, root string) {
+		blockManifest(t, root, "package.json")
+	})
+	assertHas(t, frameworkNames(r), "Gin")
+	if r.FrameworkStatus != StatusIncomplete {
+		t.Errorf("framework status = %q, want incomplete despite Gin", r.FrameworkStatus)
+	}
+}
+
+func TestIncompleteOutranksUnsupported(t *testing.T) {
+	// Nothing here is in a language recon has rules for, but the one manifest
+	// that would have said what this project is could not be read. "no
+	// detector for these languages" would be a confident wrong answer.
+	r := detectRepoWith(t, map[string]string{
+		"notes.txt": "hello\n",
+	}, func(t *testing.T, root string) {
+		blockManifest(t, root, "package.json")
+	})
+	if r.FrameworkStatus != StatusIncomplete {
+		t.Errorf("framework status = %q, want incomplete", r.FrameworkStatus)
+	}
+}
+
+// --- The three original statuses still mean exactly what they meant ---
+
+func TestReadableRepoReportsNoIssuesAndTheOriginalStatuses(t *testing.T) {
+	r := detectRepo(t, map[string]string{
+		"go.mod":  "module x\n\ngo 1.22\n\nrequire github.com/spf13/cobra v1.8.0\n",
+		"main.go": "package main\n\nfunc main() {}\n",
+	})
+	if len(r.ManifestIssues) != 0 {
+		t.Fatalf("healthy repo produced issues: %+v", r.ManifestIssues)
+	}
+	if r.FrameworkStatus != StatusFound {
+		t.Errorf("framework status = %q, want found", r.FrameworkStatus)
+	}
+	if r.EntrypointStatus != StatusFound {
+		t.Errorf("entrypoint status = %q, want found", r.EntrypointStatus)
+	}
+	if r.DependencyStatus != StatusFound {
+		t.Errorf("dependency status = %q, want found", r.DependencyStatus)
+	}
+}
+
+func TestStatusValuesAreStableWireStrings(t *testing.T) {
+	// pkg/recon and the CLI map these strings; changing one silently breaks a
+	// consumer that no test here would catch.
+	for got, want := range map[Status]string{
+		StatusFound:       "found",
+		StatusNoneMatched: "none_matched",
+		StatusUnsupported: "unsupported",
+		StatusIncomplete:  "incomplete",
+	} {
+		if string(got) != want {
+			t.Errorf("status %q, want %q", string(got), want)
+		}
+	}
+	for got, want := range map[Feature]string{
+		FeatureFrameworks:   "frameworks",
+		FeatureDependencies: "dependencies",
+		FeatureEntrypoints:  "entrypoints",
+	} {
+		if string(got) != want {
+			t.Errorf("feature %q, want %q", string(got), want)
+		}
+	}
+}
+
 // --- Determinism ---
 
 func TestDetectIsDeterministic(t *testing.T) {
@@ -610,6 +956,35 @@ func TestDetectIsDeterministic(t *testing.T) {
 		}
 		if !reflect.DeepEqual(first.Languages, got.Languages) {
 			t.Fatalf("run %d languages differ:\n%+v\n%+v", i, first.Languages, got.Languages)
+		}
+	}
+}
+
+func TestManifestIssuesAreDeterministic(t *testing.T) {
+	// Issues are collected in detector order and must come out sorted, or a
+	// broken repo reports the same facts in a different order every run.
+	root, idx := buildRepoWith(t, map[string]string{
+		"src/lib.js":           "export const a = 1;\n",
+		"app.py":               "x = 1\n",
+		"src/main/java/A.java": "package a;\nclass A {}\n",
+	}, func(t *testing.T, root string) {
+		blockManifest(t, root, "package.json")
+		blockManifest(t, root, "pyproject.toml")
+		blockManifest(t, root, "pom.xml")
+	})
+
+	first := Detect(idx, root).ManifestIssues
+	if len(first) != 3 {
+		t.Fatalf("issues = %+v, want one per blocked manifest", first)
+	}
+	for i := 1; i < len(first); i++ {
+		if first[i-1].Manifest > first[i].Manifest {
+			t.Fatalf("issues not sorted: %+v", first)
+		}
+	}
+	for i := 0; i < 25; i++ {
+		if got := Detect(idx, root).ManifestIssues; !reflect.DeepEqual(first, got) {
+			t.Fatalf("run %d: %+v != %+v", i, got, first)
 		}
 	}
 }

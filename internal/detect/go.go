@@ -31,7 +31,10 @@ func (d *GoDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
 		return res
 	}
 
-	content, ok := readManifest(root, "go.mod")
+	// go.mod carries dependencies and framework claims; entrypoints come from
+	// source, so an unreadable go.mod does not put them in doubt.
+	mr := newManifestReader(root, "go")
+	content, ok := mr.read("go.mod")
 	if ok {
 		for _, dep := range parseGoMod(content) {
 			res.Dependencies = append(res.Dependencies, Dependency{
@@ -51,6 +54,7 @@ func (d *GoDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
 	}
 
 	res.Entrypoints = d.entrypoints(idx, root)
+	res.ManifestIssues = mr.issues
 	return res
 }
 
