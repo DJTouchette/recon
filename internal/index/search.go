@@ -8,6 +8,38 @@ import (
 	"github.com/djtouchette/recon/internal/scan"
 )
 
+// testDemotion scales the final score of a test file when an implementation
+// file also matched the query.
+//
+// Every tier of this scorer accumulates into one per-file total that is then
+// clamped to 1.0, so `FooService.cs` (exact symbol 1.0 + basename 0.6 = 1.6)
+// and `FooServiceTests.cs` (prefix symbol 0.9 + basename 0.6 = 1.5) both arrive
+// at exactly 1.0 and the only thing separating them is the alphabetical
+// path tiebreak. On a real C# tree that tiebreak decides at random: searching
+// `MeApi` put `backend/tests/.../MeApiTests.cs` first and the actual
+// `clients/mobile/src/.../MeApi.cs` fourth, because "backend" sorts before
+// "clients". Sending an agent that asked "where is X" to the tests for X is the
+// worst answer this tool can give.
+//
+// 0.85 is deliberately small. It is enough to break the 1.0 clamp tie against
+// any implementation that also scored in the top tier, but not enough to push a
+// top-tier test (0.85) below the file-path tier (0.6) or the preview/content
+// tiers (0.3/0.2). Tests that are legitimately the only answer — E2E suites,
+// golden-file suites, integration tests with no same-named source file — keep
+// their position, because the demotion is uniform and so cannot reorder tests
+// among themselves.
+const testDemotion = 0.85
+
+// testIntentTokens are whole query words that mean the caller is asking for
+// tests. Only exact tokens count: a *suffix* rule would fire on domain nouns
+// ("LabTest", "TestResult", "SmokeSpec"), which are common enough in real
+// codebases — Leroy has LabTest, LabTestRepository and CombinedVaccinationTestData —
+// that it would silently disable the demotion for a whole domain.
+var testIntentTokens = map[string]bool{
+	"test": true, "tests": true, "testing": true,
+	"spec": true, "specs": true,
+}
+
 // SearchResult represents a single match from unified search.
 type SearchResult struct {
 	Path      string  `json:"path"`
@@ -31,18 +63,28 @@ func Search(query string, root string, idx *FileIndex, symbols *SymbolIndex, ext
 
 	// Score accumulator per file path
 	type fileScore struct {
-		path    string
-		score   float64
-		matches []SearchResult
+		path  string
+		score float64
+		// namedExactly is set when the query *is* this file's own name — an
+		// exact symbol name or an exact basename. A test file the caller asked
+		// for by name is not demoted: `AprysePdfGoldenTests` should return
+		// AprysePdfGoldenTests.cs at full score.
+		namedExactly bool
+		matches      []SearchResult
 	}
 	scores := make(map[string]*fileScore)
 
-	addMatch := func(path string, score float64, result SearchResult) {
+	get := func(path string) *fileScore {
 		fs, ok := scores[path]
 		if !ok {
 			fs = &fileScore{path: path}
 			scores[path] = fs
 		}
+		return fs
+	}
+
+	addMatch := func(path string, score float64, result SearchResult) {
+		fs := get(path)
 		fs.score += score
 		fs.matches = append(fs.matches, result)
 	}
@@ -70,6 +112,10 @@ func Search(query string, root string, idx *FileIndex, symbols *SymbolIndex, ext
 				weight = 1.0
 			} else if strings.HasPrefix(nameLower, q) {
 				weight = 0.9
+			}
+
+			if nameLower == q {
+				get(sym.File).namedExactly = true
 			}
 
 			s := sym // copy
@@ -106,6 +152,9 @@ func Search(query string, root string, idx *FileIndex, symbols *SymbolIndex, ext
 		baseLower := strings.ToLower(strings.TrimSuffix(f.RelPath[strings.LastIndex(f.RelPath, "/")+1:], ""))
 		if strings.Contains(baseLower, q) {
 			weight = 0.6 // basename match is stronger
+		}
+		if strings.TrimSuffix(baseLower, strings.ToLower(filepath.Ext(baseLower))) == q {
+			get(f.RelPath).namedExactly = true
 		}
 
 		addMatch(f.RelPath, weight, SearchResult{
@@ -182,6 +231,27 @@ func Search(query string, root string, idx *FileIndex, symbols *SymbolIndex, ext
 		}
 	}
 
+	// Should test files be demoted? Only when the caller did not ask for tests
+	// and something other than a test also matched — a demotion applied to a
+	// result set that is entirely tests would deflate every score without
+	// changing a single position.
+	demoteTests := true
+	for _, tok := range tokens {
+		if testIntentTokens[tok] {
+			demoteTests = false
+			break
+		}
+	}
+	if demoteTests {
+		demoteTests = false
+		for path := range scores {
+			if f := idx.Get(path); f != nil && f.Class != scan.ClassTest {
+				demoteTests = true
+				break
+			}
+		}
+	}
+
 	// Flatten: pick the best match per file, use accumulated score for ranking
 	var results []SearchResult
 	for _, fs := range scores {
@@ -195,6 +265,13 @@ func Search(query string, root string, idx *FileIndex, symbols *SymbolIndex, ext
 		best.Score = fs.score
 		if best.Score > 1.0 {
 			best.Score = 1.0
+		}
+		// Demote after the clamp, not before: every top-tier match saturates at
+		// 1.0, so a demotion folded in beforehand would be clamped away.
+		if demoteTests && !fs.namedExactly {
+			if f := idx.Get(fs.path); f != nil && f.Class == scan.ClassTest {
+				best.Score *= testDemotion
+			}
 		}
 		results = append(results, best)
 	}
