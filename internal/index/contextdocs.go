@@ -201,6 +201,9 @@ var commentSyntaxes = map[string]commentSyntax{
 	"java":       cFamily,
 	"kotlin":     cFamily,
 	"csharp":     cFamily,
+	// Razor markup takes HTML comments, C# comments inside @{ } and @code
+	// blocks, and its own @* ... *@ form.
+	"razor":      {line: []string{"//"}, blocks: []blockPair{cBlock, htmlPair, {"@*", "*@"}}},
 	"fsharp":     {line: []string{"//"}, blocks: []blockPair{{"(*", "*)"}}},
 	"swift":      cFamily,
 	"c":          cFamily,

@@ -190,6 +190,13 @@ func TestLangFromExt(t *testing.T) {
 		{"app.py", "python"},
 		{"lib.rs", "rust"},
 		{"Foo.cs", "csharp"},
+		// Razor markup is its own language; its code-behind is not. The
+		// language is keyed on the final extension, which is what keeps
+		// Contacts.cshtml.cs — ordinary C# that parses fine — out of it.
+		{"Contacts.cshtml", "razor"},
+		{"Counter.razor", "razor"},
+		{"Contacts.cshtml.cs", "csharp"},
+		{"Counter.razor.cs", "csharp"},
 		{"Main.java", "java"},
 		{"app.rb", "ruby"},
 		{"app.ex", "elixir"},

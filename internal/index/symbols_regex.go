@@ -221,6 +221,16 @@ var maskConfigs = map[string]maskConfig{
 		quotes:      []byte{'"'}, triples: []string{`"""`},
 		escape: true,
 	},
+	// Razor code blocks. This key is deliberately not a recon language: it is
+	// the masking profile for the body of an @code/@functions block, which is
+	// plain C#. Brace depth is what separates a member of the block from a
+	// statement inside one of its bodies.
+	razorCodeLang: {
+		lineComment: []string{"//"},
+		blockOpen:   "/*", blockClose: "*/",
+		quotes: []byte{'"', '\''},
+		escape: true, braces: true,
+	},
 }
 
 // litMasker walks a file line by line, returning each line with its comment and
@@ -384,6 +394,14 @@ func containsByte(set []byte, b byte) bool {
 const maxContinuationLines = 8
 
 func extractSymbolsRegex(data []byte, relPath, lang string, patterns []symbolPattern) []Symbol {
+	// Razor is markup, not a language whose declarations sit on lines of their
+	// own; what it declares is directives plus the members of a @code block. It
+	// has its own extractor, which calls back into this one under the
+	// razorCodeLang masking profile for the block bodies.
+	if lang == razorLang {
+		return extractRazorSymbols(data, relPath)
+	}
+
 	lines := splitLines(data)
 	if len(lines) == 0 {
 		return nil
@@ -592,6 +610,7 @@ var langPatterns = map[string][]symbolPattern{
 	"typescript": tsPatterns,
 	"javascript": tsPatterns, // shares TS patterns
 	"csharp":     csharpPatterns,
+	razorLang:    razorMemberPatterns,
 	"java":       javaPatterns,
 	"kotlin":     javaPatterns, // close enough
 	"python":     pythonPatterns,

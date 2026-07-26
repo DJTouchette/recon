@@ -101,24 +101,36 @@ func LangFromExt(name string) string {
 }
 
 var extToLang = map[string]string{
-	".go":     "go",
-	".js":     "javascript",
-	".jsx":    "javascript",
-	".mjs":    "javascript",
-	".cjs":    "javascript",
-	".ts":     "typescript",
-	".tsx":    "typescript",
-	".mts":    "typescript",
-	".py":     "python",
-	".pyw":    "python",
-	".rs":     "rust",
-	".rb":     "ruby",
-	".ex":     "elixir",
-	".exs":    "elixir",
-	".erl":    "erlang",
-	".cs":     "csharp",
-	".cshtml": "csharp",
-	".razor":  "csharp",
+	".go":  "go",
+	".js":  "javascript",
+	".jsx": "javascript",
+	".mjs": "javascript",
+	".cjs": "javascript",
+	".ts":  "typescript",
+	".tsx": "typescript",
+	".mts": "typescript",
+	".py":  "python",
+	".pyw": "python",
+	".rs":  "rust",
+	".rb":  "ruby",
+	".ex":  "elixir",
+	".exs": "elixir",
+	".erl": "erlang",
+	".cs":  "csharp",
+	// Razor is not C#. A .cshtml/.razor file is HTML markup with @-prefixed
+	// directives and interleaved C# fragments, and feeding one to the C#
+	// grammar fails on essentially every file: on a 13k-file ASP.NET repo all
+	// 173 .cshtml files came back "partial" with a syntax error, 172 of them
+	// produced no symbols at all, and they still counted toward the repo's C#
+	// share (78.9%) while burying the 19 real parse failures under 173 bogus
+	// caveats. It has its own language and its own extractor instead; see
+	// internal/index/symbols_razor.go.
+	//
+	// Code-behind (Index.cshtml.cs, Counter.razor.cs) is ordinary C# and is not
+	// affected: the language is keyed on the final extension, which for those
+	// files is ".cs".
+	".cshtml": "razor",
+	".razor":  "razor",
 	".fs":     "fsharp",
 	".java":   "java",
 	".kt":     "kotlin",

@@ -49,7 +49,9 @@ const (
 	// 2: C# file-based-app directives no longer break the parse, and a partial
 	//    tree-sitter parse is supplemented by line patterns — both change the
 	//    symbols and parse statuses stored for unchanged files.
-	analysisVer = 2
+	// 3: Razor became its own language, so every .cshtml file's lang, parse
+	//    status, symbols, import edges and references change.
+	analysisVer = 3
 
 	// busyTimeoutMS is how long a writer waits for a competing writer's lock
 	// before giving up with SQLITE_BUSY. Several recon processes routinely run

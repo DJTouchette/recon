@@ -422,6 +422,11 @@ func isImportLine(line, lang string) bool {
 		return strings.HasPrefix(line, "import ") || strings.HasPrefix(line, "from ")
 	case "csharp":
 		return strings.HasPrefix(line, "using ") || strings.HasPrefix(line, "namespace ")
+	case razorLang:
+		// @model and @page are the most informative lines a view has, so only
+		// the genuine imports are skipped.
+		return strings.HasPrefix(line, "@using ") || strings.HasPrefix(line, "@namespace ") ||
+			strings.HasPrefix(line, "@addTagHelper ")
 	case "java", "kotlin":
 		return strings.HasPrefix(line, "import ") || strings.HasPrefix(line, "package ")
 	case "rust":
@@ -575,6 +580,13 @@ func extractFileSymbols(root string, f *scan.FileEntry) ([]Symbol, FileParse) {
 	fp.SymbolCount = len(syms)
 	fp.Status = ParseOK
 	fp.Detail = "line-pattern extraction: names, kinds and lines are approximate"
+	if f.Lang == "razor" {
+		// Say what was and was not looked at. A Razor file's directives are
+		// extracted completely, so the generic wording undersells it, while the
+		// markup body and inline C# are not parsed at all, which the generic
+		// wording does not mention.
+		fp.Detail = "Razor directive extraction: markup and inline C# are not parsed"
+	}
 	return syms, fp
 }
 

@@ -57,6 +57,16 @@ func hasTSRefs(lang string) bool {
 // mirrors grammarCandidates so .tsx keeps the TSX grammar while .ts gets the
 // real TypeScript one.
 func refGrammarCandidates(lang, relPath string) []string {
+	// Razor has no grammar of its own. Its references are extracted by running
+	// the C# refs grammar over the file's C# regions only — see
+	// extractFileReferences and razorCSharpProjection.
+	if lang == razorLang {
+		if hasTSRefs("csharp") {
+			return []string{"csharp"}
+		}
+		return nil
+	}
+
 	var out []string
 	for _, key := range grammarCandidates(lang, relPath) {
 		if hasTSRefs(key) {
@@ -203,6 +213,13 @@ func extractFileReferences(root string, f *scan.FileEntry) []Reference {
 	data, err := readSource(fullPath, 0)
 	if err != nil {
 		return nil
+	}
+	if f.Lang == razorLang {
+		// Only the file's @{ } and @code blocks are C#. Handing the whole of a
+		// Razor file to the C# grammar produced mostly markup: 4064 references
+		// from 173 views on a real repo, of which 96% named nothing the repo
+		// declares — 668 of them calls to "@if".
+		data = razorCSharpProjection(data)
 	}
 
 	var best []Reference

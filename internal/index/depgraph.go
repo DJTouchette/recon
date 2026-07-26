@@ -324,9 +324,15 @@ type resolveCtx struct {
 	jsOnce    sync.Once
 	jsAliases []jsAlias
 
-	csOnce   sync.Once
-	csNS     map[string][]string
+	csOnce sync.Once
+	csNS   map[string][]string
+	// csNSTree holds every declared namespace and all its ancestors.
 	csNSTree map[string]bool
+	// csTypes maps a fully-qualified type name to the files declaring it, and
+	// csTypeShort maps the bare type name. Razor's @model/@inherits resolution
+	// needs a type, not a namespace.
+	csTypes     map[string][]string
+	csTypeShort map[string][]string
 
 	jvmOnce sync.Once
 	jvmPkg  map[string][]string
@@ -481,6 +487,8 @@ func extractImports(f *scan.FileEntry, rc *resolveCtx) ([]string, ImportStats) {
 		out = resolveJavaSpecs(jvmImportSpecs(fullPath, f.Lang), f.RelPath, f.Lang, rc, t)
 	case "csharp":
 		out = resolveCSharpSpecs(csharpImportSpecs(fullPath), f.RelPath, rc, t)
+	case razorLang:
+		out = resolveRazorSpecs(razorImportSpecs(fullPath), f.RelPath, rc, t)
 	case "ruby":
 		out = resolveRubySpecs(rubyImportSpecs(fullPath), f.RelPath, rc.idx, t)
 	case "rust":
@@ -1908,26 +1916,67 @@ func (rc *resolveCtx) csharpNamespaceInRepo(ns string) bool {
 	return rc.csNSTree[ns]
 }
 
-// buildCSharpNamespaces populates the declared-namespace map and the set of
-// tree nodes (every declared namespace plus all its ancestors), once.
+// csharpTypeFiles returns the files declaring the type named by a
+// fully-qualified name ("Leroy.Api.Pages.App.ContactsModel"), and the files
+// declaring any type with that short name.
+//
+// This is what resolves a Razor `@model`. The namespace map alone cannot: a
+// page model lives in Contacts.cshtml.cs, whose file name is nothing like
+// ContactsModel, and its namespace holds every other page in the folder — so
+// resolving `@model ...App.ContactsModel` through the namespace would link the
+// view to a dozen unrelated pages.
+func (rc *resolveCtx) csharpTypeFiles(fqn string) (exact, byShortName []string) {
+	rc.buildCSharpNamespaces()
+	return rc.csTypes[fqn], rc.csTypeShort[shortTypeName(fqn)]
+}
+
+// csTypeDeclRe matches a C# type declaration. It is used only to attach a name
+// to a file that already declares a namespace, so a missed match costs an edge
+// and can never invent one.
+var csTypeDeclRe = regexp.MustCompile(`(?m)^\s*(?:\[[^\]\n]*\]\s*)*` +
+	`(?:(?:public|internal|private|protected|sealed|abstract|static|partial|readonly|unsafe|new|ref)\s+)*` +
+	`(?:class|record|struct|interface|enum)(?:\s+(?:class|struct))?\s+([A-Za-z_]\w*)`)
+
+// csFileDecls is what one C# file contributes to the repo-wide maps.
+type csFileDecls struct {
+	namespaces []string
+	types      []string
+}
+
+// buildCSharpNamespaces populates the declared-namespace map, the set of tree
+// nodes (every declared namespace plus all its ancestors) and the declared-type
+// maps, once.
 func (rc *resolveCtx) buildCSharpNamespaces() {
 	rc.csOnce.Do(func() {
 		rc.csNS = make(map[string][]string)
 		rc.csNSTree = make(map[string]bool)
-		scanned := scanLangFilesParallel(rc, []string{"csharp"}, func(_ *scan.FileEntry, data []byte) []string {
-			var namespaces []string
+		rc.csTypes = make(map[string][]string)
+		rc.csTypeShort = make(map[string][]string)
+		scanned := scanLangFilesParallel(rc, []string{"csharp"}, func(_ *scan.FileEntry, data []byte) csFileDecls {
+			var d csFileDecls
 			for _, spec := range csharpSpecsFromData(data) {
 				if kind, ns := splitSpec(spec, ""); kind == "ns" && ns != "" {
-					namespaces = append(namespaces, ns)
+					d.namespaces = append(d.namespaces, ns)
 				}
 			}
-			return namespaces
+			for _, m := range csTypeDeclRe.FindAllStringSubmatch(string(data), -1) {
+				d.types = append(d.types, m[1])
+			}
+			return d
 		})
+		addType := func(m map[string][]string, key, path string) {
+			for _, p := range m[key] {
+				if p == path {
+					return
+				}
+			}
+			m[key] = append(m[key], path)
+		}
 		for _, s := range scanned {
 			if s.file == nil {
 				continue
 			}
-			for _, ns := range s.val {
+			for _, ns := range s.val.namespaces {
 				rc.csNS[ns] = append(rc.csNS[ns], s.file.RelPath)
 				for node := ns; node != ""; {
 					rc.csNSTree[node] = true
@@ -1936,6 +1985,15 @@ func (rc *resolveCtx) buildCSharpNamespaces() {
 						break
 					}
 					node = node[:i]
+				}
+			}
+			for _, name := range s.val.types {
+				addType(rc.csTypeShort, name, s.file.RelPath)
+				if len(s.val.namespaces) == 0 {
+					addType(rc.csTypes, name, s.file.RelPath) // global namespace
+				}
+				for _, ns := range s.val.namespaces {
+					addType(rc.csTypes, ns+"."+name, s.file.RelPath)
 				}
 			}
 		}
@@ -2051,6 +2109,116 @@ func resolveCSharpSpecs(specs []string, filePath string, rc *resolveCtx, t *impo
 		}
 	}
 	t.extract(usings)
+	return resolved
+}
+
+// ─── Razor ───────────────────────────────────────────────────────────────────
+
+// razorImportSpecs returns tagged Razor specifiers: "using:<namespace>" for an
+// @using directive and "type:<name>" for the type-valued directives that bind a
+// view to a class — @model above all, plus @inherits and @implements.
+//
+// A Razor view had no imports at all before this: it was classified as C# and
+// the C# extractor looks for `using X;`, which is not how a view spells one. So
+// no view was connected to anything, and the question an agent actually asks
+// about a view — "what does this page depend on", "where is the view for
+// ContactsModel" — had no answer anywhere in the graph.
+func razorImportSpecs(fullPath string) []string {
+	data, err := os.ReadFile(fullPath)
+	if err != nil {
+		return nil
+	}
+	return razorSpecsFromData(data)
+}
+
+func razorSpecsFromData(data []byte) []string {
+	var specs []string
+	seen := make(map[string]bool)
+	add := func(s string) {
+		if !seen[s] {
+			seen[s] = true
+			specs = append(specs, s)
+		}
+	}
+	for _, d := range parseRazorDirectives(data) {
+		switch d.Kind {
+		case razorDirUsing:
+			add("using:" + d.Value)
+		case razorDirModel, razorDirInherits, razorDirImplements:
+			// razorTypeNames drops primitives — `@model string?` binds to no
+			// file at all, and counting it as an unresolved edge would be a
+			// caveat about nothing — and splits a generic model so both
+			// `IEnumerable` and `Contact` get a chance to resolve.
+			for _, ref := range razorTypeNames(d.Value) {
+				add("type:" + ref)
+			}
+		}
+	}
+	return specs
+}
+
+// resolveRazorSpecs resolves a Razor view's dependencies.
+//
+// @using is an ordinary C# using directive, so it is handed to the C# resolver
+// unchanged — same namespace map, same External/Unresolved accounting. Writing
+// a second namespace resolver for views would just be a second thing to drift.
+//
+// @model is resolved as a type, which the namespace map cannot do on its own:
+// the page model of Pages/App/Contacts.cshtml lives in Contacts.cshtml.cs, a
+// file whose name shares nothing with ContactsModel, in a namespace shared with
+// every other page in the folder. A fully-qualified name must match a declared
+// type exactly; a bare one is accepted only when exactly one file in the repo
+// declares that name, because Pages/App/Forms.cshtml.cs and
+// Pages/Tenant/Forms.cshtml.cs both declaring FormsModel is a real layout and
+// guessing between them would fabricate an edge.
+func resolveRazorSpecs(specs []string, filePath string, rc *resolveCtx, t *importTally) []string {
+	var usings, types []string
+	for _, spec := range specs {
+		switch kind, v := splitSpec(spec, "using"); kind {
+		case "using":
+			usings = append(usings, spec)
+		case "type":
+			types = append(types, v)
+		}
+	}
+
+	resolved := resolveCSharpSpecs(usings, filePath, rc, t)
+	seen := make(map[string]bool, len(resolved))
+	for _, p := range resolved {
+		seen[p] = true
+	}
+
+	t.extract(len(types))
+	for _, fqn := range types {
+		exact, short := rc.csharpTypeFiles(fqn)
+		hits := exact
+		if len(hits) == 0 && !strings.Contains(fqn, ".") && len(short) == 1 {
+			hits = short
+		}
+		found := false
+		for _, p := range hits {
+			if p == "" || p == filePath {
+				continue
+			}
+			if !seen[p] {
+				seen[p] = true
+				resolved = append(resolved, p)
+			}
+			found = true
+		}
+		switch {
+		case found:
+			t.hit()
+		case len(short) > 0:
+			// The repo declares that type name but the binding could not be
+			// pinned to one file: a real edge recon dropped.
+			t.miss(fqn)
+		default:
+			// No file in the repo declares it — a framework or package type
+			// (`@inherits LayoutComponentBase`). An expected non-edge.
+			t.skip()
+		}
+	}
 	return resolved
 }
 

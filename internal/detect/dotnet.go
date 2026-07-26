@@ -22,12 +22,16 @@ var (
 
 type DotNetDetector struct{}
 
-func (d *DotNetDetector) Key() string         { return "dotnet" }
-func (d *DotNetDetector) Languages() []string { return []string{"csharp", "fsharp"} }
+func (d *DotNetDetector) Key() string { return "dotnet" }
+
+// Languages includes razor: a Blazor or Razor Pages project is a .NET project,
+// and Razor markup is no longer classified as C#.
+func (d *DotNetDetector) Languages() []string { return []string{"csharp", "fsharp", "razor"} }
 
 func (d *DotNetDetector) Detect(idx *index.FileIndex, root string) DetectorResult {
 	var res DetectorResult
-	if len(idx.ByLang("csharp")) == 0 && len(idx.ByLang("fsharp")) == 0 {
+	if len(idx.ByLang("csharp")) == 0 && len(idx.ByLang("fsharp")) == 0 &&
+		len(idx.ByLang("razor")) == 0 {
 		return res
 	}
 
