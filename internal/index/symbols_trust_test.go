@@ -115,8 +115,33 @@ func TestPartialParseIsRecorded(t *testing.T) {
 	if broken.Detail == "" {
 		t.Error("broken.go: partial parse has no explanatory detail")
 	}
-	if broken.Extractor != ExtractorTreeSitter {
-		t.Errorf("broken.go extractor = %q, want %q", broken.Extractor, ExtractorTreeSitter)
+	// The grammar stops at `func Bad( {` and loses everything from there. The
+	// line patterns reach it, so the file is extracted by both and says so —
+	// per-symbol provenance below keeps that exact rather than blurring it.
+	if broken.Extractor != ExtractorMixed {
+		t.Errorf("broken.go extractor = %q, want %q", broken.Extractor, ExtractorMixed)
+	}
+
+	var good, bad *Symbol
+	syms := si.ForFile("broken.go")
+	for i := range syms {
+		switch syms[i].Name {
+		case "Good":
+			good = &syms[i]
+		case "Bad":
+			bad = &syms[i]
+		}
+	}
+	if good == nil {
+		t.Fatal("broken.go: Good was lost")
+	}
+	if good.Extractor != ExtractorTreeSitter {
+		t.Errorf("Good extractor = %q, want %q — the grammar parsed it and its line is trustworthy", good.Extractor, ExtractorTreeSitter)
+	}
+	if bad == nil {
+		t.Error("broken.go: Bad is past the syntax error and was not recovered by line patterns")
+	} else if bad.Extractor != ExtractorRegex {
+		t.Errorf("Bad extractor = %q, want %q — recovered approximately, and must not claim otherwise", bad.Extractor, ExtractorRegex)
 	}
 
 	if clean := parseFor(t, si, "clean.go"); clean.Status != ParseOK {
@@ -817,5 +842,126 @@ func TestTSXReferencesStillResolve(t *testing.T) {
 	}
 	if !files["a.ts"] {
 		t.Error("no reference to helper found in a.ts (angle-bracket cast broke the parse)")
+	}
+}
+
+// tree-sitter-c-sharp v0.23.5 — the latest release — misparses a collection
+// expression whose single element is an identifier named after a member-level
+// attribute target. `[type]` and `[field]` are indistinguishable from the start
+// of an attribute list with a `type:` / `field:` target, so the grammar commits
+// to that reading and the parse errors there.
+//
+// The seven member-level targets (field, event, method, param, property,
+// return, type) all reproduce it; assembly and module do not, because they are
+// only legal where a collection expression cannot appear.
+//
+// The code is valid and current, and there is no newer grammar to move to. What
+// must hold is that the file is still usable and still honest: declarations
+// after the error are reported, and the file says its parse was incomplete
+// rather than presenting a short list as a full one.
+func TestCSharpCollectionExpressionSyntaxIsHandled(t *testing.T) {
+	const src = `namespace N;
+
+internal class Svc(IRepo repo) : ISvc
+{
+    public void Assign(Tenant created, string type)
+    {
+        created.Types = [type];
+    }
+
+    public void AfterTheError() { }
+
+    public string Name => "x";
+}
+`
+	root, idx := writeTree(t, map[string]string{"Svc.cs": src})
+	si := NewSymbolIndex(root, idx)
+
+	names := map[string]bool{}
+	for _, s := range si.ForFile("Svc.cs") {
+		names[s.Name] = true
+	}
+	for _, want := range []string{"Svc", "Assign", "AfterTheError"} {
+		if !names[want] {
+			t.Errorf("%q missing; the parse error swallowed it (got %v)", want, names)
+		}
+	}
+
+	fp := parseFor(t, si, "Svc.cs")
+	switch fp.Status {
+	case ParseOK:
+		// Upstream fixed the grammar. Nothing further to assert.
+	case ParsePartial:
+		if fp.Detail == "" {
+			t.Error("incomplete parse reported without a reason")
+		}
+	default:
+		t.Errorf("status = %q, want %q or %q", fp.Status, ParsePartial, ParseOK)
+	}
+}
+
+// .NET 10 file-based apps open with `#:package`/`#:sdk`/`#:property` lines that
+// the SDK consumes and the C# grammar cannot parse. Left in, they collapsed the
+// parse at line 1: three real scripts reported zero symbols under a "syntax
+// errors" caveat, which reads as "recon could not understand this file" when
+// the truth is that a script declares nothing. Blanked, the parse is clean and
+// the empty result is honest.
+func TestCSharpFileBasedAppDirectivesDoNotBreakTheParse(t *testing.T) {
+	root, idx := writeTree(t, map[string]string{
+		"tool.cs": `#:package dbup-sqlserver@7.2.0
+#:package Microsoft.Data.SqlClient@6.1.4
+
+using DbUp;
+
+var conn = Environment.GetEnvironmentVariable("CONN");
+Console.WriteLine(conn);
+
+class Helper
+{
+    public void Run() { }
+}
+`,
+	})
+	si := NewSymbolIndex(root, idx)
+
+	fp := parseFor(t, si, "tool.cs")
+	if fp.Status != ParseOK {
+		t.Errorf("status = %q (%s), want %q — #: lines are an SDK preamble, not a syntax error",
+			fp.Status, fp.Detail, ParseOK)
+	}
+
+	names := map[string]bool{}
+	for _, s := range si.ForFile("tool.cs") {
+		names[s.Name] = true
+	}
+	// Declarations below the directives must survive; blanking preserves line
+	// numbers, so Helper's reported line still matches the file on disk.
+	if !names["Helper"] || !names["Run"] {
+		t.Errorf("declarations after the directives were lost: %v", names)
+	}
+	for _, s := range si.ForFile("tool.cs") {
+		if s.Name == "Helper" && s.Line != 9 {
+			t.Errorf("Helper reported at line %d, want 9 — line numbers must survive stripping", s.Line)
+		}
+	}
+}
+
+// A partial parse that the line patterns cannot improve on must not claim a
+// recovery it did not make.
+func TestPartialParseWithNothingToRecoverStaysTreeSitter(t *testing.T) {
+	root, idx := writeTree(t, map[string]string{
+		// Broken, and containing no further declaration for the patterns to find.
+		"only.go": "package main\n\nfunc Bad( {\n",
+	})
+	si := NewSymbolIndex(root, idx)
+
+	fp := parseFor(t, si, "only.go")
+	if fp.Status != ParsePartial {
+		t.Skipf("grammar parsed this cleanly; nothing to assert (status %q)", fp.Status)
+	}
+	for _, s := range si.ForFile("only.go") {
+		if s.Extractor == ExtractorRegex && s.Name != "Bad" {
+			t.Errorf("unexpected recovered symbol %q", s.Name)
+		}
 	}
 }

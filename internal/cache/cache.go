@@ -46,7 +46,10 @@ const (
 	// 1: first tracked version. Covers the C# external-vs-unresolved
 	//    classification, the .NET test-project mapping tiers, and the source
 	//    content-scan issue reporting.
-	analysisVer = 1
+	// 2: C# file-based-app directives no longer break the parse, and a partial
+	//    tree-sitter parse is supplemented by line patterns — both change the
+	//    symbols and parse statuses stored for unchanged files.
+	analysisVer = 2
 
 	// busyTimeoutMS is how long a writer waits for a competing writer's lock
 	// before giving up with SQLITE_BUSY. Several recon processes routinely run

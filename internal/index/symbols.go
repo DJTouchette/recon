@@ -1,8 +1,10 @@
 package index
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -23,6 +25,11 @@ const (
 	ExtractorTreeSitter = "tree-sitter"
 	ExtractorRegex      = "regex"
 	ExtractorNone       = "none"
+	// ExtractorMixed is a file-level value only: the grammar parsed part of the
+	// file and line patterns supplied the rest. Individual symbols always carry
+	// the single extractor that actually found them, so provenance stays exact
+	// per symbol even when the file needed both.
+	ExtractorMixed = "tree-sitter+regex"
 )
 
 // Parse statuses for FileParse.Status.
@@ -71,7 +78,7 @@ type Symbol struct {
 type FileParse struct {
 	RelPath     string `json:"path"`
 	Lang        string `json:"lang"`
-	Extractor   string `json:"extractor"` // tree-sitter | regex | none
+	Extractor   string `json:"extractor"` // tree-sitter | regex | tree-sitter+regex | none
 	Status      string `json:"status"`    // ok | partial | unsupported | failed
 	SymbolCount int    `json:"symbol_count"`
 	// Detail is a human-readable reason for a non-ok status, suitable for
@@ -510,19 +517,46 @@ func extractFileSymbols(root string, f *scan.FileEntry) ([]Symbol, FileParse) {
 		return nil, fp
 	}
 
+	data = stripNonGrammarPreamble(data, f.Lang)
+
 	if cands := grammarCandidates(f.Lang, f.RelPath); len(cands) > 0 {
 		if syms, res, ok := extractWithGrammars(data, f.RelPath, cands); ok {
 			fp.Extractor = ExtractorTreeSitter
-			fp.SymbolCount = len(syms)
 			if res.clean {
+				fp.SymbolCount = len(syms)
 				fp.Status = ParseOK
 				if res.key != f.Lang {
 					// e.g. a .h classified as C that parsed better as C++.
 					fp.Detail = "parsed with the " + res.key + " grammar"
 				}
-			} else {
-				fp.Status = ParsePartial
-				fp.Detail = "tree-sitter (" + res.key + ") reported syntax errors; symbol list may be incomplete"
+				return syms, fp
+			}
+
+			// The grammar hit a construct it does not understand. Everything
+			// after that point is lost, and the loss is silent: the file
+			// reports a symbol list that looks like a list, just shorter.
+			//
+			// Seen in the wild on a current C# codebase — tree-sitter-c-sharp
+			// v0.23.5 (the latest release) misparses a collection expression
+			// whose single element is named after a member-level attribute
+			// target, so `x.Types = [type];` and `M(pdf, [field]);` are read as
+			// attribute lists and the parse collapses there. Three files
+			// dropped to zero symbols and six lost everything below the first
+			// occurrence. Nothing is wrong with the code, and upstream has no
+			// newer release to move to.
+			//
+			// So when a parse is incomplete, run the line patterns too and add
+			// back what the grammar never reached. Tree-sitter's own symbols
+			// always win — its names, kinds and lines are trustworthy where it
+			// succeeded — and each recovered symbol keeps ExtractorRegex, so a
+			// reader can tell which half of the file it came from.
+			syms, recovered := supplementWithRegex(syms, data, f)
+			fp.SymbolCount = len(syms)
+			fp.Status = ParsePartial
+			fp.Detail = "tree-sitter (" + res.key + ") reported syntax errors; symbol list may be incomplete"
+			if recovered > 0 {
+				fp.Extractor = ExtractorMixed
+				fp.Detail += fmt.Sprintf("; %d further symbol(s) recovered by line patterns and marked approximate", recovered)
 			}
 			return syms, fp
 		}
@@ -542,6 +576,85 @@ func extractFileSymbols(root string, f *scan.FileEntry) ([]Symbol, FileParse) {
 	fp.Status = ParseOK
 	fp.Detail = "line-pattern extraction: names, kinds and lines are approximate"
 	return syms, fp
+}
+
+// stripNonGrammarPreamble blanks lines that a language's toolchain consumes
+// before the compiler ever sees them, and which its grammar therefore cannot
+// parse.
+//
+// Today that is C#'s file-based apps (.NET 10), whose `#:package dbup@7.2.0`,
+// `#:sdk` and `#:property` lines sit above ordinary top-level statements. They
+// are a preamble for the SDK, not C#, and tree-sitter fails on the first one —
+// so a perfectly valid script was reported as "syntax errors" with zero
+// symbols, which reads as "recon could not understand this file" when the truth
+// is that the file declares nothing. Blanking the directives turns that into a
+// clean parse and an honest empty result.
+//
+// Lines are replaced rather than removed so every symbol's reported line number
+// still matches the file on disk.
+//
+// `#:` is not a valid preprocessor directive in any C# version, so this cannot
+// collide with #if/#region/#pragma and does not need to be anchored to the top
+// of the file.
+func stripNonGrammarPreamble(data []byte, lang string) []byte {
+	if lang != "csharp" || !bytes.Contains(data, []byte("#:")) {
+		return data
+	}
+
+	lines := bytes.Split(data, []byte("\n"))
+	changed := false
+	for i, line := range lines {
+		if bytes.HasPrefix(bytes.TrimLeft(line, " \t"), []byte("#:")) {
+			lines[i] = nil
+			changed = true
+		}
+	}
+	if !changed {
+		return data
+	}
+	return bytes.Join(lines, []byte("\n"))
+}
+
+// supplementWithRegex adds line-pattern symbols the grammar never reached to a
+// partial tree-sitter result, returning the merged list and how many were
+// added.
+//
+// Deduplication is on name+kind, which is deliberately conservative: it will
+// decline to add a second overload of a method the grammar already found,
+// preferring to under-recover rather than emit a duplicate symbol that an agent
+// would read as two distinct declarations. Lines from the two extractors do not
+// agree closely enough to dedupe on position.
+//
+// The merged list is sorted by line so the output does not depend on which
+// extractor produced an entry.
+func supplementWithRegex(tsSyms []Symbol, data []byte, f *scan.FileEntry) ([]Symbol, int) {
+	patterns := patternsForLang(f.Lang)
+	if len(patterns) == 0 {
+		return tsSyms, 0
+	}
+
+	seen := make(map[string]bool, len(tsSyms))
+	for _, s := range tsSyms {
+		seen[s.Name+"\x00"+s.Kind] = true
+	}
+
+	merged := tsSyms
+	added := 0
+	for _, s := range extractSymbolsRegex(data, f.RelPath, f.Lang, patterns) {
+		key := s.Name + "\x00" + s.Kind
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		merged = append(merged, s)
+		added++
+	}
+	if added == 0 {
+		return tsSyms, 0
+	}
+
+	sortSymbols(merged)
+	return merged, added
 }
 
 func langLabel(lang string) string {
