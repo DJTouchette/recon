@@ -226,6 +226,7 @@ func (r *Recon) Overview() (*Overview, error) {
 
 // Related returns files related to the given path, ranked by relevance.
 func (r *Recon) Related(path string, opts ...RelatedOption) ([]RelatedFile, error) {
+	path = r.resolvePath(path)
 	cfg := &relatedConfig{maxResults: 20}
 	for _, o := range opts {
 		o(cfg)
@@ -248,8 +249,18 @@ func (r *Recon) Related(path string, opts ...RelatedOption) ([]RelatedFile, erro
 
 // Context returns the full operational context for a file: preview, hash, owners, metrics, nearby configs.
 func (r *Recon) Context(path string) (*FileContext, error) {
-	path = filepath.Clean(path)
-	ctx := &FileContext{Path: path}
+	path = r.resolvePath(path)
+	ctx := &FileContext{Path: path, Status: StatusIndexed}
+
+	// A path recon never scanned produces exactly the same record as a file
+	// with no dependents and no history: fan_in 0, fan_out 0, churn 0, hotspot
+	// 0. The zeros are indistinguishable, and "nothing depends on this" is the
+	// most consequential thing this call can say, so the two are separated
+	// here rather than left to the reader.
+	if r.idx == nil || r.idx.Get(path) == nil {
+		ctx.Status = StatusNotIndexed
+		return ctx, nil
+	}
 
 	if e, ok := r.extras[path]; ok {
 		ctx.Preview = e.Preview
@@ -295,7 +306,7 @@ func (r *Recon) Docs(query string, maxResults int) ([]ContextDocInfo, error) {
 	case query == "":
 		docs = r.contextDocs.All()
 	case strings.HasPrefix(query, "file:"):
-		docs = r.contextDocs.ForFile(filepath.Clean(strings.TrimPrefix(query, "file:")))
+		docs = r.contextDocs.ForFile(r.resolvePath(strings.TrimPrefix(query, "file:")))
 	case strings.HasPrefix(query, "symbol:"):
 		docs = r.contextDocs.ForSymbol(strings.TrimPrefix(query, "symbol:"))
 	default:
@@ -389,7 +400,7 @@ func (r *Recon) Symbols(query string, maxResults int) ([]SymbolInfo, error) {
 	var syms []index.Symbol
 
 	if strings.HasPrefix(query, "file:") {
-		filePath := filepath.Clean(strings.TrimPrefix(query, "file:"))
+		filePath := r.resolvePath(strings.TrimPrefix(query, "file:"))
 		syms = r.symbols.ForFile(filePath)
 	} else if query == "" {
 		syms = r.symbols.All()
@@ -482,7 +493,7 @@ func (r *Recon) referenceResolves(file string, defFiles, defDirs map[string]bool
 
 // FileDetail returns preview and content hash for a file.
 func (r *Recon) FileDetail(path string) (*FileDetail, error) {
-	path = filepath.Clean(path)
+	path = r.resolvePath(path)
 	if e, ok := r.extras[path]; ok {
 		return &FileDetail{
 			Path:        path,
@@ -496,6 +507,7 @@ func (r *Recon) FileDetail(path string) (*FileDetail, error) {
 // Tests returns test files relevant to the given path.
 // maxResults caps output (0 = default 20, -1 = unlimited).
 func (r *Recon) Tests(path string, maxResults int) ([]TestFile, error) {
+	path = r.resolvePath(path)
 	if maxResults == 0 {
 		maxResults = 20
 	}
@@ -706,6 +718,7 @@ func collapseMatches(matches []GrepLine) []GrepLine {
 
 // ImportedBy returns files that import the given file (reverse dependency edge).
 func (r *Recon) ImportedBy(path string) []string {
+	path = r.resolvePath(path)
 	if r.deps == nil {
 		return nil
 	}
@@ -714,6 +727,7 @@ func (r *Recon) ImportedBy(path string) []string {
 
 // ImportsOf returns files imported by the given file.
 func (r *Recon) ImportsOf(path string) []string {
+	path = r.resolvePath(path)
 	if r.deps == nil {
 		return nil
 	}
@@ -722,6 +736,7 @@ func (r *Recon) ImportsOf(path string) []string {
 
 // CoChangedWith returns files that frequently co-change with the given file.
 func (r *Recon) CoChangedWith(path string, minCount int) []CoChangePair {
+	path = r.resolvePath(path)
 	if r.cochange == nil {
 		return nil
 	}
@@ -735,7 +750,7 @@ func (r *Recon) CoChangedWith(path string, minCount int) []CoChangePair {
 
 // IsTestFile returns true if the given path is classified as a test file.
 func (r *Recon) IsTestFile(path string) bool {
-	f := r.idx.Get(filepath.Clean(path))
+	f := r.idx.Get(r.resolvePath(path))
 	if f == nil {
 		return false
 	}
@@ -1237,6 +1252,7 @@ func (r *Recon) ImportCoverage() []LangImportCoverage {
 // ImportStatsFor returns the import resolution record for a single file, or nil
 // when the file had no import specifiers at all.
 func (r *Recon) ImportStatsFor(path string) *ImportStatsInfo {
+	path = r.resolvePath(path)
 	if r.deps == nil {
 		return nil
 	}

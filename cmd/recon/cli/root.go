@@ -620,6 +620,18 @@ func printSearchHuman(cmd *cobra.Command, results []recon.SearchResult) {
 func printContextHuman(cmd *cobra.Command, ctx *recon.FileContext) {
 	w := cmd.OutOrStdout()
 	fmt.Fprintf(w, "File: %s\n", ctx.Path)
+
+	// Printing the usual table of zeros for a path recon never scanned reads
+	// as "this file has no dependents and no history". Say what actually
+	// happened and stop, rather than dressing ignorance as measurement.
+	if ctx.Status == recon.StatusNotIndexed {
+		fmt.Fprintln(w, "\nrecon has no record of this path, so it has no metrics to report.")
+		fmt.Fprintln(w, "This is not the same as a file with no dependents — nothing was measured.")
+		fmt.Fprintln(w, "Check the path is inside the repo and not excluded by ignore rules;")
+		fmt.Fprintln(w, "paths are matched relative to the repo root.")
+		return
+	}
+
 	if ctx.ContentHash != "" {
 		fmt.Fprintf(w, "Hash: %s\n", ctx.ContentHash)
 	}

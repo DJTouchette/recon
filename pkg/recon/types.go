@@ -157,7 +157,15 @@ type FileDetail struct {
 }
 
 type FileContext struct {
-	Path          string            `json:"path"`
+	Path string `json:"path"`
+
+	// Status is StatusIndexed when this path names a file recon actually
+	// scanned, and StatusNotIndexed when it does not — a path outside the
+	// repo, a typo, or a file excluded by the ignore rules. Every count below
+	// is zero in that case, and the difference between "zero dependents" and
+	// "recon has never seen this file" is the whole point of the field.
+	Status string `json:"status"`
+
 	Preview       string            `json:"preview,omitempty"`
 	ContentHash   string            `json:"content_hash,omitempty"`
 	Owners        []string          `json:"owners,omitempty"`
@@ -173,6 +181,12 @@ type FileContext struct {
 	// imports at all", which are very different facts to act on.
 	ImportStats *ImportStatsInfo `json:"import_stats,omitempty"`
 }
+
+// Statuses for FileContext.Status.
+const (
+	StatusIndexed    = "indexed"
+	StatusNotIndexed = "not_indexed"
+)
 
 // ContextDocInfo is a context doc extracted from a rivet:context code comment
 // or a .context/ sidecar markdown file, attached to a file or symbol.
