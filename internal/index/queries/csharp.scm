@@ -11,4 +11,19 @@
 (property_declaration name: (identifier) @property) @def
 (delegate_declaration name: (identifier) @delegate) @def
 
+; Named constants: `const` and `static readonly` fields. This is where C# keeps SQL
+; fragments, policy names and lookup tables, so a definition search for one must land
+; on its declaration. Instance and mutable fields stay out: they are state, and
+; indexing every `_field` would bury the names people actually look for.
+(field_declaration
+  (modifier) @_const
+  (variable_declaration (variable_declarator name: (identifier) @constant))
+  (#eq? @_const "const")) @def
+(field_declaration
+  (modifier) @_static
+  (modifier) @_readonly
+  (variable_declaration (variable_declarator name: (identifier) @constant))
+  (#eq? @_static "static")
+  (#eq? @_readonly "readonly")) @def
+
 (namespace_declaration name: [(identifier) (qualified_name)] @module) @def

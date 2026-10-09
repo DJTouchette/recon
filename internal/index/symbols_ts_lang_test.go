@@ -115,12 +115,26 @@ enum Color { RED }
   public enum State { On, Off }
   public struct Vec { }
   public record Person(string Name);
+  public static class Sql {
+    public const string OwnerFilter = """
+        AND rg.Role <> 'owner'
+        """;
+    private const int Lo = 1, Hi = 2;
+    internal static readonly string[] Roles = ["owner"];
+    private readonly int _instanceOnly;
+    private int _mutable;
+  }
 }
 `,
 			want: map[string]string{
 				"App": "module", "Service": "class", "Run": "method", "Count": "property",
 				"IThing": "interface", "State": "enum", "Vec": "struct", "Person": "class",
+				// Constants are where C# keeps SQL fragments, policy names and the like; a
+				// definition search for one has to land on its declaration.
+				"OwnerFilter": "constant", "Lo": "constant", "Hi": "constant", "Roles": "constant",
 			},
+			// Instance and mutable fields are state, not named definitions anyone searches for.
+			forbid: []string{"_instanceOnly", "_mutable"},
 		},
 		{
 			lang: "php",
